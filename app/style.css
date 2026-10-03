@@ -1,0 +1,1248 @@
+/* Облік ТЗ ПС — щільний інституційний десктоп.
+   Палітра, типографіка й метрики взяті з макета «ТЗ ПС - Облік.dc.html». */
+
+:root {
+  --page: #dcdcd8;
+  --chrome: #1b201c;
+  --side: #232823;
+  --side-line: #33392f;
+  --side-input: #171b18;
+  --side-input-bd: #343a34;
+  --side-label: #929b8f;
+  --side-fg: #e4e7e0;
+  --side-fg-dim: #c8ccc4;
+  --side-hover: #2b312b;
+
+  --main: #ececeb;
+  --card: #fff;
+  --card-2: #fafaf8;
+  --card-3: #f6f6f3;
+  --field: #f3f3f1;
+
+  --bd: #d9dbd5;
+  --bd-2: #e6e7e2;
+  --bd-3: #f0f0ed;
+  --bd-strong: #d3d5cf;
+
+  --ink: #191c19;
+  --ink-2: #3a3e39;
+  --ink-3: #4a4e46;
+  --ink-4: #5c6058;
+  /* Приглушена шкала. Кожен крок перевірений на контраст із білим тлом картки:
+     mut 5.8 : mut-2 5.1 : mut-3 4.6 — усі проходять AA для дрібного тексту.
+     mut-4 (3.7) лишається тільки для ліній і неактивних меж, не для тексту. */
+  --mut: #5c6057;
+  --mut-2: #61655c;
+  --mut-3: #656960;                   /* ≥ 5:1 на білому: дрібний текст читається */
+  --mut-4: #6d7168;
+  --hover-bd: #a3a79e;               /* рамки на наведення — світліші за текст */
+
+  --accent: #3f5233;
+  --accent-hi: #5c7a4a;
+  --accent-soft: #f2f5ee;
+  --accent-bd: #cfdcc4;
+  --ok: #3f6b46;
+  --warn: #8f5f1f;
+  --bad: #a03a2e;
+
+  --row-h: 34px;
+  --row-pad: 0px;      /* вертикальний люфт рядка на щільних режимах */
+  --gut: 7px;          /* половина жолоба між колонками */
+  --sans: 'IBM Plex Sans', 'Segoe UI', system-ui, sans-serif;
+  --mono: 'IBM Plex Mono', 'Cascadia Mono', Consolas, monospace;
+}
+
+[data-rows='comfort'] { --row-h: 42px; --row-pad: 4px; }
+[data-rows='dense']   { --row-h: 34px; --row-pad: 0px; }
+[data-rows='compact'] { --row-h: 28px; --row-pad: 0px; }
+
+/* Більший текст: кеглі задано в пікселях, тож масштабується робоча область
+   цілком. Бічна панель лишається як є — місця їй і так вистачає. */
+[data-text='big'] .main { zoom: 1.12; }
+[data-text='bigger'] .main { zoom: 1.25; }
+
+/* Повні назви: довгий текст переноситься, а не обрізається; рядок росте. */
+[data-wrap='1'] .c-name b, [data-wrap='1'] .c-txt, [data-wrap='1'] .c-name small {
+  white-space: normal; overflow: visible; text-overflow: clip; line-height: 1.3;
+}
+[data-wrap='1'] .tbl__row { padding-top: 5px; padding-bottom: 5px; }
+
+* { box-sizing: border-box; }
+
+html, body { margin: 0; padding: 0; height: 100%; }
+
+body {
+  background: var(--page);
+  font-family: var(--sans);
+  color: var(--ink);
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+  /* Цифри в таблицях мають ставати в колонку навіть там, де шрифт не моно. */
+  font-variant-numeric: tabular-nums;
+  accent-color: var(--accent);
+}
+
+::selection { background: #d5e0c8; color: var(--ink); }
+
+::-webkit-scrollbar { width: 11px; height: 11px; }
+::-webkit-scrollbar-thumb {
+  background: #b9bcb3;
+  border: 3px solid transparent;
+  background-clip: content-box;
+  border-radius: 6px;
+}
+::-webkit-scrollbar-thumb:hover { background: #9ca097; background-clip: content-box; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-corner { background: transparent; }
+
+/* Одна видима фігура фокуса на весь застосунок. Ніде не «outline: none» без
+   заміни — інакше клавіатурне введення документів стає сліпим. */
+:focus-visible { outline: 2px solid var(--accent-hi); outline-offset: 1px; border-radius: 2px; }
+.side :focus-visible { outline-color: #8fae77; }
+
+/* ------------------------------------------------------------- каркас вікна */
+.app { height: 100vh; display: flex; flex-direction: column; background: var(--page); }
+
+.titlebar {
+  height: 34px; flex: none; background: var(--chrome);
+  display: flex; align-items: center; padding-left: 12px; gap: 10px;
+  user-select: none;
+}
+.titlebar__ico {
+  width: 14px; height: 14px; flex: none; border-radius: 2px; background: var(--accent);
+  display: flex; align-items: center; justify-content: center;
+  font: 700 8px var(--mono); color: #fff;
+}
+.titlebar__name {
+  font: 500 11.5px var(--sans); color: var(--side-fg-dim);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.titlebar__spacer { flex: 1; }
+.wctl { display: flex; align-items: stretch; height: 34px; flex: none; }
+.wctl button {
+  width: 44px; border: 0; background: transparent; color: #9aa096;
+  font-size: 11px; cursor: default; font-family: var(--mono);
+}
+.wctl button:hover { background: #2b312b; color: var(--side-fg); }
+.wctl button:last-child:hover { background: var(--bad); color: #fff; }
+
+.body { flex: 1; display: flex; min-height: 0; }
+
+/* ------------------------------------------------------------------ сайдбар */
+.side {
+  width: 228px; flex: none; background: var(--side);
+  display: flex; flex-direction: column; min-height: 0;
+}
+.side__top { padding: 15px 15px 11px; }
+.side__label {
+  font: 600 10px var(--mono); letter-spacing: 1.4px;
+  color: var(--side-label); text-transform: uppercase;
+}
+.side__date {
+  margin-top: 7px; display: flex; align-items: center; justify-content: space-between;
+  background: var(--side-input); border: 1px solid var(--side-input-bd);
+  border-radius: 3px; padding: 7px 10px;
+}
+.side__date input {
+  border: 0; background: transparent; padding: 0;
+  font: 500 12.5px var(--sans); color: var(--side-fg); width: 100%;
+  color-scheme: dark;
+}
+/* Звітна дата міняє сенс усіх цифр, тому режим видно завжди: сьогодні це чи
+   історичний стан. */
+.side__mode {
+  margin-top: 5px; font: 500 10.5px/1.3 var(--mono); letter-spacing: .3px;
+  color: var(--side-label); display: flex; align-items: center; gap: 5px;
+}
+.side__mode.is-past { color: #e8c65a; }
+.side__mode button {
+  margin-left: auto; border: 0; background: transparent; cursor: pointer; padding: 0;
+  font: 500 10.5px var(--mono); color: #e8c65a; text-decoration: underline;
+}
+.side__date:focus-within { border-color: #4d5a44; background: #12160f; }
+.side__date input:focus { outline: none; }
+
+.nav { flex: 1; overflow-y: auto; padding: 4px 8px 16px; }
+.nav__item {
+  display: flex; align-items: center; gap: 10px; padding: 8px 10px;
+  margin-bottom: 1px; border-radius: 3px; cursor: pointer;
+  background: transparent; border: 0; width: 100%; text-align: left;
+}
+.nav__item:hover { background: var(--side-hover); }
+.nav__item:active { background: #343b33; }
+.nav__item.is-active {
+  background: var(--accent);
+  box-shadow: inset 2px 0 0 #9dba86;
+}
+.nav__ico {
+  width: 16px; flex: none; text-align: center;
+  font: 500 11px var(--mono); color: var(--side-label);
+}
+.nav__item.is-active .nav__ico { color: #d7e2cc; }
+.nav__label { flex: 1; min-width: 0; font: 500 12.5px/1.3 var(--sans); color: #c6cbbf; }
+.nav__item:hover .nav__label { color: var(--side-fg); }
+.nav__item.is-active .nav__label { color: #fff; }
+.nav__badge { font: 500 10.5px var(--mono); color: var(--side-label); }
+.nav__item.is-active .nav__badge { color: #d6e4c9; }
+.nav__sep { height: 1px; background: var(--side-line); margin: 9px 10px; }
+/* Підпис групи: пункти ті самі, але видно, навіщо людина сюди заходить. */
+.nav__group {
+  padding: 13px 10px 5px; font: 600 9.5px/1 var(--mono); letter-spacing: 1.1px;
+  text-transform: uppercase; color: var(--side-label); opacity: .75;
+}
+.nav__group:first-child { padding-top: 4px; }
+
+.side__foot {
+  flex: none; border-top: 1px solid var(--side-line); padding: 11px 14px;
+  display: flex; align-items: center; gap: 9px;
+}
+.side__avatar {
+  width: 26px; height: 26px; flex: none; border-radius: 50%; background: #3d453b;
+  display: flex; align-items: center; justify-content: center;
+  font: 600 10px var(--mono); color: #cdd3c6;
+}
+.side__who { flex: 1; min-width: 0; }
+.side__name {
+  font: 500 11.5px var(--sans); color: #dfe3d9;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.side__role { font: 400 10px var(--mono); color: var(--side-label); }
+.side__gear {
+  color: var(--side-label); font-size: 13px; flex: none; line-height: 1;
+  background: none; border: 1px solid transparent; border-radius: 3px;
+  cursor: pointer; padding: 5px 6px;
+}
+.side__gear:hover { color: var(--side-fg); background: var(--side-hover); }
+.side__gear + .side__gear { margin-left: 4px; }
+.side__gear.is-on { color: var(--side-fg); background: var(--side-hover); border-color: var(--side-line); }
+
+/* -------------------------------------------------------------- робоча зона */
+.main { flex: 1; min-width: 0; display: flex; flex-direction: column; background: var(--main); }
+
+.head {
+  flex: none; background: var(--card); border-bottom: 1px solid var(--bd-strong);
+  padding: 0 20px;
+}
+.head__row {
+  display: flex; align-items: center; flex-wrap: wrap;
+  gap: 10px 14px; min-height: 52px; padding: 8px 0;
+}
+.head__titles { min-width: 0; flex: 1 1 230px; }
+.crumb {
+  font: 400 10px var(--mono); letter-spacing: .8px;
+  color: var(--mut-2); text-transform: uppercase;
+}
+.title { font: 600 16px/1.25 var(--sans); color: var(--ink); margin-top: 2px; }
+.head__stamp { display: none; }
+
+.search {
+  display: flex; align-items: center; gap: 8px; background: var(--field);
+  border: 1px solid var(--bd); border-radius: 3px; padding: 7px 11px;
+  flex: 1 1 180px; max-width: 260px; min-width: 150px;
+}
+.search:focus-within { border-color: var(--accent); background: var(--card); }
+.search span { color: var(--mut-3); font-size: 11px; }
+.search input {
+  border: 0; background: transparent; padding: 0; width: 100%;
+  font: 400 12.5px var(--sans); color: var(--ink);
+}
+.search input::placeholder { color: var(--mut-3); }
+.search input:focus { outline: none; }
+.search input::-webkit-search-cancel-button { cursor: pointer; }
+
+.btn {
+  border: 1px solid var(--bd); border-radius: 3px; padding: 7px 11px;
+  background: var(--card); cursor: pointer; flex: none;
+  font: 500 12px var(--sans); color: var(--ink-2);
+}
+.btn:hover { background: var(--card-3); border-color: var(--hover-bd); }
+.btn:active { background: #e9eae4; }
+.btn--primary {
+  border-color: transparent; background: var(--accent); color: #fff; padding: 8px 14px;
+  white-space: nowrap;
+}
+.btn--primary:hover { background: var(--accent-hi); border-color: transparent; }
+.btn--primary:active { background: #33421f; }
+.btn--ghost { background: transparent; border-color: transparent; color: var(--ink-4); }
+.btn--ghost:hover { background: var(--card-3); border-color: var(--bd); }
+.btn--danger { color: #83372c; }
+.btn--danger:hover { background: #fbf1ef; border-color: #dcbdb6; color: var(--bad); }
+.btn[disabled] {
+  color: var(--mut-3); background: var(--card-3); border-color: var(--bd-2);
+  cursor: not-allowed; pointer-events: none;
+}
+.btn--primary[disabled] { background: #b7bfae; color: #f2f4ef; }
+
+.scroll { flex: 1; overflow-y: auto; padding: 18px 20px 40px; }
+
+/* Екрани «панель + одна велика таблиця» віддають таблиці всю решту висоти:
+   фільтри лишаються перед очима, шапка колонок прилипає, а горизонтальний
+   повзунок таблиці опиняється під нею, а не за сотні рядків нижче. */
+.scroll--fill {
+  display: flex; flex-direction: column; gap: 0;
+  padding-bottom: 20px;
+}
+.scroll--fill > * { flex: none; }
+
+/* -------------------------------------------------------------------- панелі */
+.panel {
+  background: var(--card); border: 1px solid var(--bd); border-radius: 4px;
+  margin-bottom: 12px; padding: 12px 14px;
+  display: flex; flex-wrap: wrap; gap: 9px; align-items: center;
+}
+.panel__note {
+  font: 400 11.5px/1.55 var(--sans); color: var(--ink-4);
+  flex: 1; min-width: 260px; max-width: 96ch; text-wrap: pretty;
+}
+.panel__note b { font-weight: 600; color: var(--ink-2); }
+.panel__spacer { flex: 1; }
+/* Зауваження форми бувають довгі: переносяться в межах картки, а не тягнуть її вшир. */
+#form-msg, #item-msg { white-space: normal; max-width: 100%; overflow-wrap: anywhere; }
+.panel__count {
+  font: 400 11.5px var(--mono); color: var(--mut-2);
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+/* Сторінка з N — це показник, а не кнопка: раніше він стояв у сегменті
+   пофарбований акцентом і читався як активний перемикач. */
+.pager { display: flex; align-items: center; gap: 2px; flex: none; }
+.pager__ind {
+  font: 500 11.5px var(--mono); color: var(--ink-3);
+  padding: 0 10px; white-space: nowrap; font-variant-numeric: tabular-nums;
+}
+
+.card { background: var(--card); border: 1px solid var(--bd); border-radius: 4px; overflow: hidden; }
+
+/* Горизонтальний повзунок — так, вертикального всередині картки бути не повинно:
+   він створював другий скрол і сірі «обрізки» на зведенні та в картці засобу. */
+.card--scroll { overflow-x: auto; overflow-y: hidden; }
+
+/* Велика таблиця як окрема робоча область: власна прокрутка по обох осях,
+   тому «position: sticky» шапки нарешті працює. */
+.card--fill {
+  flex: 1 1 auto; min-height: 220px; overflow: auto;
+  display: block; scrollbar-gutter: stable;
+}
+.scroll--fill > .card--fill { flex: 1 1 auto; margin-bottom: 0; }
+.scroll--fill > .empty { flex: 1 1 auto; }
+.scroll--fill > .panel { margin-bottom: 12px; }
+.scroll--fill > .panel:last-child { margin: 12px 0 0; }
+
+.card__head {
+  padding: 13px 18px; border-bottom: 1px solid var(--bd-2);
+  display: flex; flex-wrap: wrap; align-items: center; gap: 12px;
+}
+.card__title { font: 600 13px var(--sans); color: var(--ink); }
+.card__foot {
+  padding: 14px 18px; background: var(--card-2); border-top: 1px solid var(--bd-2);
+  display: flex; flex-wrap: wrap; align-items: center; gap: 12px;
+}
+
+.chip {
+  flex: none; display: flex; align-items: center; gap: 8px;
+  border: 1px solid var(--bd); background: var(--card); border-radius: 3px;
+  padding: 6px 10px; cursor: pointer; font-family: var(--sans);
+}
+.chip:hover { border-color: var(--hover-bd); }
+.chip:focus-within { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+.chip.is-on { border-color: var(--accent-bd); background: var(--accent-soft); }
+.chip__label {
+  font: 500 9px var(--mono); letter-spacing: .7px;
+  color: var(--mut-2); text-transform: uppercase; flex: none;
+}
+.chip.is-on .chip__label { color: var(--accent); }
+.chip__value { font: 500 11.5px var(--sans); color: var(--ink-2); }
+.chip select {
+  border: 0; background: transparent; font: 500 11.5px var(--sans);
+  color: var(--ink-2); padding: 0; cursor: pointer; max-width: 190px;
+}
+.chip--wide select { max-width: 330px; }
+.chip select:focus { outline: none; }
+
+.seg { display: flex; border: 1px solid var(--bd); border-radius: 3px; overflow: hidden; flex: none; }
+.seg button {
+  padding: 6px 13px; font: 500 11.5px var(--sans); cursor: pointer;
+  background: var(--card); color: var(--ink-4); border: 0;
+  border-right: 1px solid var(--bd-2); white-space: nowrap;
+}
+.seg button:last-child { border-right: 0; }
+.seg button:hover { background: var(--card-3); color: var(--ink-2); }
+.seg button:active { background: #e9eae4; }
+.seg button.is-on { background: var(--accent); color: #fff; }
+.seg button.is-on:hover { background: var(--accent-hi); color: #fff; }
+.seg button[disabled] { color: var(--mut-3); cursor: not-allowed; pointer-events: none; }
+.seg :focus-visible { outline-offset: -2px; }
+
+/* ------------------------------------------------------------------ таблиці */
+.tbl { min-width: var(--tbl-min, 1040px); }
+
+/* Шапка росте під двоярусні підписи замість того, щоб виштовхувати рядок
+   тексту за свою межу (раніше «З ПІДЛЕГЛИМИ» злітало в шапку картки). */
+.tbl__head {
+  display: flex; align-items: flex-end; padding: 10px 8px 0; min-height: 40px;
+  border-bottom: 1px solid var(--bd); background: var(--card-2);
+  position: sticky; top: 0; z-index: 3;
+  /* Тінь кольору самої шапки закриває субпіксельну щілину, крізь яку
+     прозирав верхній рядок під час прокручування. */
+  box-shadow: 0 -4px 0 var(--card-2);
+}
+.tbl__h {
+  font: 600 9px var(--mono); letter-spacing: .5px; color: var(--mut-2);
+  text-transform: uppercase; padding-bottom: 9px; line-height: 1.25;
+  align-self: flex-end;
+}
+.tbl__group {
+  display: flex; align-items: center; gap: 8px; padding: 0 15px;
+  height: 28px; background: var(--card-3);
+  border-top: 1px solid var(--bd-2); border-bottom: 1px solid var(--bd-2);
+  position: sticky; top: 39px; z-index: 2;
+}
+.tbl__group:first-child { border-top: 0; }
+.tbl__group b {
+  font: 600 11px var(--sans); color: var(--ink-2);
+  letter-spacing: .2px; text-transform: uppercase;
+}
+.tbl__group span { font: 400 10.5px var(--mono); color: var(--mut-2); }
+.tbl__row {
+  display: flex; align-items: center; padding: var(--row-pad) 8px;
+  min-height: var(--row-h);
+  border-bottom: 1px solid var(--bd-3); cursor: pointer;
+  scroll-margin-top: 72px;
+}
+.tbl__row:hover { background: #f6f8f2; }
+.tbl__row:active { background: #eef2e8; }
+.tbl__row.is-sel { background: var(--accent-soft); box-shadow: inset 2px 0 0 var(--accent); }
+.tbl__row--plain { cursor: default; }
+/* Закритий підрозділ — в історії, але вже без майна й нових документів. */
+.tbl__row--closed .c-name b { color: var(--mut-2); font-weight: 500; }
+.tbl__row--plain:hover, .tbl__row--plain:active { background: transparent; }
+.tbl__row:last-child { border-bottom: 0; }
+
+/* Симетричний жолоб на кожній комірці: сусідні колонки завжди розділені 14px,
+   незалежно від того, ліворівняна колонка чи праворівняна. */
+.c-code, .c-name, .c-unit, .c-date, .c-txt, .c-num, .c-tag, .c-status { padding: 0 var(--gut); }
+/* Номери документів бувають довгі («ТЗ20220000-003») — вони обрізаються,
+   а не переносяться другим рядком і не ламають висоту рядка. */
+.c-code, .c-date {
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.c-code { width: 88px; flex: none; font: 400 11px var(--mono); color: var(--mut); }
+.c-tag { width: 104px; flex: none; }
+
+/* Назва і її уточнення (код, тип підрозділу, зав. №) стоять в один рядок.
+   Раніше уточнення було другим рядком і не влазило у висоту рядка: на щільному
+   режимі воно перетинало межу й читалося як підпис до НАСТУПНОЇ позиції. */
+/* Найменування важливіше за маршрут, тож на широких екранах воно забирає
+   дві третини вільного місця, а не половину. */
+.c-name { flex: 2 1 0; min-width: 0; display: flex; align-items: baseline; gap: 8px; }
+.c-name b {
+  font: 500 12.5px/1.35 var(--sans); color: var(--ink);
+  min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.c-name small {
+  flex: none; font: 400 10.5px var(--mono); color: var(--mut-3);
+  white-space: nowrap;
+}
+.c-name .tag { flex: none; align-self: center; }
+/* Реєстр знищеного: назва, а під нею одиниця й обставини другим рядком.
+   Поруч із назвою обставини не вміщалися й лізли на сусідні колонки. */
+.c-name--stack { display: block; }
+.c-name--stack b { display: block; }
+.c-name--stack small { display: block; overflow: hidden; text-overflow: ellipsis; }
+[data-wrap='1'] .c-name--stack small { white-space: normal; }
+/* Другий рядок у вузькій колонці: дата рапорту під номером, днів без акта під станом. */
+.c-code small, .c-tag small { display: block; font: 400 10.5px var(--mono); color: var(--mut-3); }
+.c-tag small.num-bad { color: var(--bad); }
+.c-unit { width: 62px; flex: none; font: 400 11px var(--mono); color: var(--mut-2); }
+.c-num {
+  width: 70px; flex: none; text-align: right;
+  font: 500 12px var(--mono); color: var(--ink-3);
+  font-variant-numeric: tabular-nums;
+}
+.c-num--dim { color: var(--mut-3); }
+.c-num--wide { width: 88px; }
+.c-num--xwide { width: 112px; }
+.c-num--pct { width: 78px; }
+.c-num--input { width: 90px; display: flex; justify-content: flex-end; align-items: center; }
+.tbl__h.c-num--input { display: block; }
+.c-date { width: 96px; flex: none; font: 400 11px var(--mono); color: var(--mut); }
+.c-date--w { width: 116px; }
+.c-txt { flex: 1 1 0; min-width: 0; font: 400 12px var(--sans); color: var(--ink-3);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.tag {
+  display: inline-flex; align-items: center; padding: 2px 6px; border-radius: 2px;
+  font: 500 10px var(--mono); letter-spacing: .3px;
+}
+.tag--in { background: #eef3ea; color: var(--ok); }
+.tag--mv { background: #eef0f3; color: #4a5a6e; }
+.tag--out { background: #f6ece9; color: var(--bad); }
+.tag--ser { background: var(--card-3); color: var(--mut); border: 1px solid var(--bd-2); }
+/* Вид обліку за ФЕС: необоротні активи (10/11) чи запаси (15/18); пунктир —
+   у знімках ФЕС позиції не було, ознака з паперів служби. */
+.tag--na { background: rgba(61, 86, 102, .10); color: #3d5666; border: 1px solid rgba(61, 86, 102, .3); }
+.tag--stock { background: rgba(176, 120, 30, .10); color: #7a5410; border: 1px solid rgba(176, 120, 30, .35); }
+.tag--unsure { border-style: dashed; }
+/* Смуга фільтрів усередині картки підрозділу: без власної рамки, впритул до таблиці. */
+.sub-filter, .panel--inset { border: 0; border-bottom: 1px solid var(--bd); border-radius: 0; margin: 0; padding: 8px 14px; }
+/* Пошук усередині панелі реєстру — поруч із чипами, а не в шапці сторінки. */
+.search--panel { flex: 0 1 240px; padding: 5px 10px; }
+
+.bar {
+  width: 46px; height: 4px; border-radius: 2px; background: var(--bd-2); flex: none;
+  margin-left: var(--gut); overflow: hidden;
+}
+.bar i { display: block; height: 100%; border-radius: 2px; background: var(--bad); }
+.bar--ok i { background: var(--ok); }
+
+.num-bad { color: var(--bad); }
+.num-ok { color: var(--ok); }
+.num-warn { color: var(--warn); }
+
+/* -------------------------------------------------------------------- плитки */
+.tiles {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 12px; margin-bottom: 12px;
+}
+.tile {
+  background: var(--card); border: 1px solid var(--bd); border-radius: 4px;
+  padding: 14px 16px; display: flex; flex-direction: column;
+}
+.tile__label {
+  font: 600 9px var(--mono); letter-spacing: .7px;
+  color: var(--mut-2); text-transform: uppercase;
+}
+.tile__value {
+  font: 600 24px/1.1 var(--sans); color: var(--ink); margin-top: 7px;
+  font-variant-numeric: tabular-nums; letter-spacing: -.2px;
+}
+.tile__value small { font: 500 12px var(--mono); color: var(--mut-2); letter-spacing: 0; }
+.tile__hint { font: 400 11px/1.45 var(--sans); color: var(--mut); margin-top: auto; padding-top: 5px; }
+
+.grid-2 {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr));
+  gap: 12px; align-items: start;
+}
+
+/* -------------------------------------------------------------------- форми */
+/* Форма живе на тій самій сітці, що й таблиці під нею: раніше max-width 1060px
+   різав її правий край десь посеред екрана. */
+.form__grid {
+  padding: 18px; display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 15px 18px; border-bottom: 1px solid var(--bd-2);
+}
+.field label {
+  display: block; font: 600 9px var(--mono); letter-spacing: .7px;
+  color: var(--mut-2); text-transform: uppercase; margin-bottom: 6px;
+}
+.field input, .field select, .field textarea {
+  width: 100%; border: 1px solid var(--bd); border-radius: 3px; background: var(--card);
+  padding: 8px 10px; font: 400 12.5px var(--sans); color: var(--ink);
+}
+.field input:hover, .field select:hover, .field textarea:hover { border-color: var(--hover-bd); }
+.field textarea { resize: vertical; min-height: 58px; }
+.field input:focus, .field select:focus, .field textarea:focus {
+  outline: none; border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+  background: var(--card);
+}
+.field input::placeholder, .field textarea::placeholder { color: var(--mut-3); }
+.field__hint { font: 400 10.5px var(--sans); color: var(--mut-3); margin-top: 5px; }
+.field--bad input, .field--bad select { border-color: var(--bad); background: #fdf7f6; }
+.field--span { grid-column: 1 / -1; }
+/* Вибір номенклатури — найдовший рядок у формі, йому дві колонки. */
+.field--span2 { grid-column: span 2; }
+
+/* Норма редагується просто в клітинці таблиці — поле має читатися як поле,
+   але не гриміти на сотні рядків. */
+.norm {
+  width: 62px; text-align: right; border: 1px solid var(--bd-2); border-radius: 2px;
+  padding: 2px 5px; font: 500 12px var(--mono); color: var(--ink);
+  background: var(--card-2); font-variant-numeric: tabular-nums;
+}
+.norm:hover { border-color: var(--hover-bd); background: var(--card); }
+.norm:focus {
+  outline: none; border-color: var(--accent); background: var(--card);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+.norm::placeholder { color: var(--mut-3); }
+
+.subhead {
+  padding: 16px 18px 6px; display: flex; align-items: center;
+  justify-content: space-between; gap: 10px;
+}
+.subhead b { font: 600 12px var(--sans); color: var(--ink-3); }
+.subhead span { font: 400 11px var(--mono); color: var(--mut-3); }
+.pad { padding: 0 18px 18px; }
+
+.callout {
+  border: 1px solid var(--bd-2); background: var(--card-3); border-radius: 3px;
+  padding: 10px 12px; font: 400 11.5px/1.55 var(--sans); color: var(--ink-4);
+}
+.callout--bad { border-color: #e6cdc8; background: #fdf6f5; color: #7d382e; }
+.callout--ok { border-color: #cfdcc8; background: #f4f7f0; color: #3c5533; }
+
+/* -------------------------------------------------------------- порожні стани */
+/* Порожній стан — не помилка, а сторінка книги, яку ще не почали заповнювати:
+   картка займає всю робочу область, текст іде в один вимірюваний стовпчик. */
+.empty {
+  background: var(--card); border: 1px solid var(--bd); border-radius: 4px;
+  /* Нижній відступ більший за верхній — блок стає в оптичний центр, а не в
+     геометричний, інакше в повноекранній картці він «провалюється» вниз. */
+  padding: 48px 32px 96px; text-align: center;
+  flex: 1 1 auto; min-height: 260px;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+}
+.empty__mark {
+  width: 44px; height: 44px; margin: 0 0 16px; border-radius: 3px;
+  border: 1px dashed var(--hover-bd); display: flex; align-items: center;
+  justify-content: center; font: 400 18px var(--mono); color: var(--mut-2);
+  background: var(--card-3); flex: none;
+}
+.empty__title { font: 600 14px var(--sans); color: var(--ink-2); }
+.empty__text {
+  font: 400 12px/1.65 var(--sans); color: var(--mut); margin: 9px 0 0; max-width: 52ch;
+  text-align: left; text-wrap: pretty;
+}
+.empty__acts { margin-top: 20px; display: flex; gap: 9px; justify-content: center; flex-wrap: wrap; }
+
+/* -------------------------------------------------------------- картка засобу */
+.spec { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 14px 18px; }
+.spec__k {
+  font: 600 9px var(--mono); letter-spacing: .7px;
+  color: var(--mut-2); text-transform: uppercase;
+}
+.spec__v { font: 500 13px var(--sans); color: var(--ink); margin-top: 4px; }
+.spec__v--mono { font-family: var(--mono); font-size: 12.5px; }
+
+/* ------------------------------------------------------------------- журнали */
+.jr { min-width: var(--tbl-min, 1200px); font-family: var(--mono); }
+
+/* Двоярусна шапка книги прилипає обома ярусами: без цього на сотнях рядків
+   не видно, під якою ТМЦ (чи під яким підрозділом) стоїть цифра. */
+.jr__head { display: flex; background: var(--card-2); position: sticky; z-index: 3; }
+.jr__head--top {
+  top: 0; border-bottom: 1px solid var(--bd-2);
+  box-shadow: 0 -4px 0 var(--card-2);
+}
+.jr__head--sub {
+  top: calc(var(--jr-top-h, 34px) - 1px); z-index: 2;
+  background: var(--card-3); border-bottom: 1px solid var(--bd);
+}
+.jr__blk {
+  border-left: 1px solid var(--bd-2); text-align: center;
+  font: 600 9px/1.3 var(--mono); letter-spacing: .5px; color: var(--mut-2);
+  text-transform: uppercase; padding: 7px 5px;
+  display: flex; align-items: center; justify-content: center;
+}
+/* Назви ТМЦ у шапці журналу 14 — це дані, а не підпис: без caps і не довше
+   двох рядків, повний текст лишається в title. */
+/* Назва ТМЦ обрізається на другому рядку. Затискач живе на вкладеному span:
+   flex-елемент блокифікується у flow-root і -webkit-line-clamp на ньому мертвий. */
+.jr__blk--name {
+  text-transform: none; letter-spacing: 0; font-weight: 500;
+  color: var(--ink-3); text-align: left; align-items: flex-start;
+  overflow: hidden; padding: 8px 6px;
+}
+.jr__nm {
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden; width: 100%;
+}
+/* Гнучка колонка — рівно одна на рядок, з однаковою базою в обох ярусах шапки
+   й у тілі. Тоді вільний простір розподіляється однаково і яруси не роз'їжджаються. */
+.jr__flex { flex: 1 1 var(--fb, 150px); min-width: var(--fb, 150px); }
+/* Підпис колонки стоїть там само, де стоятимуть її значення. */
+.jr__blk--n { justify-content: flex-end; }
+.jr__blk--l { justify-content: flex-start; padding-left: 6px; }
+
+/* Рядок книги завжди однорядковий, тому line-height = висота рядка:
+   комірка заповнює рядок по висоті (смугування без прогалин), а текст
+   лишається блоком — інакше не працює обрізання з трьома крапками. */
+.jr__row {
+  display: flex; border-bottom: 1px solid var(--bd-3);
+  min-height: 30px; align-items: stretch;
+}
+.jr__row:hover { background: #f6f8f2; }
+.jr__row:last-child { border-bottom: 0; }
+.jr__cell {
+  font: 400 11px/30px var(--mono); color: var(--ink-3); padding: 0 6px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.jr__n {
+  text-align: right; font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+.jr__zero { color: transparent; }
+
+/* Колонка залишку — акцент типографікою, а не сірим прямокутником:
+   раніше нульові клітинки читалися як порожні поля вводу. */
+.jr__open {
+  font-weight: 600; color: var(--ink);
+  box-shadow: inset 1px 0 0 var(--bd-3);
+}
+
+/* Смугування по блоках підрозділів / ТМЦ: єдине, що робить широку книгу
+   читабельною — видно, де закінчується один блок і де починається наступний. */
+.jr__b1 { background: #f3f5f0; }
+.jr__row:hover .jr__b1 { background: #edf1e6; }
+.jr__sep { border-left: 1px solid var(--bd-2); }
+/* Книга № 47: у графі підрозділу — залишок після запису. Там, де його змінив
+   документ, — жирно й зі зміною; решта — чинний залишок, блідо. */
+.jr__hit { font-weight: 700; color: var(--ink); }
+.jr__hit small { font-weight: 500; font-size: 9.5px; color: var(--mut-2); margin-right: 3px; }
+.jr__was { font-weight: 400; color: var(--mut-3); }
+
+/* ------------------------------------------------------------------- налашт. */
+/* Панель відкривається біля ⚙, а не в протилежному куті екрана. */
+.tweaks {
+  position: fixed; left: 12px; bottom: 54px; z-index: 20; width: 264px;
+  background: var(--card); border: 1px solid var(--bd-strong); border-radius: 4px;
+  box-shadow: 0 10px 30px rgba(25, 28, 25, .24); padding: 14px;
+  /* зі скороченнями панель вища за екран ноутбука — гортається всередині,
+     а не виїжджає верхом (оформленням) за край */
+  max-height: calc(100vh - 66px); overflow-y: auto;
+}
+.tweaks h4 {
+  margin: 0 0 12px; font: 600 9px var(--mono); letter-spacing: .7px;
+  color: var(--mut-2); text-transform: uppercase;
+}
+.tweaks__row { margin-bottom: 14px; }
+.tweaks__row:last-child { margin-bottom: 0; }
+.tweaks__label {
+  display: block; margin-bottom: 7px;
+  font: 500 9px var(--mono); letter-spacing: .7px;
+  color: var(--mut-2); text-transform: uppercase;
+}
+/* Три режими щільності — три рівні колонки. Раніше «Дуже щільна» переносилась
+   на другий рядок і сегмент розвалювався. */
+.tweaks .seg { display: grid; grid-template-columns: repeat(3, 1fr); }
+.tweaks .seg button { padding: 6px 4px; text-align: center; font-size: 11px; }
+.swatches { display: flex; gap: 7px; }
+.swatch {
+  width: 26px; height: 22px; border-radius: 3px; border: 1px solid rgba(0, 0, 0, .2);
+  cursor: pointer; padding: 0; box-shadow: 0 0 0 0 var(--card), 0 0 0 0 var(--ink);
+}
+.swatch:hover { box-shadow: 0 0 0 2px var(--card), 0 0 0 3px var(--bd-strong); }
+.swatch.is-on { box-shadow: 0 0 0 2px var(--card), 0 0 0 3px var(--ink); }
+
+/* У десктоп-режимі рамку вікна малює Windows — власний titlebar зайвий. */
+body.is-native .titlebar { display: none; }
+
+.hidden { display: none !important; }
+
+/* Підказка, що таблиця ширша за екран: тінь біля правого краю зникає,
+   коли прокрутили до кінця. Без неї «некомплект» і «забезпеченість»
+   просто не існують для того, хто не здогадався потягнути вбік. */
+.card--scroll, .card--fill {
+  background-image:
+    linear-gradient(to right, var(--card) 30%, rgba(255, 255, 255, 0)),
+    linear-gradient(to right, rgba(255, 255, 255, 0), var(--card) 70%),
+    linear-gradient(to right, rgba(25, 28, 25, .10), rgba(25, 28, 25, 0)),
+    linear-gradient(to left, rgba(25, 28, 25, .10), rgba(25, 28, 25, 0));
+  background-position: 0 0, 100% 0, 0 0, 100% 0;
+  background-repeat: no-repeat;
+  background-size: 28px 100%, 28px 100%, 12px 100%, 12px 100%;
+  background-attachment: local, local, scroll, scroll;
+}
+
+/* Робоча зона зі своєю прокруткою підказує краєм, що список триває. */
+.scroll--fill > .card--fill { border-color: var(--bd-strong); }
+
+
+/* ---------------------------------------------------------------------- друк */
+@media print {
+  body { overflow: visible; background: #fff; }
+  .app { height: auto; display: block; }
+  .body { display: block; }
+  /* На папері не лишається жодного органу керування — лише дані. */
+  .titlebar, .side, .btn, .search, .tweaks, .seg, .chip, .pager,
+  .panel__count, .empty__acts { display: none !important; }
+  .head__stamp {
+    display: block; width: 100%; order: 9;
+    font: 400 9pt var(--mono); color: #3a3e39; padding-top: 4px;
+  }
+  .main, .scroll { overflow: visible; height: auto; }
+  .scroll, .scroll--fill { display: block; padding: 0; }
+  .card, .panel { border-color: #9a9e96; break-inside: auto; box-shadow: none; }
+  .card--scroll, .card--fill {
+    overflow: visible; max-height: none; min-height: 0;
+    background-image: none;
+  }
+  .jr, .tbl { min-width: 0 !important; }
+  /* Книга ширша за аркуш. Стискаються ТІЛЬКИ числові колонки — текстові
+     (дата, документ, номер, контрагент) тримають ширину, інакше з аркуша
+     зникає те, ЧИМ саме проведено рух, і лишаються самі цифри.
+     Числові блоки в обох ярусах шапки й у тілі мають однакову сумарну базу,
+     тому стискаються на однакову величину і колонки не роз'їжджаються. */
+  .jr__cell, .jr__blk, .jr__flex { flex-shrink: 0; }
+  .jr__n, .jr__blk--n, .jr__blk--name, .jr__blk--grp { flex-shrink: 1; min-width: 0; }
+  .jr__cell { padding: 0 2px; }
+  .jr__blk { padding: 6px 2px; }
+  /* Стиснута числова колонка не вміщає слова «прих.» — на папері лишається
+     скорочення, на екрані підпис повний. */
+  .jr__blk--n[data-short] { font-size: 0; letter-spacing: 0; }
+  .jr__blk--n[data-short]::after { content: attr(data-short); font-size: 6pt; }
+  .jr__row, .tbl__row, .tbl__group { break-inside: avoid; }
+  /* Шапка книги повторюється на кожній сторінці, а не «прилипає» до одного місця. */
+  .jr__head, .tbl__head, .tbl__group { position: static; }
+  .jr__head { break-inside: avoid; break-after: avoid; }
+  .jr__cell, .jr__blk { font-size: 7.5pt; }
+  .jr__cell { line-height: 22px; }
+  .jr__row { min-height: 22px; }
+  .tbl__row { min-height: 0; padding: 3px 8px; }
+  .jr__b1, .jr__open { background: #f2f2ef !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  .tag { border: 1px solid #b8bcb2; background: none !important; color: #3a3e39 !important; }
+  .head { border-bottom: 1px solid #9a9e96; padding: 0 0 6px; }
+  .head__row { min-height: 0; padding: 0; }
+  .crumb { color: #5c6058; }
+  .panel__note { color: #3a3e39; }
+  @page { size: A4 landscape; margin: 10mm; }
+}
+
+/* ------------------------------------------------- рядки документа у формі */
+/* Накладна — це шапка й таблиця рядків. Кожен рядок показує, скільки майна є
+   у відправника на дату документа, тому помилку видно до проведення. */
+.lines { border-top: 1px solid var(--bd); margin-top: 6px; }
+.lines__head, .lines__row {
+  display: grid; gap: 8px; align-items: center; padding: 6px 16px;
+  grid-template-columns: 26px minmax(260px, 1fr) 176px minmax(140px, .5fr) 28px;
+}
+.lines__head:has(.lines__price), .lines__row:has(.lines__price) {
+  grid-template-columns: 26px minmax(260px, 1fr) 176px 110px minmax(140px, .5fr) 28px;
+}
+.lines__head {
+  font: 500 9px var(--mono); letter-spacing: .7px; text-transform: uppercase;
+  color: var(--mut-2); border-bottom: 1px solid var(--bd);
+}
+.lines__row + .lines__row { border-top: 1px dashed var(--bd); }
+.lines__no { font: 500 11px var(--mono); color: var(--mut-2); }
+.lines input {
+  width: 100%; border: 1px solid var(--bd); border-radius: 3px; background: var(--card);
+  padding: 7px 9px; font: 400 12.5px var(--sans); color: var(--ink);
+}
+.lines input:hover { border-color: var(--hover-bd); }
+.lines input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+.lines input::placeholder { color: var(--mut-3); }
+.lines__qty, .lines__price input { font-variant-numeric: tabular-nums; }
+.lines__qty { display: flex; align-items: center; gap: 6px; }
+.lines__qty input { width: 72px; flex: none; text-align: right; font-family: var(--mono); }
+.lines__price input { text-align: right; font-family: var(--mono); }
+.lines__qty input.is-bad, .lines__price input.is-bad { border-color: var(--bad); background: rgba(176, 58, 46, .06); }
+/* Скільки є у відправника — одразу біля кількості; клац бере все. */
+.lines__av { min-width: 0; }
+.lines__avail {
+  border: 1px solid var(--bd); border-radius: 3px; background: #f6f8f2; cursor: pointer;
+  font: 500 11px var(--mono); color: var(--ink-3); padding: 4px 6px; white-space: nowrap;
+}
+.lines__avail:hover:not(:disabled) { border-color: var(--accent); color: var(--ink); }
+.lines__avail.is-bad { color: var(--bad); border-color: rgba(176, 58, 46, .45); background: #fdf7f6; }
+.lines__avail:disabled { cursor: default; }
+/* Прихід за іншою ціною: позиції потрібен новий код. */
+.lines__avail--code, .lines__avail--code:hover:not(:disabled) { color: var(--bad); border-color: rgba(176, 58, 46, .45); background: #fdf7f6; }
+.lines__avail--code:hover:not(:disabled) { border-color: var(--bad); }
+.lines__unit { font: 400 11px var(--mono); color: var(--mut-2); }
+/* Інше майно в рапорті: назва, кількість з одиницею, ціна, примітка — у тій
+   самій сітці, а документ списання — під рядком. */
+.lines__row.lines__row--other { grid-template-columns: 26px minmax(260px, 1fr) 176px 110px minmax(140px, .5fr) 28px; }
+.lines .lines__uom { width: 58px; flex: none; font-family: var(--sans); text-align: left; }
+.lines__off { grid-column: 2 / 6; display: flex; align-items: center; gap: 8px; }
+.lines__off-l { font: 500 9px var(--mono); letter-spacing: .7px; text-transform: uppercase; color: var(--mut-2); }
+.lines .lines__off input { width: 180px; }
+.lines .lines__off input[type="date"] { width: 150px; }
+/* «за док.» під ціною в реєстрі знищеного */
+.c-num small { display: block; font: 400 10.5px var(--mono); color: var(--mut-3); }
+
+/* Перелік для вибору найменування: пошук, а праворуч — наявність. Лежить
+   поверх усього (position: fixed), тож картка форми його не обрізає. */
+.pick {
+  position: fixed; z-index: 50; display: none; flex-direction: column;
+  background: var(--card); border: 1px solid var(--bd-strong); border-radius: 4px;
+  box-shadow: 0 12px 30px rgba(25, 28, 25, .24); overflow: hidden;
+}
+.pick__head {
+  flex: none; display: flex; gap: 12px; justify-content: space-between; align-items: baseline;
+  padding: 7px 12px; background: #f6f8f2; border-bottom: 1px solid var(--bd-2);
+  font: 500 10.5px var(--mono); color: var(--mut-2);
+}
+.pick__head span { color: var(--mut-3); font-weight: 400; white-space: nowrap; }
+.pick__list { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+.pick__opt { display: flex; align-items: baseline; gap: 12px; padding: 6px 12px; cursor: pointer; }
+.pick__opt + .pick__opt { border-top: 1px solid var(--bd-3); }
+.pick__opt:hover { background: #f6f8f2; }
+.pick__opt.is-active { background: var(--accent-soft); box-shadow: inset 2px 0 0 var(--accent); }
+.pick__opt.is-used { opacity: .5; }
+.pick__code { flex: none; min-width: 48px; font: 400 11px var(--mono); color: var(--mut); }
+.pick__name { flex: 1 1 auto; min-width: 0; font: 400 12.5px/1.35 var(--sans); color: var(--ink); }
+.pick__name mark { background: #f1e2a0; color: inherit; border-radius: 2px; padding: 0 1px; }
+.pick__why { display: block; font: 400 11px var(--sans); color: var(--mut-2); margin-top: 1px; }
+.pick__qty { flex: none; font: 600 12px var(--mono); color: var(--ink); white-space: nowrap; }
+.pick__empty { padding: 10px 12px; font: 400 12px var(--sans); color: var(--mut-2); }
+.pick__opt--new {
+  flex: none; border-top: 1px solid var(--bd-2); color: var(--accent);
+  font: 500 12px var(--sans); padding: 9px 12px;
+}
+@media print { .pick { display: none !important; } }
+.lines__del {
+  background: none; border: 1px solid transparent; border-radius: 3px;
+  color: var(--mut-2); cursor: pointer; padding: 4px 6px; line-height: 1;
+}
+.lines__del:hover:not(:disabled) { color: var(--bad); border-color: var(--bd-strong); }
+.lines__del:disabled { opacity: .3; cursor: default; }
+/* Вужче за 1140 px (ноутбук з масштабом 125 %, вікно не на весь екран) шести
+   колонкам тісно: примітка переходить під найменування, ✕ лишається в рядку. */
+@media (max-width: 1140px) {
+  .lines__head, .lines__row { grid-template-columns: 26px minmax(200px, 1fr) 176px 28px; }
+  .lines__head:has(.lines__price), .lines__row:has(.lines__price),
+  .lines__row.lines__row--other { grid-template-columns: 26px minmax(200px, 1fr) 176px 110px 28px; }
+  .lines__head .lines__note { display: none; }
+  .lines__row .lines__note { grid-column: 2 / -2; }
+  .lines__row .lines__del { grid-row: 1; grid-column: -2 / -1; }
+  .lines__off { grid-column: 2 / -1; }
+}
+.lines__foot { display: flex; align-items: center; gap: 12px; padding: 10px 16px; }
+.field label .req { color: var(--bad); }
+
+/* Повідомлення про проведений документ: показується один раз, зверху сторінки. */
+.flash {
+  margin-bottom: 12px; padding: 10px 14px; border-radius: 4px;
+  background: rgba(76, 110, 62, .10); border: 1px solid rgba(76, 110, 62, .35);
+  font: 400 12px var(--sans); color: var(--fg);
+}
+.tag--mine { background: rgba(76, 110, 62, .14); color: var(--ok); border-color: rgba(76, 110, 62, .3); }
+
+/* Стан документа — одне слово, яке читається за півсекунди. */
+.status {
+  display: inline-flex; align-items: center; padding: 2px 7px; border-radius: 2px;
+  border: 1px solid transparent; font: 600 9.5px var(--mono); letter-spacing: .6px;
+  white-space: nowrap; vertical-align: middle;
+}
+.status--draft { background: rgba(176, 120, 30, .12); color: #7a5410; border-color: rgba(176, 120, 30, .45); }
+.status--editing { background: rgba(176, 120, 30, .12); color: #7a5410; border-color: rgba(176, 120, 30, .6); border-style: dashed; }
+.status--posted { background: rgba(76, 110, 62, .13); color: var(--ok); border-color: rgba(76, 110, 62, .4); }
+.status--fixed { background: rgba(61, 86, 102, .10); color: #3d5666; border-color: rgba(61, 86, 102, .4); }
+.num-warn { color: var(--warn); }
+.status--big { font-size: 11px; padding: 4px 10px; letter-spacing: .9px; }
+.c-status { width: 96px; flex: none; }
+.subtitle { font: 400 11.5px/1.35 var(--sans); color: var(--mut-2); margin-top: 3px; max-width: 920px; }
+.doc-sum__diff { margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--bd-2); }
+@media print { .subtitle, .status--draft, .status--editing { display: none !important; } }
+
+/* Чіп-перемикач: та сама висота, що й у фільтрів-міток поруч. */
+.chip--btn { cursor: pointer; font: 400 11px var(--sans); color: var(--mut); }
+.chip--btn.is-on { border-color: var(--accent); color: var(--fg); }
+
+/* Дії в рядку реєстру — словом, не значком: «✓» читалося як «готово», «⇥» не
+   означало нічого (консиліум 01.10.2026, п'ятеро з п'яти). Ширина графи задається
+   на таблиці змінною --acts, щоб шапка й рядки збігалися. Кнопки видно завжди:
+   людина з мишею не здогадається, що щось з'явиться при наведенні. */
+.c-acts { flex: 0 0 var(--acts, 96px); display: flex; gap: 3px; justify-content: flex-end; align-items: center;
+  padding: 0 var(--gut); }
+.ico-btn {
+  background: none; border: 1px solid transparent; border-radius: 3px; cursor: pointer;
+  color: var(--mut); font: 400 11px/1.2 var(--sans); padding: 3px 7px; white-space: nowrap;
+}
+.ico-btn:hover { color: var(--fg); border-color: var(--bd-strong); background: var(--card); }
+.ico-btn:disabled { color: var(--mut-3); cursor: default; }
+.ico-btn:disabled:hover { border-color: transparent; background: none; }
+.ico-btn--bad:hover { color: var(--bad); border-color: #dcbdb6; }
+/* Головна дія рядка — та, заради якої сюди прийшли («Списати актом…»). */
+.ico-btn--main { color: var(--accent); border-color: var(--accent); font-weight: 500; }
+.ico-btn--main:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
+/* Графа дій у два поверхи: головна дія, під нею решта дрібніше. */
+.c-acts--col { flex-direction: column; align-items: flex-end; gap: 2px; }
+.acts__more { display: flex; gap: 0; }
+.acts__more .ico-btn { font-size: 10.5px; padding: 1px 5px; color: var(--mut-2); }
+/* Сума, а під нею ціна — одна графа замість двох, щоб реєстр уміщався в 1366 px. */
+.c-num--stack small { display: block; font: 400 10px var(--mono); color: var(--mut-3); }
+.tbl__more { display: flex; align-items: center; gap: 12px; padding: 10px 16px; }
+@media print { .c-acts, .tbl__more, #doc-form { display: none !important; } }
+
+.tweaks__hint { margin-top: 8px; font: 400 10px var(--mono); color: var(--mut-2); line-height: 1.4; }
+/* Словничок у ⚙: скорочення служби для тих, хто тільки починає. */
+.tweaks__gloss div { display: flex; gap: 8px; align-items: baseline; padding: 2px 0; font: 400 11px/1.35 var(--sans); }
+.tweaks__gloss b { flex: 0 0 62px; font: 600 10.5px var(--mono); color: var(--ink); }
+.tweaks__gloss span { color: var(--mut-2); }
+
+/* Повідомлення в куті вікна: про вивантаження в Excel, видно на будь-якому екрані. */
+.toast {
+  position: fixed; right: 18px; bottom: 18px; z-index: 40; max-width: 460px;
+  padding: 10px 14px; border-radius: 4px; box-shadow: 0 8px 24px rgba(25, 28, 25, .22);
+  background: var(--card); border: 1px solid rgba(76, 110, 62, .45);
+  font: 400 12px var(--sans); color: var(--fg); transition: opacity .6s;
+}
+.toast--bad { border-color: var(--bad); }
+.toast--out { opacity: 0; }
+@media print { .toast { display: none !important; } }
+
+/* Посилання всередині рядка: найменування веде в картку засобу, номер акта —
+   в сам акт. Пунктир, а не суцільне підкреслення: у таблиці їх десятки. */
+.lnk { cursor: pointer; text-decoration: underline dotted var(--mut-3); text-underline-offset: 2px; }
+.lnk:hover { color: var(--accent); text-decoration: underline solid; }
+.jr__row[data-open] { cursor: pointer; }
+/* Підсумок документа: під рядками, не клікабельний. */
+.tbl__row--total { background: #f6f8f2; border-top: 1px solid var(--bd-3); }
+.tbl__row--total .c-num { color: var(--ink); font-weight: 600; }
+
+/* ---------------------------------------------------- звірки з підрозділами */
+.btn--sm { padding: 4px 9px; font-size: 11px; }
+.flash--info { background: rgba(61, 86, 102, .08); border-color: rgba(61, 86, 102, .3); }
+/* «З чого почати»: щоденні дії служби як кнопки. */
+.intro__grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 8px; padding: 4px 18px 10px;
+}
+.intro__item {
+  text-align: left; padding: 9px 11px; border: 1px solid var(--bd); border-radius: 3px;
+  background: var(--card-2); cursor: pointer; font: inherit; color: var(--ink);
+}
+.intro__item:hover { border-color: var(--accent); background: var(--accent-soft); }
+.intro__item b { display: block; font: 600 12.5px/1.3 var(--sans); margin-bottom: 2px; }
+.intro__item span { display: block; font: 400 11.5px/1.35 var(--sans); color: var(--mut-2); }
+.intro__keys { padding-top: 0; padding-bottom: 12px; font: 400 11px/1.4 var(--mono); color: var(--mut-2); }
+.intro__keys b { color: var(--ink-3); }
+
+/* Рядок таблиці з клавіатури: видно, де курсор. */
+.tbl__row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+/* Підсумок перед проведенням: що саме зміниться в обліку. */
+.doc-sum {
+  margin: 0 18px 10px; padding: 9px 12px; border: 1px solid var(--bd);
+  border-left: 3px solid var(--accent); border-radius: 3px; background: var(--card-2);
+  font: 500 12.5px/1.45 var(--sans); color: var(--ink);
+}
+.doc-sum small {
+  display: block; margin-top: 3px; font: 400 11.5px/1.4 var(--sans); color: var(--mut-2);
+}
+.doc-sum--empty { border-left-color: var(--bd-strong); color: var(--mut-2); font-weight: 400; }
+
+.flash--warn { background: rgba(176, 120, 30, .10); border-color: rgba(176, 120, 30, .45);
+  display: flex; align-items: center; gap: 12px; justify-content: space-between; }
+/* Повідомлення з наступним кроком: текст ліворуч, кнопка праворуч. */
+.flash--acts { display: flex; align-items: center; gap: 12px; justify-content: space-between; }
+/* Згорнутий блок картки: другорядне (комісія, посадовці, скани) не тисне на головне. */
+details.fold > summary { cursor: pointer; list-style: none; display: flex; align-items: center; gap: 8px; }
+details.fold > summary::-webkit-details-marker { display: none; }
+details.fold > summary .card__title::before { content: '▸'; display: inline-block; width: 14px; color: var(--mut-2); }
+details.fold[open] > summary .card__title::before { content: '▾'; }
+details.fold > summary .fold__hint { font: 400 11px var(--sans); color: var(--mut-2); margin-left: auto;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* Підрозділ, з яким звірка прострочена чи не підписана, — червона риска зліва. */
+.tbl__row.is-due { box-shadow: inset 3px 0 0 var(--bad); }
+/* Рядок відомості з розбіжністю: облік, ФЕС і наявність не сходяться. */
+.tbl__row.is-diff { background: #fdf3f1; }
+.tbl__row.is-diff:hover { background: #fbecE8; }
+.rc-in {
+  width: 72px; border: 1px solid var(--bd); border-radius: 3px; background: var(--card);
+  padding: 4px 6px; font: 500 12px var(--mono); text-align: right; color: var(--ink);
+}
+.rc-in:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+.rc-in:disabled { background: transparent; border-color: transparent; color: var(--ink-3); }
+.rc-in--wide { width: 100%; text-align: left; font-family: var(--sans); }
+/* Перелік у рядку таблиці займає свою графу й не заходить на сусідню. */
+.tbl__row select { width: 100%; }
+.rc-note { flex: 1.3 1 0; }
+.chip input[type="date"] { border: 0; background: transparent; font: 500 11.5px var(--mono); color: var(--ink); }
+
+/* Запис у файл не вдався — червона смуга над усім, доки не вийде. */
+.save-bar {
+  position: fixed; top: 0; left: 0; right: 0; z-index: 60;
+  padding: 9px 16px; background: #a8322a; color: #fff;
+  font: 500 12.5px var(--sans); text-align: center; box-shadow: 0 2px 10px rgba(0, 0, 0, .25);
+}
+@media print { .save-bar { display: none !important; } }
+
+/* ---------------------------------------------------- заміни в штаті */
+/* Правило читається зліва направо: чим замінюють → замість чого. */
+.sb-new {
+  padding: 16px 18px; display: grid; gap: 12px 16px; align-items: start;
+  grid-template-columns: minmax(240px, 1fr) auto minmax(300px, 1.3fr);
+  border-bottom: 1px solid var(--bd-2);
+}
+.sb-new__arrow { font: 400 20px var(--sans); color: var(--mut-3); padding-top: 24px; }
+@media (max-width: 900px) { .sb-new { grid-template-columns: 1fr; } .sb-new__arrow { display: none; } }
+.sb-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+.sb-chip {
+  display: inline-flex; align-items: center; gap: 7px; padding: 4px 3px 4px 8px;
+  border: 1px solid var(--accent); background: var(--accent-soft); border-radius: 3px;
+  font: 500 12px var(--sans); color: var(--ink);
+}
+.sb-chip > b { font: 600 11px var(--mono); color: var(--accent); }
+.sb-chip small { font: 400 10.5px var(--mono); color: var(--mut-2); }
+.sb-chip__x { border: 0; background: none; color: var(--mut-2); cursor: pointer; padding: 0 5px; font-size: 11px; }
+.sb-chip__x:hover { color: var(--bad); }
+.sb-quick { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; margin-top: 8px;
+  font: 400 10.5px var(--sans); color: var(--mut-3); }
+.st-detail__acts { margin-top: 8px; }
+/* Охоплення інвентаризації: уся частина чи обрані підрозділи. */
+.st-scope { font: 400 12.5px var(--sans); color: var(--ink); padding: 6px 0; }
+.st-scope summary { cursor: pointer; }
+.st-scope__list { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 8px; }
+.st-scope__list label { display: inline-flex; align-items: center; gap: 5px; font: 400 12px var(--sans);
+  text-transform: none; letter-spacing: 0; color: var(--ink); margin: 0; }
+/* Звітна дата не сьогоднішня — видно з будь-якого екрана. */
+.asof-past #as-of { background: #fff3cd; border-color: #c9a227; }
+.asof-chip { background: #fff3cd; border-color: #c9a227; color: #6d5412; }
+
+/* Скан перетягують на картку документа — підсвічуємо, куди він ляже. */
+#scroll.is-drop { outline: 2px dashed var(--accent); outline-offset: -8px; background: var(--accent-soft); }
+.tile--drop .tile__hint .btn { margin-top: 2px; }
+
+/* Вибір пошуком у журналах: поле в чіпі, поточний пункт у переліку позначено. */
+.combo { min-width: 0; }
+.combo__input {
+  border: 0; background: transparent; outline: none; min-width: 320px; width: 34vw; max-width: 520px;
+  font: 500 12px var(--sans); color: var(--ink); padding: 2px 0;
+}
+.combo__input::placeholder { color: var(--mut-3); }
+.pick__opt.is-current .pick__name { font-weight: 600; }
+.pick__opt.is-current .pick__name::before { content: '✓ '; color: var(--accent); }
+
+/* ---------------------------------------------------- файли й перегляд */
+.files__grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px;
+  padding: 12px 16px 16px;
+}
+.file {
+  position: relative; display: flex; flex-direction: column; gap: 4px; min-width: 0;
+  padding: 8px; border: 1px solid var(--bd-2); border-radius: 4px; background: var(--card-2); cursor: pointer;
+}
+.file:hover { border-color: var(--accent); background: var(--accent-soft); }
+.file__thumb { width: 100%; height: 96px; object-fit: cover; border-radius: 3px; background: var(--bd-3); }
+.file__ico {
+  display: grid; place-items: center; height: 96px; border-radius: 3px; background: var(--field);
+  font: 600 14px var(--mono); letter-spacing: .5px; color: var(--ink-3);
+}
+.file__ico--big { height: 110px; width: 110px; margin: 0 auto 12px; font-size: 22px; }
+.file__name {
+  font: 500 12px/1.3 var(--sans); color: var(--ink); word-break: break-word;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.file__meta { font: 400 10.5px var(--mono); color: var(--mut-2); }
+.file__del { position: absolute; top: 4px; right: 4px; background: var(--card); }
+.files__empty { padding: 12px 18px 16px; font: 400 12.5px var(--sans); color: var(--mut); }
+.tile[data-vw], .scan[data-vw] { cursor: pointer; }
+.scan[data-vw]:hover { color: var(--accent); }
+
+.viewer {
+  position: fixed; inset: 0; z-index: 80; display: flex; justify-content: center; align-items: stretch;
+  padding: 22px; background: rgba(18, 22, 18, .72);
+}
+.viewer__box {
+  display: flex; flex-direction: column; width: min(1240px, 100%); background: var(--card);
+  border-radius: 6px; overflow: hidden; box-shadow: 0 24px 70px rgba(0, 0, 0, .45);
+}
+.viewer__bar { display: flex; align-items: center; gap: 8px; padding: 9px 12px; border-bottom: 1px solid var(--bd); }
+.viewer__name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font: 600 13px var(--sans); color: var(--ink); }
+.viewer__count { font: 400 11px var(--mono); color: var(--mut-2); white-space: nowrap; }
+.viewer__body { flex: 1 1 auto; min-height: 0; display: flex; align-items: center; justify-content: center;
+  background: #2b302b; overflow: auto; }
+.viewer__body img { max-width: 100%; max-height: 100%; object-fit: contain; }
+.viewer__body iframe { width: 100%; height: 100%; border: 0; background: #fff; }
+.viewer__none { background: var(--card); padding: 28px 36px; border-radius: 6px; text-align: center; max-width: 480px;
+  font: 400 13px/1.5 var(--sans); color: var(--ink-2); }
+
+/* ---------------------------------------------------- люди й інвентаризація */
+.tbl__row.is-sel { background: var(--accent-soft); box-shadow: inset 3px 0 0 var(--accent); }
+.st-member { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; }
+.st-member select { flex: 1 1 auto; min-width: 0; }
+/* Інше місце в плані інвентаризації: назва й МВО — двома полями в одній графі, «проведено» поруч із ✕. */
+.st-place { display: grid; gap: 4px; align-content: center; }
+.st-place__last { display: flex; gap: 6px; align-items: center; }
+.st-place__last .rc-in { flex: 1 1 auto; min-width: 0; }
+.form .pad .field select, .form .pad .field input { width: 100%; }
+.c-txt small { display: block; color: var(--mut-2); font-size: 11px; }
+/* Рядок опису: знищене за рапортом, ще не списане, — не нестача, а задокументована втрата. */
+.tbl__row.is-gone { background: #fff8e6; }
+
+/* ---------------------------------------------------- потребує уваги */
+.att {
+  display: flex; align-items: center; gap: 12px; padding: 9px 18px; border-top: 1px solid var(--bd-3);
+  cursor: pointer; font: 500 13px var(--sans); color: var(--ink);
+}
+.att:hover { background: var(--card-3); }
+.att__n {
+  min-width: 34px; padding: 2px 8px; border-radius: 3px; text-align: center;
+  font: 600 13px var(--mono); background: var(--field); color: var(--ink-2);
+}
+.att--bad .att__n { background: #f6dcd8; color: var(--bad); }
+.att--warn .att__n { background: #f5e8cf; color: var(--warn); }
+.att--info .att__n { background: var(--accent-soft); color: var(--accent); }
+.att__text { flex: 1 1 auto; min-width: 0; }
+.att__text small { display: block; margin-top: 1px; font: 400 11.5px var(--sans); color: var(--mut-2);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* Праворуч у рядку — не стрілка, а дія: що саме зараз зробити. */
+.att__go {
+  flex: none; color: var(--accent); font: 600 11.5px var(--sans); white-space: nowrap;
+  padding: 3px 8px; border: 1px solid var(--bd); border-radius: 3px; background: var(--card);
+}
+.att:hover .att__go { border-color: var(--accent); background: var(--accent-soft); }
+.att-card--ok .card__head { border-bottom: 0; }
+
+/* ---------------------------------------------------- сортування, розклад некомплекту */
+.tbl__h.is-sortable { cursor: pointer; user-select: none; }
+.tbl__h.is-sortable:hover { color: var(--accent); }
+.tbl__h.is-sorted { color: var(--accent); }
+.st-detail { padding: 8px 18px 12px 34px; background: var(--card-2); border-bottom: 1px solid var(--bd-3);
+  font: 400 12.5px var(--sans); color: var(--ink-2); }
+.st-detail__head { font: 600 10px var(--mono); letter-spacing: .6px; text-transform: uppercase; color: var(--mut-2);
+  margin-bottom: 4px; }
+.st-detail__row { display: grid; grid-template-columns: minmax(180px, 1.4fr) 110px 120px 1fr; gap: 10px; padding: 2px 0; }
+.st-detail__row.num-bad span:last-child { font-weight: 600; }
+.st-detail__codes { line-height: 1.7; }
+
+/* ---------------------------------------------------- пошук по всьому */
+.side__search {
+  display: flex; align-items: center; gap: 6px; width: 100%; margin-top: 10px; padding: 7px 9px;
+  border: 1px solid var(--side-input-bd); border-radius: 3px; background: var(--side-input);
+  color: var(--side-fg-dim); font: 500 11.5px var(--sans); cursor: pointer; text-align: left;
+}
+.side__search:hover { color: var(--side-fg); border-color: var(--side-label); }
+.side__search kbd, .palette__in kbd {
+  margin-left: auto; padding: 1px 5px; border: 1px solid currentColor; border-radius: 3px;
+  font: 500 9.5px var(--mono); opacity: .7;
+}
+.palette { position: fixed; inset: 0; z-index: 85; display: flex; justify-content: center; align-items: flex-start;
+  padding-top: 12vh; background: rgba(18, 22, 18, .45); }
+.palette__box { width: min(760px, calc(100% - 40px)); background: var(--card); border-radius: 6px;
+  box-shadow: 0 24px 70px rgba(0, 0, 0, .4); overflow: hidden; }
+.palette__in { display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--bd); }
+.palette__in span { font: 500 16px var(--mono); color: var(--mut-2); }
+.palette__in input { flex: 1 1 auto; border: 0; outline: none; font: 500 15px var(--sans); color: var(--ink); background: transparent; }
+.palette__in kbd { color: var(--mut-2); }
+.palette__list { max-height: 56vh; overflow: auto; padding: 4px 0; }
+.palette__opt { display: flex; align-items: center; gap: 10px; padding: 8px 16px; cursor: pointer; }
+.palette__opt.is-active, .palette__opt:hover { background: var(--accent-soft); }
+.palette__type { flex: 0 0 104px; font: 600 9.5px var(--mono); letter-spacing: .5px; text-transform: uppercase; color: var(--mut-2); }
+.palette__label { flex: 1 1 auto; min-width: 0; font: 500 13px var(--sans); color: var(--ink);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.palette__meta { flex: 0 1 260px; font: 400 11.5px var(--sans); color: var(--mut-2); text-align: right;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* ---------------------------------------------------- вікно: копії, журнал змін */
+.modal__box { max-width: 980px; }
+/* Пам’ятка: текст на одну сторінку, дві колонки; на папері — лише вона. */
+.memo { padding: 8px 20px 14px; font: 400 12.5px/1.45 var(--sans); color: var(--ink); }
+.memo__head { display: flex; align-items: center; gap: 12px; padding: 6px 0 4px; border-bottom: 1px solid var(--bd); }
+.memo__head h2 { flex: 1 1 auto; margin: 0; font: 600 16px/1.3 var(--sans); }
+.memo__cols { display: grid; grid-template-columns: 1fr 1fr; gap: 0 28px; }
+.memo h3 { margin: 12px 0 4px; font: 600 12px/1.3 var(--mono); text-transform: uppercase; letter-spacing: .04em; color: var(--mut); }
+.memo ul, .memo ol { margin: 0; padding-left: 18px; }
+.memo li { margin: 2px 0; }
+.memo__gloss div { display: flex; gap: 8px; align-items: baseline; padding: 1px 0; }
+.memo__gloss b { flex: 0 0 60px; font: 600 11px var(--mono); }
+.memo__pairs div { display: flex; gap: 10px; align-items: baseline; padding: 1px 0; }
+.memo__pairs b { flex: 0 0 140px; font-weight: 600; }
+.memo__pairs--keys b { font: 600 11px var(--mono); }
+.memo__foot { margin-top: 12px; padding-top: 6px; border-top: 1px solid var(--bd); font: 400 11px var(--mono); color: var(--mut-2); }
+@media (max-width: 760px) { .memo__cols { grid-template-columns: 1fr; } }
+@media print {
+  body.printing-memo .app, body.printing-memo #modal .viewer__bar { display: none !important; }
+  body.printing-memo #modal { position: static; padding: 0; background: #fff; display: block; }
+  body.printing-memo .viewer__box { box-shadow: none; width: auto; max-width: none; border-radius: 0; }
+  body.printing-memo .modal__body { overflow: visible; }
+  body.printing-memo .memo { padding: 0; font-size: 11pt; }
+  body.printing-memo .memo__cols { gap: 0 20pt; }
+}
+.modal__body { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 0 0 12px; }
+.modal__body .panel { margin: 12px 16px; }
