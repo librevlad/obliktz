@@ -263,7 +263,7 @@
   /** «зав. № …» — як одиницю називають у накладній. Без заводського номера
    *  лишається шасі, без нього — інвентарний номер із бирки. */
   const unitLabel = (u) => (!u ? '' : u.serial ? `зав. № ${u.serial}`
-    : u.chassis ? `шасі № ${u.chassis}` : u.inv ? `інв. № ${u.inv}` : '');
+    : u.chassis ? `шасі № ${u.chassis}` : u.inv ? `бирка ${u.inv}` : '');
 
   // ------------------------------------------------------- користувацькі дані
   // У десктоп-режимі стан лежить у файлі поруч із програмою (його видно, можна
@@ -2995,7 +2995,7 @@
         <button type="button" class="btn btn--sm" data-act="un-new" data-code="${esc(i.code)}"
           title="Завести одиницю з номером: потім її можна назвати в приході">+ Одиниця</button></div>
       <div class="card--scroll"><div class="tbl" style="--tbl-min:980px">
-        <div class="tbl__head"><div class="tbl__h c-code" style="width:110px">інв. №</div>
+        <div class="tbl__head"><div class="tbl__h c-code" style="width:110px" title="Власний номер служби на одиниці">бирка</div>
           <div class="tbl__h c-code" style="width:150px">зав. №</div><div class="tbl__h c-code" style="width:110px">шасі</div>
           <div class="tbl__h c-num">рік</div><div class="tbl__h c-num">кат.</div>
           <div class="tbl__h c-txt">де числиться · примітка</div>
@@ -9921,16 +9921,20 @@
     if (need > 1e-9) out.push({ price: null, q: need, d: '' });
     return out;
   }
+  /** Інвентарний номер для паперу — той, під яким майно веде ФЕС (необоротний актив). Власний
+   *  номер служби з бирки («код/NNN») у документ не йде: це внутрішня позначка, комісія й ФЕС
+   *  звіряють за номером ФЕС. Запаси інвентарного номера не мають. */
+  const fesInvNo = (it) => (it && it.fes && it.nonrev ? String(it.fes) : '');
   function valLineOf(code, o) {
     const it = itemBy.get(code) || {};
-    return valLine(Object.assign({ code, name: cleanName(it.name || code), uom: it.unit || '' }, o));
+    return valLine(Object.assign({ code, name: cleanName(it.name || code), uom: it.unit || '', inv: fesInvNo(it) }, o));
   }
   function valLinesOfUnit(id, date) {
     const u = unitBy.get(String(id));
     const a = u ? unitArrival(u.id, '9999-12-31', null) : null;
     if (!u) return [];
     return [valLineOf(u.code, { src: { kind: 'unit', unit: String(u.id), doc: a ? keyOfRow(a) : '', label: `${unitLabel(u)}${a ? `; ${valDocLabel(a)}` : ''}`,
-      holder: unitHolderAt(u.id, date, null) || '' }, serial: u.serial || '', inv: u.inv || '', qty: '1', price: a ? valMoney(a.price) : '',
+      holder: unitHolderAt(u.id, date, null) || '' }, serial: u.serial || '', qty: '1', price: a ? valMoney(a.price) : '',
     acq: a ? a.lot || a.d : '' })];
   }
   function valLinesOfDz(r) {
@@ -9950,7 +9954,7 @@
       const u = r.unit ? unitBy.get(String(r.unit)) : null;
       for (const part of rowParts(r)) {
         out.push(valLineOf(r.code, { src: { kind: 'doc', doc: key, unit: u ? String(u.id) : '', label: valDocLabel(r) }, serial: u ? u.serial || '' : '',
-          inv: u ? u.inv || '' : '', qty: valQty(part.q), price: valMoney(part.price), acq: part.d || (r.kind === 'in' ? r.d : '') }));
+          qty: valQty(part.q), price: valMoney(part.price), acq: part.d || (r.kind === 'in' ? r.d : '') }));
       }
     });
     return out;
@@ -10121,7 +10125,8 @@
         <label class="chip"><input type="checkbox" name="onlyEmpty" checked> не змінювати вже вказане в рядку</label></div>`
     : `<div class="form__grid"><div class="field field--span"><label>Найменування, модель, марка</label><input name="name" value="${esc(v.name)}" autocomplete="off"></div>
         <div class="field"><label>Заводський номер</label><input name="serial" value="${esc(v.serial)}" autocomplete="off"></div>
-        <div class="field"><label>Інвентарний номер</label><input name="inv" value="${esc(v.inv)}" autocomplete="off"></div>
+        <div class="field"><label>Інвентарний номер</label><input name="inv" value="${esc(v.inv)}" autocomplete="off"
+          title="Номер, під яким майно веде ФЕС; номер служби з бирки сюди не пишуть"></div>
         <div class="field"><label>Одиниця виміру</label><input name="uom" value="${esc(v.uom)}" autocomplete="off"></div>
         <div class="field"><label>Кількість</label><input name="qty" value="${esc(v.qty)}" inputmode="decimal" autocomplete="off"></div>
         <div class="field field--span"><label>Примітка (графа 12)</label><input name="note" value="${esc(v.note)}" autocomplete="off"></div></div>
@@ -10205,7 +10210,7 @@
           fmtNum(stockOn(st.code), '0')} ${esc(it.unit || '')}</small></div>
           <div class="c-acts" style="flex-basis:150px"><button type="button" class="btn btn--sm" data-vp-back>← Інша позиція</button></div>`)
           + us.map(({ u, a }) => row(`<div class="c-txt" style="flex:0 0 36px"><input type="checkbox" data-vp-unit="${esc(u.id)}"></div>
-            <div class="c-name"><b>${esc(unitLabel(u) || 'одиниця без номера')}</b><small>${esc([u.inv ? `інв. № ${u.inv}` : '', u.year ? `${u.year} р.` : '',
+            <div class="c-name"><b>${esc(unitLabel(u) || 'одиниця без номера')}</b><small>${esc([u.inv ? `бирка ${u.inv}` : '', u.year ? `${u.year} р.` : '',
     unitHolderAt(u.id, date, null) || 'ніде не числиться'].filter(Boolean).join(' · '))}</small></div>
             <div class="c-num" style="width:120px">${a ? fmtMoney(a.price) : '—'}</div>`)).join('')
           + valBatches(st.code).map((b, i) => row(`<div class="c-num" style="width:86px"><input class="rc-in" data-vp-lot="${i}" inputmode="decimal"
@@ -10485,7 +10490,8 @@
       options.map(([val, text]) => `<option value="${esc(val)}"${String(v[name] ?? '') === String(val) ? ' selected' : ''}>${esc(text)}</option>`).join('')}</select></div>`;
     const el = modalOpen(`${off ? 'Списати' : 'Оприбуткувати'}: ${ln ? ln.name || 'рядок' : 'новий рядок'}`, `<form id="yats-form"><div class="form__grid">
         ${inp('name', off ? 'Найменування військового майна' : 'Найменування озброєння (техніки, майна)', ' field--span')}
-        ${off ? inp('serial', 'Заводський номер') + inp('inv', 'Інвентарний номер') : ''}
+        ${off ? inp('serial', 'Заводський номер') + inp('inv', 'Інвентарний номер', '',
+          ' title="Номер, під яким майно веде ФЕС; номер служби з бирки сюди не пишуть"') : ''}
         ${inp('code', 'Код номенклатури')}${inp('uom', 'Одиниця виміру')}${sel('cat', 'Категорія', VAL_ROMAN.map((r, i) => [String(i + 1), r]))}
         ${inp('qty', 'Кількість', '', ' inputmode="decimal"')}${inp('price', off ? 'Ціна за одиницю, грн' : 'Залишкова вартість за одиницю, грн', '', ' inputmode="decimal"')}
         ${off ? inp('normTerm', 'Експлуатується за нормою') + sel('normUnit', 'Одиниця строку за нормою', ACT_TERM_UNITS.map((u) => [u, u]))
