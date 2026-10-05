@@ -2434,7 +2434,7 @@
         <button type="button" class="btn" data-act="short-xls" title="Некомплект по підрозділах в Excel">Заявка на некомплект</button>
         <button type="button" class="btn" data-act="form21-xls" title="Форма 21/Прод у бланку вищого штабу на звітну дату">Форма 21/Прод</button>
         <button type="button" class="btn" data-act="form21-set"
-          title="Зведена за частину, управління (усе поза батальйонами) і кожен батальйон: книга з аркушами й окремі файли в одній теці">21/Прод: комплект</button>
+          title="Зведена за частину, управління (усе поза батальйонами) і кожен батальйон: книга з аркушами, окремі файли й розшифровка до форми в одній теці">21/Прод: комплект</button>
       </div>${ownLineCard()}
       <div class="card card--scroll"><div class="tbl" style="--tbl-min:820px">
         <div class="tbl__head">
@@ -11048,7 +11048,7 @@
    *  батальйон — книга з аркушем на кожного й ті самі форми окремими файлами в одній теці. */
   function form21SetExcel() {
     return toExcel({ kind: 'form21set', date: state.asOf, file: `21 Прод на ${state.asOf}`,
-      note: 'Окремі файли за батальйонами лежать у тій самій теці.' });
+      note: 'Окремі файли за батальйонами й розшифровка до форми лежать у тій самій теці.' });
   }
 
   function shortageExcel() {
