@@ -1182,6 +1182,8 @@ class Handler(BaseHTTPRequestHandler):
                       "tech_act": techact_export.save_tech_act,
                       # Форма 21/Прод у бланку вищого штабу — зі звіту по базі.
                       "form21": lambda s, f: form21.save_form21(db(), s, f),
+                      # Комплект: зведена, управління й кожен батальйон — книгою й окремими файлами.
+                      "form21set": lambda s, f: form21.save_form21_set(db(), s, f),
                       # Книги обліку № 47 і № 14 за рік — паперові томи й електронні, по базі.
                       "journals": lambda s, f: journals.save_journals(db(), s, f),
                       }.get(spec.get("kind"), excel_export.save)

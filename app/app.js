@@ -2428,8 +2428,11 @@
             ? `, із замінами <b class="num-ok">${Math.round(covS * 100)}%</b>` : ''}</div>
         <button type="button" class="chip chip--btn${state.staffAll ? ' is-on' : ''}" data-act="staff-all"
           title="Показати й позиції форми без штату та без кодів служби">${state.staffAll ? '✓ ' : ''}усі позиції форми</button>
+        <div style="flex-basis:100%;height:0"></div><div class="panel__spacer"></div>
         <button type="button" class="btn" data-act="short-xls" title="Некомплект по підрозділах в Excel">Заявка на некомплект</button>
         <button type="button" class="btn" data-act="form21-xls" title="Форма 21/Прод у бланку вищого штабу на звітну дату">Форма 21/Прод</button>
+        <button type="button" class="btn" data-act="form21-set"
+          title="Зведена за частину, управління (усе поза батальйонами) і кожен батальйон: книга з аркушами й окремі файли в одній теці">21/Прод: комплект</button>
       </div>
       <div class="card card--scroll"><div class="tbl" style="--tbl-min:820px">
         <div class="tbl__head">
@@ -10974,6 +10977,12 @@
   function form21Excel() {
     return toExcel({ kind: 'form21', sub: state.sub || '', date: state.asOf, file: `21 Прод на ${state.asOf}` });
   }
+  /** Комплект одним рухом: зведена за частину, управління (усе поза батальйонами) і кожен
+   *  батальйон — книга з аркушем на кожного й ті самі форми окремими файлами в одній теці. */
+  function form21SetExcel() {
+    return toExcel({ kind: 'form21set', date: state.asOf, file: `21 Прод на ${state.asOf}`,
+      note: 'Окремі файли за батальйонами лежать у тій самій теці.' });
+  }
 
   function shortageExcel() {
     const date = state.asOf;
@@ -13026,7 +13035,8 @@
       });
       const j = await r.json();
       if (!j.ok) throw new Error(j.error || 'помилка вивантаження');
-      toast(j.opened ? `Відкрито ${spec.word ? 'у Word' : 'в Excel'}: ${j.path}` : `Файл збережено: ${j.path}`);
+      toast((j.opened ? `Відкрито ${spec.word ? 'у Word' : 'в Excel'}: ${j.path}` : `Файл збережено: ${j.path}`)
+        + (spec.note ? `. ${spec.note}` : ''));
     } catch (e) {
       toast(`Не вдалося вивантажити ${spec.word ? 'у Word' : 'в Excel'}: ${e.message}`, true);
     }
@@ -14334,6 +14344,7 @@ ${r.other ? r.name : it ? it.name : r.code} — ${fmtNum(r.qty)}, `
       case 'lines-all': linesAll(); break;
       case 'short-xls': shortageExcel(); break;
       case 'form21-xls': form21Excel(); break;
+      case 'form21-set': form21SetExcel(); break;
       case 'losses-xls': lossesExcel(); break;
       case 'sub-nomen': go('nomen', { sub: state.subName, q: '' }); break;
       case 'sub-j14': go('j14', { j14sub: state.subName, j14page: 1 }); break;

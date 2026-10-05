@@ -79,11 +79,12 @@ class Report:
         return [x for x in self.lines if x.need or x.have or x.destroyed]
 
 
+# Підрозділи охоплення підставляються переліком номерів ({subs}): так рахується і піддерево
+# (батальйон з усім підпорядкованим), і «все, крім батальйонів».
 _NEED = """
 SELECT n.report_line_id AS id, SUM(n.qty_milli) AS qty
 FROM norm n
-JOIN subdivision_tree t ON t.descendant_id = n.subdivision_id
-WHERE t.ancestor_id = :sub AND n.report_line_id IS NOT NULL
+WHERE n.subdivision_id IN ({subs}) AND n.report_line_id IS NOT NULL
   AND n.valid_from <= :as_of AND (n.valid_to IS NULL OR n.valid_to > :as_of)
 GROUP BY n.report_line_id
 """
@@ -92,8 +93,7 @@ _HAVE = """
 SELECT m.report_line_id AS id, SUM(p.sign * p.qty_milli) AS qty
 FROM posting p
 JOIN nomen_report_line m ON m.nomen_id = p.nomen_id
-JOIN subdivision_tree t ON t.descendant_id = p.subdivision_id
-WHERE t.ancestor_id = :sub AND p.doc_date <= :as_of
+WHERE p.subdivision_id IN ({subs}) AND p.doc_date <= :as_of
 GROUP BY m.report_line_id
 """
 
@@ -101,19 +101,30 @@ _DESTROYED = """
 SELECT m.report_line_id AS id, SUM(d.qty_milli) AS qty
 FROM destroyed_open d
 JOIN nomen_report_line m ON m.nomen_id = d.nomen_id
-JOIN subdivision_tree t ON t.descendant_id = d.subdivision_id
-WHERE t.ancestor_id = :sub AND d.doc_date <= :as_of
+WHERE d.subdivision_id IN ({subs}) AND d.doc_date <= :as_of
 GROUP BY m.report_line_id
 """
+
+
+def subtree(con, subdivision_id: int) -> list:
+    """Підрозділ з усім підпорядкованим — номери записів довідника."""
+    return [r[0] for r in con.execute(
+        "SELECT descendant_id FROM subdivision_tree WHERE ancestor_id = ?", (subdivision_id,))]
 
 
 def collect(con, subdivision_id: int, as_of: str) -> Report:
     name = con.execute("SELECT name FROM subdivision WHERE id = ?",
                        (subdivision_id,)).fetchone()[0]
-    p = dict(sub=subdivision_id, as_of=as_of)
-    need = {r["id"]: r["qty"] for r in con.execute(_NEED, p)}
-    have = {r["id"]: r["qty"] for r in con.execute(_HAVE, p)}
-    gone = {r["id"]: r["qty"] for r in con.execute(_DESTROYED, p)}
+    return collect_subs(con, subtree(con, subdivision_id), as_of, name)
+
+
+def collect_subs(con, subdivision_ids, as_of: str, name: str) -> Report:
+    """Потреба, наявність і знищене за переліком підрозділів на дату."""
+    subs = ",".join(str(int(x)) for x in subdivision_ids) or "NULL"
+    p = dict(as_of=as_of)
+    need = {r["id"]: r["qty"] for r in con.execute(_NEED.format(subs=subs), p)}
+    have = {r["id"]: r["qty"] for r in con.execute(_HAVE.format(subs=subs), p)}
+    gone = {r["id"]: r["qty"] for r in con.execute(_DESTROYED.format(subs=subs), p)}
 
     rep = Report(subdivision=name, as_of=as_of)
     by_section = {}
@@ -247,10 +258,8 @@ def file_name(as_of: str, unit: str = "") -> str:
     return f"{unit or 'А0000'} - 21 Прод {quarter_title(as_of)}.xlsx"
 
 
-def build_form21(con, subdivision_id: int, as_of: str, out_path) -> Report:
-    rep = collect(con, subdivision_id, as_of)
-    wb = load_workbook(TEMPLATE)
-    ws = wb.active
+def _fill(ws, rep: Report) -> None:
+    """Аркуш бланка — числами звіту: марки в офіційні рядки, решта у вільні, формули розділів."""
     blocks, total_row = _blocks(ws)
     by_section = {_norm(b.name): b for b in blocks}
     other = blocks[-1]
@@ -291,19 +300,38 @@ def build_form21(con, subdivision_id: int, as_of: str, out_path) -> Report:
         rep.unofficial.append(line.name)
     for block in blocks:
         _section_formulas(ws, block)
-
-    unit = _unit_code(con)
-    root = con.execute("SELECT id FROM subdivision WHERE parent_id IS NULL ORDER BY id LIMIT 1").fetchone()
-    if root and root[0] == subdivision_id and unit:
-        ws.title = unit
-    elif not (root and root[0] == subdivision_id):
-        ws.title = re.sub(r"[\\/*?:\[\]]", " ", rep.subdivision)[:31] or ws.title
     ws.print_area = f"A1:{LAST}{ws.max_row}"
     # Бланк на одну сторінку завширшки й на стільки заввишки, скільки треба; шапка (3:7) — з бланка.
     ws.page_setup.orientation = "landscape"
     ws.page_setup.fitToWidth = 1
     ws.page_setup.fitToHeight = 0
     ws.sheet_properties.pageSetUpPr.fitToPage = True
+
+
+def _sheet_title(text: str) -> str:
+    return re.sub(r"[\\/*?:\[\]]", " ", str(text))[:31].strip()
+
+
+def _file_part(text: str) -> str:
+    """Назва підрозділу в імені файлу — без знаків, яких не приймає Windows."""
+    return re.sub(r'[<>:"/\\|?*]', " ", str(text)).strip(" .")
+
+
+def _root_id(con) -> int:
+    return con.execute("SELECT id FROM subdivision WHERE parent_id IS NULL ORDER BY id LIMIT 1").fetchone()[0]
+
+
+def build_form21(con, subdivision_id: int, as_of: str, out_path) -> Report:
+    rep = collect(con, subdivision_id, as_of)
+    wb = load_workbook(TEMPLATE)
+    ws = wb.active
+    _fill(ws, rep)
+    unit = _unit_code(con)
+    whole = _root_id(con) == subdivision_id
+    if whole and unit:
+        ws.title = unit
+    elif not whole:
+        ws.title = _sheet_title(rep.subdivision) or ws.title
     save_book(wb, out_path)
     return rep
 
@@ -323,8 +351,88 @@ def save_form21(con, spec: dict, folder) -> str:
     unit = _unit_code(con)
     base = file_name(as_of, unit)
     if name:
-        base = base.replace(".xlsx", f" — {re.sub(r'[\\\\/*?:\\[\\]]', ' ', name)}.xlsx")
+        base = base.replace(".xlsx", f" — {_file_part(name)}.xlsx")
     Path(folder).mkdir(parents=True, exist_ok=True)
     path = Path(folder) / base
     build_form21(con, sub, as_of, path)
+    return str(path)
+
+
+# ------------------------------------------------------------------ комплект
+HQ = "Управління"                  # усе, що не входить до жодного батальйону
+
+
+def scopes(con) -> list:
+    """Охоплення комплекту: [(назва, [номери підрозділів], чинний)]. Перша — уся частина (назва
+    порожня), далі управління — усе поза батальйонами, далі кожен батальйон з усім підпорядкованим.
+    Батальйон, що стоїть усередині іншого (колишня назва після переформування), окремо не йде:
+    його майно й штат рахуються за тим, до якого він увійшов."""
+    whole = subtree(con, _root_id(con))
+    bats = [(r[0], r[1], bool(r[2])) for r in con.execute(
+        "SELECT s.id, s.name, s.is_active FROM subdivision s JOIN subdivision_kind k ON k.id = s.kind_id "
+        "WHERE k.code = 'батальйон' ORDER BY s.sort, s.id")]
+    inside = {b[0]: set(subtree(con, b[0])) for b in bats}
+    top = [b for b in bats if b[0] in whole and not any(b[0] in inside[o[0]] for o in bats if o[0] != b[0])]
+    taken = set().union(*(inside[b[0]] for b in top)) if top else set()
+    return ([("", whole, True), (HQ, [x for x in whole if x not in taken], True)]
+            + [(name, sorted(inside[bid]), active) for bid, name, active in top])
+
+
+def _blank_copy(wb, src):
+    """Ще один чистий аркуш бланка в тій самій книзі — з його шапкою для друку й закріпленням."""
+    ws = wb.copy_worksheet(src)
+    ws.print_title_rows = src.print_title_rows
+    ws.freeze_panes = src.freeze_panes
+    ws.sheet_view.zoomScale = src.sheet_view.zoomScale
+    ws.oddHeader.center.text, ws.oddFooter.center.text = src.oddHeader.center.text, src.oddFooter.center.text
+    return ws
+
+
+def _name_sheet(ws, title: str, unit: str) -> None:
+    """Назва аркуша й рядок над заголовком бланка: чий це примірник. Зведена за частину — як
+    звичайна форма: аркуш зветься умовним найменуванням, рядок над заголовком порожній."""
+    if not title:
+        if unit:
+            ws.title = unit
+        return
+    ws.title = _sheet_title(title) or ws.title
+    ws["A1"] = title
+    ws["A1"].font = copy(ws["A2"].font)
+    ws["A1"].alignment = copy(ws["A2"].alignment)
+
+
+def save_form21_set(con, spec: dict, folder) -> str:
+    """Комплект форми 21/Прод одним рухом: зведена за частину, управління (усе поза батальйонами)
+    і кожен батальйон. У теці «21 Прод <квартал>» лягає книга-комплект з аркушем на кожного й ті
+    самі форми окремими файлами. `spec` — {date: станом на}. Повертає шлях книги-комплекту."""
+    as_of = str(spec.get("date") or datetime.date.today().isoformat())
+    unit = _unit_code(con)
+    parts = []
+    for title, ids, active in scopes(con):
+        rep = collect_subs(con, ids, as_of, title or unit or "Військова частина")
+        # Розформований батальйон без штату й майна на цю дату у комплект не йде.
+        if active or rep.filled:
+            parts.append((title, rep))
+    out = Path(folder) / f"21 Прод {quarter_title(as_of)}"
+    out.mkdir(parents=True, exist_ok=True)
+    base = file_name(as_of, unit)
+    path = out / base.replace(".xlsx", " — комплект.xlsx")
+    taken = {path.name.lower()}
+    for title, rep in parts:
+        wb = load_workbook(TEMPLATE)
+        _fill(wb.active, rep)
+        _name_sheet(wb.active, title, unit)
+        name, n = (base if not title else base.replace(".xlsx", f" — {_file_part(title)}.xlsx")), 1
+        while name.lower() in taken:        # назви різняться лише регістром чи знаками — файл той самий
+            n += 1
+            name = base.replace(".xlsx", f" — {_file_part(title)} ({n}).xlsx")
+        taken.add(name.lower())
+        save_book(wb, out / name)
+    wb = load_workbook(TEMPLATE)
+    first = wb.active
+    sheets = [first] + [_blank_copy(wb, first) for _ in parts[1:]]     # копії — поки бланк чистий
+    for ws, (title, rep) in zip(sheets, parts):
+        _fill(ws, rep)
+        _name_sheet(ws, title, unit)
+    save_book(wb, path)
     return str(path)
