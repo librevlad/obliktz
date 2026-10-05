@@ -1870,6 +1870,45 @@ def _save_line_codes(con, edits):
             con.execute("INSERT INTO nomen_report_line(nomen_id, report_line_id) VALUES(?, ?)", (nid, row[0]))
 
 
+def _save_own_lines(con, lines):
+    """Власні рядки форм ([{form, section, name}]): майно, якому в бланку вищого штабу рядка
+    немає (автоклави), дістає свій рядок у розділі — так частина й робила в паперовій формі.
+    Новий рядок стає останнім у розділі, перед підсумками «Всього…». Рядок, який зник із
+    переліку, видаляється, лише поки до нього не прив'язано ні кодів, ні штату; рядків бланка
+    й табеля перелік не стосується зовсім."""
+    if lines is None:
+        return
+    row = con.execute("SELECT value FROM app_setting WHERE key = '_решта'").fetchone()
+    old = (json.loads(row[0]).get("ownLines") if row else None) or []
+
+    def key(x):
+        return str(x.get("form") or ""), " ".join(str(x.get("name") or "").split())
+
+    want = {key(x): x for x in lines if isinstance(x, dict) and key(x)[1]}
+    for form, name in {key(x) for x in old if isinstance(x, dict)} - set(want):
+        rid = con.execute("SELECT rl.id FROM report_line rl JOIN report_form f ON f.id = rl.form_id "
+                          "WHERE f.code = ? AND rl.name = ?", (form, name)).fetchone()
+        if rid and not con.execute("SELECT 1 FROM nomen_report_line WHERE report_line_id = ?", (rid[0],)).fetchone() \
+                and not con.execute("SELECT 1 FROM norm WHERE report_line_id = ?", (rid[0],)).fetchone():
+            con.execute("DELETE FROM report_line WHERE id = ?", (rid[0],))
+    for (form, name), x in want.items():
+        f = con.execute("SELECT id FROM report_form WHERE code = ?", (form,)).fetchone()
+        if f is None:
+            raise SaveError(f"власний рядок «{name}»: форми {form} у базі немає")
+        if con.execute("SELECT 1 FROM report_line WHERE form_id = ? AND name = ?", (f[0], name)).fetchone():
+            continue
+        section = " ".join(str(x.get("section") or "").split()).rstrip(":")
+        head = con.execute("SELECT sort FROM report_line WHERE form_id = ? AND section IS NULL AND rtrim(name, ':') = ?",
+                           (f[0], section)).fetchone()
+        if head is None:
+            raise SaveError(f"власний рядок «{name}»: розділу «{section}» у формі {form} немає")
+        last = con.execute("SELECT MAX(sort) FROM report_line WHERE form_id = ? AND section = ? AND name NOT LIKE 'Всього%'",
+                           (f[0], section)).fetchone()[0]
+        sort = (head[0] if last is None else last) + 1
+        con.execute("UPDATE report_line SET sort = sort + 1 WHERE form_id = ? AND sort >= ?", (f[0], sort))
+        con.execute("INSERT INTO report_line(form_id, name, section, sort) VALUES(?, ?, ?, ?)", (f[0], name, section, sort))
+
+
 def _save_recon_base(con, edits):
     """Графи 6 і 7 підписаних відомостей із бази (рішення начальника, примітки):
     їх дописують уже за підписаною, решта відомості лишається як у папері."""
@@ -2465,6 +2504,8 @@ def _save_state(con, state, replace_papers=False):
         _save_responsible(con, state.get("mvo"), state.get("officials"), state.get("cmdrs"))
         _save_locations(con, state.get("locations"))
         _save_items(con, state.get("items"))
+        # Власний рядок форми — до кодів рядків: коди щойно заведеного рядка лягають у тому ж записі.
+        _save_own_lines(con, state.get("ownLines"))
         _save_line_codes(con, state.get("lineCodes"))
         _save_inv_issue(con, state.get("invIssue"))
         _save_inv_moves(con, state.get("invMoves"))

@@ -129,6 +129,17 @@ GROUP BY m.report_line_id
 """
 
 
+# Одиниця власного рядка (якого в бланку немає) — та, у якій ведуться його коди: 2420 мисок і
+# ложок — «шт», а не «к-т». Коди в різних одиницях або рядок без кодів — «к-т», як у бланку.
+_UOM = """
+SELECT m.report_line_id AS id, MIN(u.name) AS lo, MAX(u.name) AS hi
+FROM nomen_report_line m
+JOIN nomen n ON n.id = m.nomen_id
+JOIN uom u ON u.id = n.uom_id
+GROUP BY m.report_line_id
+"""
+
+
 def last_day(as_of: str) -> str:
     """Останній день, який входить у донесення «станом на» дату, — день перед нею: «станом на
     1 липня» закриває II квартал, а документ від 1 липня — уже III квартал."""
@@ -154,6 +165,7 @@ def collect_subs(con, subdivision_ids, as_of: str, name: str) -> Report:
     need = {r["id"]: r["qty"] for r in con.execute(_NEED.format(subs=subs), p)}
     have = {r["id"]: r["qty"] for r in con.execute(_HAVE.format(subs=subs), p)}
     gone = {r["id"]: r["qty"] for r in con.execute(_DESTROYED.format(subs=subs), p)}
+    uoms = {r["id"]: r["lo"] for r in con.execute(_UOM) if r["lo"] and r["lo"] == r["hi"]}
 
     rep = Report(subdivision=name, as_of=as_of)
     by_section = {}
@@ -163,7 +175,7 @@ def collect_subs(con, subdivision_ids, as_of: str, name: str) -> Report:
             (FORM_CODE,)):
         is_section = r["section"] is None
         line = Line(line_id=r["id"], name=r["name"], section=r["section"],
-                    uom="к-т", is_section=is_section,
+                    uom=uoms.get(r["id"], "к-т"), is_section=is_section,
                     need=need.get(r["id"], 0), have=have.get(r["id"], 0),
                     destroyed=gone.get(r["id"], 0))
         rep.lines.append(line)

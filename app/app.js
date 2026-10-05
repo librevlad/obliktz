@@ -2428,12 +2428,14 @@
             ? `, із замінами <b class="num-ok">${Math.round(covS * 100)}%</b>` : ''}</div>
         <button type="button" class="chip chip--btn${state.staffAll ? ' is-on' : ''}" data-act="staff-all"
           title="Показати й позиції форми без штату та без кодів служби">${state.staffAll ? '✓ ' : ''}усі позиції форми</button>
+        <button type="button" class="btn btn--sm" data-act="ol-open"
+          title="Рядок для майна, якому в бланку рядка немає: стане у вільний рядок свого розділу">+ Власний рядок</button>
         <div style="flex-basis:100%;height:0"></div><div class="panel__spacer"></div>
         <button type="button" class="btn" data-act="short-xls" title="Некомплект по підрозділах в Excel">Заявка на некомплект</button>
         <button type="button" class="btn" data-act="form21-xls" title="Форма 21/Прод у бланку вищого штабу на звітну дату">Форма 21/Прод</button>
         <button type="button" class="btn" data-act="form21-set"
           title="Зведена за частину, управління (усе поза батальйонами) і кожен батальйон: книга з аркушами й окремі файли в одній теці">21/Прод: комплект</button>
-      </div>
+      </div>${ownLineCard()}
       <div class="card card--scroll"><div class="tbl" style="--tbl-min:820px">
         <div class="tbl__head">
           ${sortHead('staff', 'line', 'табельна позиція', 'c-name')}
@@ -2450,6 +2452,69 @@
 
   /** Де саме бракує: штат і наявність по кожному підрозділу, що має цю позицію
    *  за штатом, і коди служби, з яких складається наявність. */
+  /** Власний рядок форми — для майна, якому в бланку вищого штабу рядка немає (автоклави):
+   *  так частина й робила в паперовій формі. Рядок стає останнім у своєму розділі, у бланку —
+   *  у вільний рядок розділу; коди прив'язують «+ код служби», як до будь-якого рядка. */
+  const ownLineKey = (x) => x.form + '|' + x.name;
+  const isOwnLine = (key) => (store.ownLines || []).some((x) => ownLineKey(x) === key);
+  function formSections(form) {
+    return reportLines.filter((l) => l.form === form && !l.section).map((l) => l.line.replace(/:\s*$/, '').trim());
+  }
+  function ownLineCard() {
+    if (!state.ownLineOpen) return '';
+    const sections = formSections(state.staffForm);
+    const pick = sections.includes('Інше майно') ? 'Інше майно' : sections[sections.length - 1];
+    return `<div class="card form" style="margin-bottom:12px" data-own-line>
+      <div class="card__head"><div class="card__title">Власний рядок форми ${esc(state.staffForm)}</div>
+        <div class="panel__spacer"></div><button type="button" class="btn" data-act="ol-cancel">Скасувати</button></div>
+      <div class="form__grid">
+        <div class="field"><label for="ol-section">Розділ</label><select id="ol-section" data-ol="section">${sections.map((s) =>
+          `<option value="${esc(s)}"${s === pick ? ' selected' : ''}>${esc(s)}</option>`).join('')}</select></div>
+        <div class="field field--span2"><label for="ol-name">Назва рядка</label><input id="ol-name" data-ol="name"
+          placeholder="наприклад, Автоклави" autocomplete="off"></div>
+      </div>
+      <div class="card__foot"><button type="button" class="btn btn--primary" data-act="ol-add">Додати рядок</button></div></div>`;
+  }
+  function ownLineAdd() {
+    const form = state.staffForm;
+    const section = ($('[data-ol="section"]') || {}).value || '';
+    const name = String(($('[data-ol="name"]') || {}).value || '').replace(/\s+/g, ' ').trim();
+    if (!name) { toast('Впишіть назву рядка.', true); return; }
+    const same = (a) => a.replace(/[’ʼ‘]/g, "'").replace(/\s+/g, ' ').trim().replace(/:$/, '').toLowerCase();
+    const twin = reportLines.find((l) => l.form === form && same(l.line) === same(name));
+    if (twin) { toast(`Рядок «${twin.line}» у формі ${form} уже є: прив’яжіть коди до нього.`, true); return; }
+    if (!formSections(form).includes(section)) { toast('Оберіть розділ форми.', true); return; }
+    store.ownLines = (store.ownLines || []).concat([{ form, section, name }]);
+    // У переліку — одразу після останнього рядка свого розділу, як і в базі.
+    const after = reportLines.reduce((at, l, i) => (l.form === form && l.section === section && !/^Всього/.test(l.line) ? i : at), -1);
+    reportLines.splice(after >= 0 ? after + 1 : reportLines.length, 0, { form, line: name, section, codes: [] });
+    lineCodes.set(form + '|' + name, []);
+    logChange('рядок форми додано', 'line|' + form + '|' + name, `«${name}» у розділі «${section}» (${form})`);
+    state.ownLineOpen = false;
+    state.staffAll = true;
+    state.staffOpen = form + '|' + name;
+    save(true, true);
+    render();
+  }
+  function ownLineDelete(key) {
+    const i = key.indexOf('|');
+    const form = key.slice(0, i), name = key.slice(i + 1);
+    if ((lineCodes.get(key) || []).length || normsInit().some((n) => n.form === form && n.line === name)) {
+      toast('До рядка прив’язано коди чи штат: спершу відв’яжіть їх.', true);
+      return;
+    }
+    if (!confirm(`Видалити власний рядок «${name}» з форми ${form}?`)) return;
+    store.ownLines = (store.ownLines || []).filter((x) => ownLineKey(x) !== key);
+    const at = reportLines.findIndex((l) => l.form === form && l.line === name);
+    if (at >= 0) reportLines.splice(at, 1);
+    lineCodes.delete(key);
+    if (store.lineCodes) delete store.lineCodes[key];
+    logChange('рядок форми видалено', 'line|' + key, `«${name}» (${form})`);
+    if (state.staffOpen === key) state.staffOpen = null;
+    save(true, true);
+    render();
+  }
+
   function staffDetail(g, cols) {
     const date = state.asOf;
     const key = g.form + '|' + g.line;
@@ -2498,7 +2563,9 @@
         <span></span></div>`}
       ${g.ref ? '' : addSub}${ownRows}
       ${g.staffed && !g.ref ? `<div class="st-detail__acts"><button type="button" class="btn btn--sm" data-act="sb-for"
-        data-line="${esc(g.line)}" title="Додати правило заміни">⇆ Чим замінити…</button></div>` : ''}</div>`;
+        data-line="${esc(g.line)}" title="Додати правило заміни">⇆ Чим замінити…</button></div>` : ''}${
+      isOwnLine(key) && !(g.codes || []).length && !g.staffed ? `<div class="st-detail__acts">${rowBtn('ol-del', '✕ Видалити рядок',
+        `data-line="${esc(key)}"`, { bad: true, title: 'Власний рядок без кодів і штату' })}</div>` : ''}</div>`;
   }
 
 
@@ -12311,6 +12378,14 @@
       if (d.act === 'un-edit') return unitEditOpen(d.id);
       if (d.act === 'un-save') return unitEditSave();
       if (d.act === 'un-cancel') { state.unitEdit = null; return render(); }
+      if (d.act === 'ol-open') {
+        state.ownLineOpen = true;
+        render();
+        return setTimeout(() => $('[data-ol="name"]')?.focus(), 0);
+      }
+      if (d.act === 'ol-cancel') { state.ownLineOpen = false; return render(); }
+      if (d.act === 'ol-add') return ownLineAdd();
+      if (d.act === 'ol-del') return ownLineDelete(d.line);
       if (d.act === 'sb-qt') return substTarget(d.v);
       if (d.act === 'sb-rm') return substTarget(d.v, false);
       if (d.act === 'sb-for') {
