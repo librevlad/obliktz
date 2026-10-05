@@ -9,6 +9,11 @@
 Тому спершу рахуються марки, потім розділи згортаються з них: інакше майно, яке
 служба веде під маркою, у підсумок розділу не потрапить.
 
+Донесення «станом на 1 липня» — це кінець 30 червня: так його складає частина, і так
+рахується квартал у назві файла. Документ, датований самою звітною датою, — уже наступного
+кварталу. Знищене майно, списане актом пізніше, на звітну дату ще стоїть у графі 21.
+Звірено з бланком, який частина здала за II квартал 2026 року.
+
 Категорії І-ІІІ / ІV / V — вимір проводки, а не властивість позиції. Поки актів
 технічного стану в базі немає, усе майно стоїть у І-ІІІ категорії поточного
 забезпечення, і це видно у графі 14.
@@ -81,11 +86,12 @@ class Report:
 
 # Підрозділи охоплення підставляються переліком номерів ({subs}): так рахується і піддерево
 # (батальйон з усім підпорядкованим), і «все, крім батальйонів».
+# :cut — останній день, який входить у донесення: «станом на 1 липня» — це кінець 30 червня.
 _NEED = """
 SELECT n.report_line_id AS id, SUM(n.qty_milli) AS qty
 FROM norm n
 WHERE n.subdivision_id IN ({subs}) AND n.report_line_id IS NOT NULL
-  AND n.valid_from <= :as_of AND (n.valid_to IS NULL OR n.valid_to > :as_of)
+  AND n.valid_from <= :cut AND (n.valid_to IS NULL OR n.valid_to > :cut)
 GROUP BY n.report_line_id
 """
 
@@ -93,17 +99,40 @@ _HAVE = """
 SELECT m.report_line_id AS id, SUM(p.sign * p.qty_milli) AS qty
 FROM posting p
 JOIN nomen_report_line m ON m.nomen_id = p.nomen_id
-WHERE p.subdivision_id IN ({subs}) AND p.doc_date <= :as_of
+WHERE p.subdivision_id IN ({subs}) AND p.doc_date <= :cut
 GROUP BY m.report_line_id
 """
 
+# Знищене, ще не списане на той день: рапорт до дати включно, а акт списання — пізніше або
+# його немає. Подання destroyed_open знає лише сьогоднішній стан: списане вже після звітної дати
+# воно не показує, хоча на звітну дату це майно ще значилося знищеним. Правило закриття те саме:
+# рядок рапорту закриває акт, прив'язаний до цього рядка, а рапорт без таких прив'язок — акт,
+# пов'язаний із самим рапортом.
 _DESTROYED = """
-SELECT m.report_line_id AS id, SUM(d.qty_milli) AS qty
-FROM destroyed_open d
-JOIN nomen_report_line m ON m.nomen_id = d.nomen_id
-WHERE d.subdivision_id IN ({subs}) AND d.doc_date <= :as_of
+SELECT m.report_line_id AS id, SUM(l.qty_milli) AS qty
+FROM document_line l
+JOIN document d ON d.id = l.document_id
+JOIN doc_kind k ON k.id = d.kind_id
+JOIN nomen_report_line m ON m.nomen_id = l.nomen_id
+WHERE k.code = 'report_destroyed' AND d.from_subdivision_id IN ({subs}) AND d.doc_date <= :cut
+  AND CASE
+    WHEN EXISTS (SELECT 1 FROM report_line_act ra JOIN document_line l2 ON l2.id = ra.line_id
+                  WHERE l2.document_id = d.id)
+    THEN NOT EXISTS (SELECT 1 FROM report_line_act ra
+                       JOIN document a ON a.id = ra.act_id JOIN doc_kind ak ON ak.id = a.kind_id
+                      WHERE ra.line_id = l.id AND ak.affects_stock = 1 AND a.doc_date <= :cut)
+    ELSE NOT EXISTS (SELECT 1 FROM document_link dl
+                       JOIN document a ON a.id = dl.to_document_id JOIN doc_kind ak ON ak.id = a.kind_id
+                      WHERE dl.from_document_id = d.id AND ak.affects_stock = 1 AND a.doc_date <= :cut)
+  END
 GROUP BY m.report_line_id
 """
+
+
+def last_day(as_of: str) -> str:
+    """Останній день, який входить у донесення «станом на» дату, — день перед нею: «станом на
+    1 липня» закриває II квартал, а документ від 1 липня — уже III квартал."""
+    return (datetime.date.fromisoformat(as_of) - datetime.timedelta(days=1)).isoformat()
 
 
 def subtree(con, subdivision_id: int) -> list:
@@ -119,9 +148,9 @@ def collect(con, subdivision_id: int, as_of: str) -> Report:
 
 
 def collect_subs(con, subdivision_ids, as_of: str, name: str) -> Report:
-    """Потреба, наявність і знищене за переліком підрозділів на дату."""
+    """Потреба, наявність і знищене за переліком підрозділів станом на дату — на кінець дня перед нею."""
     subs = ",".join(str(int(x)) for x in subdivision_ids) or "NULL"
-    p = dict(as_of=as_of)
+    p = dict(cut=last_day(as_of))
     need = {r["id"]: r["qty"] for r in con.execute(_NEED.format(subs=subs), p)}
     have = {r["id"]: r["qty"] for r in con.execute(_HAVE.format(subs=subs), p)}
     gone = {r["id"]: r["qty"] for r in con.execute(_DESTROYED.format(subs=subs), p)}
@@ -250,7 +279,7 @@ def _unit_code(con) -> str:
 def quarter_title(as_of: str) -> str:
     """«III кв 2026 р» — квартал того дня, на який складено форму: «станом на 1 жовтня»
     закриває третій квартал, тож береться день перед датою."""
-    d = datetime.date.fromisoformat(as_of) - datetime.timedelta(days=1)
+    d = datetime.date.fromisoformat(last_day(as_of))
     return f"{ROMAN[(d.month - 1) // 3 + 1]} кв {d.year} р"
 
 

@@ -41,7 +41,7 @@ from build.version import APP_VERSION, APP_VERSION_DATE        # noqa: E402
 
 EXTRACT = ROOT / "build" / "data" / "extract.json"
 VERSIONS = ROOT / "docs" / "версії.md"
-EXE = ROOT / "Облік ТЗ ПС.exe"
+EXE = ROOT / "dist" / "Облік ТЗ ПС.exe"          # зібрана програма (build_exe.py)
 # Табельні форми й каталог табельних позицій — загальні для служби.
 CATALOG_SEEDS = ["form21_lines.sql", "form21_map.sql", "form3_lines.sql", "form2_lines.sql"]
 # Номери ФЕС потрібні лише на мить — виставити вид обліку за правилом db/rules/asset_class.sql;

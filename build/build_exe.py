@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """Збірка «Облік ТЗ ПС.exe» — один файл, без залежностей на машині користувача."""
-import sys, os, subprocess, shutil
+import sys, os, subprocess
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT)
@@ -66,25 +66,11 @@ def main():
     with open(version_file, "w", encoding="utf-8") as f:
         f.write(version_info())
     subprocess.run(command(version_file), check=True)
+    # Збірка лежить у dist/ і більше ніде: поруч із нею даних немає, а програма, запущена
+    # без теки «Дані обліку» поруч, відкрила б порожню базу. Дані живуть у робочій теці
+    # частини — туди програму й кладуть.
     built = os.path.join(ROOT, "dist", NAME + ".exe")
-    shutil.copy2(built, os.path.join(ROOT, NAME + ".exe"))
-    print(f"\n{NAME}.exe {APP_VERSION} — {os.path.getsize(built) / 1024 / 1024:.1f} МБ")
-
-    # Програма шукає теку даних поруч із собою — інакше в dist лишиться .exe без
-    # бази й без сканів. Копіюємо, щоб теку можна було віддати як є.
-    src = os.path.join(ROOT, "Дані обліку")
-    dst = os.path.join(ROOT, "dist", "Дані обліку")
-    if os.path.isdir(src):
-        for sub in ("oblik.sqlite", "скани"):
-            s, d = os.path.join(src, sub), os.path.join(dst, sub)
-            if os.path.isdir(s):
-                shutil.copytree(s, d, dirs_exist_ok=True)
-            elif os.path.exists(s):
-                os.makedirs(dst, exist_ok=True)
-                shutil.copy2(s, d)
-        size = sum(os.path.getsize(os.path.join(p, f))
-                   for p, _, fs in os.walk(dst) for f in fs)
-        print(f"дані поруч із програмою — {size / 1024 / 1024:.1f} МБ у {dst}")
+    print(f"\n{NAME}.exe {APP_VERSION} — {os.path.getsize(built) / 1024 / 1024:.1f} МБ: {built}")
 
 
 if __name__ == "__main__":
