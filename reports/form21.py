@@ -89,12 +89,29 @@ class Report:
 # Підрозділи охоплення підставляються переліком номерів ({subs}): так рахується і піддерево
 # (батальйон з усім підпорядкованим), і «все, крім батальйонів».
 # :cut — останній день, який входить у донесення: «станом на 1 липня» — це кінець 30 червня.
+# Потреба рядка — штат табельної позиції (норма на рядок форми) і норми на коди служби, прив'язані
+# до цього рядка, — так само, як наявність рядка складається з його кодів. Табельна норма
+# підрозділу на рядок головніша: норми того самого підрозділу на коди цього рядка тоді не
+# рахуються, щоб потреба не задвоїлася.
 _NEED = """
-SELECT n.report_line_id AS id, SUM(n.qty_milli) AS qty
-FROM norm n
-WHERE n.subdivision_id IN ({subs}) AND n.report_line_id IS NOT NULL
-  AND n.valid_from <= :cut AND (n.valid_to IS NULL OR n.valid_to > :cut)
-GROUP BY n.report_line_id
+SELECT id, SUM(qty) AS qty FROM (
+  SELECT n.report_line_id AS id, n.qty_milli AS qty
+  FROM norm n
+  WHERE n.subdivision_id IN ({subs}) AND n.report_line_id IS NOT NULL
+    AND n.valid_from <= :cut AND (n.valid_to IS NULL OR n.valid_to > :cut)
+  UNION ALL
+  SELECT m.report_line_id AS id, n.qty_milli AS qty
+  FROM norm n
+  JOIN nomen_report_line m ON m.nomen_id = n.nomen_id
+  JOIN report_line rl ON rl.id = m.report_line_id
+  JOIN report_form f ON f.id = rl.form_id AND f.code = '21/Прод'
+  WHERE n.nomen_id IS NOT NULL AND n.subdivision_id IN ({subs})
+    AND n.valid_from <= :cut AND (n.valid_to IS NULL OR n.valid_to > :cut)
+    AND NOT EXISTS (SELECT 1 FROM norm t WHERE t.report_line_id = m.report_line_id
+                      AND t.subdivision_id = n.subdivision_id
+                      AND t.valid_from <= :cut AND (t.valid_to IS NULL OR t.valid_to > :cut))
+)
+GROUP BY id
 """
 
 _HAVE = """
@@ -732,9 +749,10 @@ def save_breakdown(con, as_of: str, path) -> dict:
         if a == b:
             continue
         basis = sorted({str(x[0]).strip() for x in con.execute(
-            f"SELECT COALESCE(NULLIF(basis, ''), note) FROM norm WHERE report_line_id = ? AND subdivision_id IN ({subs}) "
+            f"SELECT COALESCE(NULLIF(basis, ''), note) FROM norm WHERE (report_line_id = ? OR nomen_id IN "
+            f"(SELECT nomen_id FROM nomen_report_line WHERE report_line_id = ?)) AND subdivision_id IN ({subs}) "
             "AND ((valid_from > ? AND valid_from <= ?) OR (valid_to > ? AND valid_to <= ?))",
-            (lid, before, cut, before, cut)) if x[0]})
+            (lid, lid, before, cut, before, cut)) if x[0]})
         row += 1
         for c, v in enumerate((name, _q(a), _q(b), _q(b - a), "; ".join(basis)), 1):
             cell = ws.cell(row, c, v)

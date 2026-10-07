@@ -974,6 +974,9 @@
     return total;
   }
   const hasNorms = () => normsInit().some((n) => n.code && +n.qty > 0);
+  /** Чи входить код у форму 21/Прод: прив'язаний до якогось її рядка. */
+  const inForm21 = (code) => reportLines.some((l) => l.form === '21/Прод'
+    && (lineCodes.get(l.form + '|' + l.line) || l.codes).includes(String(code)));
 
   // ------------------------------------------------------------------ рендер
   const app = {
@@ -2239,6 +2242,25 @@
       g.qty += n.qty;
       g.subs.push([n.sub, n.qty]);
     }
+    // Норма на код служби — теж потреба рядка, до якого код прив'язано: так само, як наявність
+    // рядка складається з його кодів (так рахує й форма 21/Прод). Табельна норма підрозділу на
+    // рядок головніша: норми того самого підрозділу на коди цього рядка тоді не рахуються.
+    const tabular = new Set(staffAt(date).map((n) => n.form + '|' + n.line + '|' + n.sub));
+    for (const n of normList(date)) {
+      if (!n.code || !(+n.qty > 0) || !inScope(n.sub)) continue;
+      for (const l of reportLines) {
+        const key = l.form + '|' + l.line;
+        const codes = lineCodes.get(key) || l.codes;
+        if (!staffForms.has(l.form) || !codes.includes(n.code) || tabular.has(key + '|' + n.sub)) continue;
+        if (!byLine.has(key)) byLine.set(key, { form: l.form, line: l.line, qty: 0, subs: [], codes, basis: '' });
+        const g = byLine.get(key);
+        g.qty += +n.qty;
+        let s = g.subs.find((x) => x[0] === n.sub && x[2]);
+        if (!s) { s = [n.sub, 0, []]; g.subs.push(s); }
+        s[1] += +n.qty;
+        if (!s[2].includes(n.code)) s[2].push(n.code);
+      }
+    }
     for (const l of reportLines) {
       const key = l.form + '|' + l.line;
       if (!byLine.has(key) && staffForms.has(l.form)) {
@@ -2435,8 +2457,12 @@
         <button type="button" class="btn" data-act="form21-xls" title="Форма 21/Прод у бланку вищого штабу на звітну дату">Форма 21/Прод</button>
         <button type="button" class="btn" data-act="form21-set"
           title="Зведена за частину, управління (усе поза батальйонами) і кожен батальйон: книга з аркушами, окремі файли й розшифровка до форми в одній теці">21/Прод: комплект</button>
-      </div>${ownLineCard()}
-      <div class="card card--scroll"><div class="tbl" style="--tbl-min:820px">
+      </div>${ownLineCard()}${list.length ? '' : `<div class="panel" data-staff-none><div class="panel__note">
+        Штату за формою ${esc(state.staffForm)} на ${fmtDate(state.asOf)} немає. Потребу вписують у рядок табеля: відкрийте
+        всі позиції форми, розгорніть рядок і додайте підрозділ у штат. Норма на код у колонці «штат власний» нижче теж
+        іде в рядок, до якого код прив’язано.</div><div class="panel__spacer"></div>
+        <button type="button" class="btn btn--primary" data-act="staff-all">Усі позиції форми</button></div>`}
+      <div class="card card--scroll"${list.length ? '' : ' hidden'}><div class="tbl" style="--tbl-min:820px">
         <div class="tbl__head">
           ${sortHead('staff', 'line', 'табельна позиція', 'c-name')}
           ${sortHead('staff', 'qty', 'штат', 'c-num')}
@@ -2518,19 +2544,22 @@
   function staffDetail(g, cols) {
     const date = state.asOf;
     const key = g.form + '|' + g.line;
-    const subsRows = g.subs.map(([sb, q]) => {
+    const subsRows = g.subs.map(([sb, q, byCodes]) => {
       const have = round3((g.codes || []).reduce((a, c) => a + haveRollup(sb, c), 0)
         - (g.codes || []).reduce((a, c) => a + destroyedIn(c, sb), 0));
       const short = Math.max(0, round3(q - have));
+      // Штат, що прийшов із норм на коди, правлять там само — у «штат власний» переліку під таблицею.
+      const qty = byCodes ? `<span title="Норма на код: змінюється в колонці «штат власний» переліку під таблицею">штат ${
+        fmtNum(q, '0')} <small>норма на код ${esc(byCodes.join(', '))}</small></span>`
+        : `<span>штат <input class="rc-in" style="width:64px" data-snorm="${esc(key + '|' + sb)}" value="${esc(String(q))}"
+          inputmode="decimal" aria-label="штат «${esc(g.line)}» у «${esc(sb)}»"></span>`;
       return `<div class="st-detail__row${short ? ' num-bad' : ''}"><span class="lnk" data-sub="${esc(sb)}">${esc(sb)}</span>
-        <span>штат <input class="rc-in" style="width:64px" data-snorm="${esc(key + '|' + sb)}" value="${esc(String(q))}"
-          inputmode="decimal" aria-label="штат «${esc(g.line)}» у «${esc(sb)}»"></span>
-        <span>наявно ${fmtNum(have, '0')}</span><span>${short ? 'бракує ' + fmtNum(short) : 'укомплектовано'}</span></div>`;
+        ${qty}<span>наявно ${fmtNum(have, '0')}</span><span>${short ? 'бракує ' + fmtNum(short) : 'укомплектовано'}</span></div>`;
     }).join('');
     // Штат міняється наказом: у програмі його правлять тут, на звітну дату.
     // Базовий табель лишається за минулими датами, а свої записи видно в
     // «Строки норм» унизу екрана.
-    const free = pickableSubs('').filter((x) => !g.subs.some(([sb]) => sb === x.name)
+    const free = pickableSubs('').filter((x) => !g.subs.some(([sb, , byCodes]) => sb === x.name && !byCodes)
       && (!state.sub || inSubtree(state.sub, x.name)) && x.type !== 'бригада');
     const addSub = `<div class="st-detail__row"><span>додати підрозділ у штат:</span>
       <span><select class="rc-in rc-in--wide" data-nmadd="${esc(key)}"><option value="">— оберіть —</option>
@@ -2853,7 +2882,8 @@
         staffSeg('supply') + searchBox() + actions),
       body: `${filterBar(cnt(list.length, 'позиція', 'позиції', 'позицій'))}${staffBlock()}
         <div class="panel" style="margin-top:14px"><div class="panel__note">
-          Нова норма в колонці «штат власний» діє для «${esc(scope)}» з ${fmtDate(state.asOf)}.</div>
+          Нова норма в колонці «штат власний» діє для «${esc(scope)}» з ${fmtDate(state.asOf)}. Норма на код,
+          прив’язаний до рядка форми, іде в потребу цього рядка.</div>
           <button class="btn" data-act="nm-terms">${state.normTerms ? 'Сховати строки' : 'Строки норм…'}</button>
           <button class="btn" data-act="norms-demo">Заповнити за наявністю</button>
           <button class="btn btn--danger" data-act="norms-clear">Очистити норми на коди</button></div>
@@ -12598,6 +12628,11 @@
         // попередніми документами й розрахунками.
         normSet({ sub: scope, code: el.dataset.norm }, v > 0 ? v : 0, state.asOf);
         save();
+        // Потреба форми 21/Прод складається з рядків, а код без рядка у форму не потрапляє.
+        if (v > 0 && !inForm21(el.dataset.norm)) {
+          toast(`Код ${el.dataset.norm} не прив’язано до рядка форми 21/Прод: у потребу форми ця норма не піде. `
+            + 'Прив’яжіть код: «Усі позиції форми» → рядок → «+ код служби».', true);
+        }
         // Перемальовуємо після того, як фокус уже перейшов (Tab чи клац у сусіднє
         // поле), і повертаємо його в те саме поле нової таблиці.
         setTimeout(() => {
@@ -14614,7 +14649,8 @@ ${r.other ? r.name : it ? it.name : r.code} — ${fmtNum(r.qty)}, `
     });
     if (!todo.length) { toast('Порожніх норм для наявних позицій немає.'); return; }
     if (!confirm(`Заповнити ${cnt(todo.length, 'порожню норму', 'порожні норми', 'порожніх норм')} для «${scope}» `
-      + 'поточною наявністю? Уже вписані норми не зміняться.')) return;
+      + 'поточною наявністю? Уже вписані норми не зміняться. Норми на коди, прив’язані до рядків форми, '
+      + 'підуть і в потребу форми 21/Прод.')) return;
     for (const i of todo) {
       normSet({ sub: scope, code: i.code }, state.sub ? haveRollup(scope, i.code) : balCode(i.code), state.asOf, false, true);
     }
