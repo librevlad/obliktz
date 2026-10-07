@@ -2,7 +2,10 @@
 """Облік ТЗ ПС — запуск як програма Windows.
 
 Піднімає локальний сервер на вільному порту (тільки 127.0.0.1, назовні нічого
-не слухає) і відкриває вікно WebView2 без адресного рядка й вкладок. Стан
+не слухає) і відкриває вікно WebView2 без адресного рядка й вкладок. Коли на
+основному ПК увімкнено роботу в мережі (⚙ → «Робота в мережі»), сервер слухає й
+мережу на сталому порту, а інші ПК відкривають програму в браузері — з кодом доступу
+(див. network.py). Стан
 користувача — норми, проведені документи, записи знищення — лягає в ту саму
 базу `Дані обліку/oblik.sqlite`, що й облік із паперів: один файл, який видно,
 можна покласти в резервну копію або перенести на інший комп'ютер.
@@ -25,7 +28,9 @@ MIME = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8",
         ".png": "image/png", ".tif": "image/tiff", ".tiff": "image/tiff",
         ".webp": "image/webp", ".heic": "image/heic", ".doc": "application/msword",
         ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        ".gif": "image/gif", ".bmp": "image/bmp"}
+        ".gif": "image/gif", ".bmp": "image/bmp",
+        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".zip": "application/zip"}
 # Що можна підшити: скани й фото, PDF, документи Office, текст, архіви й
 # підписані файли з електронного документообігу (.p7s, .asice).
 SCAN_EXT = {".pdf", ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff", ".webp", ".heic",
@@ -122,6 +127,7 @@ def data_dir(probe=False):
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import state_db                                       # noqa: E402
+import network                                        # noqa: E402
 from db.connect import (apply_migrations, checked_version, current_version,   # noqa: E402
                         APP_SCHEMA_VERSION, SchemaTooNewError, SchemaTooOldError)
 from build import export_app_data                     # noqa: E402
@@ -132,6 +138,25 @@ ROOT = base_dir()
 DATA = data_dir()
 STATE = os.path.join(DATA, "стан обліку.json")
 STATE_LOCK = threading.Lock()
+# Робота в мережі: налаштування з теки даних, підбір коду, хто записав останнім.
+_NET = {"cfg": None, "data": None}
+GATE = network.Gate()
+LAST_WRITE = {"who": "", "at": ""}
+# Що можна зробити лише на самому основному ПК: відновити базу з копії чи файла, зберегти
+# копію діалогом Windows, відкрити файл чи теку програмою цього ПК, змінити налаштування мережі.
+HOST_ONLY = {"/api/restore", "/api/restore-file", "/api/copy", "/api/reveal", "/api/open", "/api/network"}
+
+
+def net_cfg() -> dict:
+    """Налаштування мережі для теки даних, з якою працює програма."""
+    if _NET["cfg"] is None or _NET["data"] != DATA:
+        _NET.update(cfg=network.load(DATA), data=DATA)
+    return _NET["cfg"]
+
+
+def host_name() -> str:
+    """Ім'я людини на основному ПК для журналу змін; не задано — порожнє."""
+    return network.clean_name(net_cfg().get("host_name"))
 ASSET_CACHE = {}
 for name in ASSETS:
     with open(os.path.join(ROOT, name), "rb") as f:
@@ -207,14 +232,15 @@ def db():
     return con
 
 
-def load_state():
+def load_state(ui_key="ui"):
     """Внесене в програмі — з бази. Не читається база — не мовчимо: інакше
-    перше ж збереження лягло б поверх даних, яких ми не побачили."""
+    перше ж збереження лягло б поверх даних, яких ми не побачили. `ui_key` — чиї
+    налаштування вікна віддати: основного ПК («ui») чи людини з іншого ПК («ui@ім'я»)."""
     try:
         con = db()
         if state_db.is_empty(con):
             import_old_state(con)
-        return state_db.load_state(con)
+        return state_db.load_state(con, ui_key)
     except StateBroken:
         raise
     except (sqlite3.Error, ValueError) as e:
@@ -787,6 +813,7 @@ def bump_state_version() -> str:
     except ValueError:
         n = 1
     _REV["value"] = f"{n}-{os.urandom(4).hex()}"
+    _STAMP.update(real=None, shown=None)
     try:
         with open(_rev_path(), "w", encoding="utf-8") as f:
             f.write(_REV["value"])
@@ -795,23 +822,43 @@ def bump_state_version() -> str:
     return _REV["value"]
 
 
+# Час файла, який дав запис самих налаштувань вікна, і час, який версія показує замість
+# нього: такий запис версії стану не міняє.
+_STAMP = {"real": None, "shown": None}
+
+
+def _file_stamp() -> str:
+    try:
+        return str(os.stat(db_path()).st_mtime_ns)
+    except OSError:
+        return "0"
+
+
 def state_version() -> str:
     """Версія стану: ревізія програми плюс час файла. Вікно, що відкрилося
     раніше за чужий запис, не має права записати свій, застарілий стан."""
     if _REV["value"] is None:
         _REV["value"] = _load_rev()
-    try:
-        stamp = str(os.stat(db_path()).st_mtime_ns)
-    except OSError:
-        stamp = "0"
+    stamp = _file_stamp()
+    if stamp == _STAMP["real"]:
+        stamp = _STAMP["shown"]
     return f"{_REV['value']}.{stamp}"
+
+
+def save_ui(ui, ui_key="ui"):
+    """Лише налаштування вікна (оформлення, чернетки). Версія стану лишається тією ж:
+    інші вікна не оновлюються через чужу чернетку, а чужий запис не робить це вікно
+    «застарілим». Зміну файла кимось іншим версія, як і раніше, бачить."""
+    shown = state_version().rsplit(".", 1)[1]
+    state_db.save_ui(db(), ui, ui_key)
+    _STAMP.update(real=_file_stamp(), shown=shown)
 
 
 class BackupError(OSError):
     """Копію бази перед незворотним записом зробити не вдалося — такий запис не йде."""
 
 
-def save_state(obj, force_backup=False, replace_papers=False):
+def save_state(obj, force_backup=False, replace_papers=False, ui_key="ui"):
     """Запис іде однією транзакцією: обрив не лишає половини документа.
     Перед незворотними діями (скидання, відновлення з копії, видалення) копія
     робиться завжди, а не раз на 10 хвилин, — і без неї такий запис не йде:
@@ -824,7 +871,7 @@ def save_state(obj, force_backup=False, replace_papers=False):
         if force_backup:
             raise BackupError(f"копію бази перед записом не вдалося зробити: {e}") from e
         # Звичайний запис копія не спиняє: за десять хвилин буде нова спроба.
-    units = state_db.save_state(db(), obj, replace_papers=replace_papers and force_backup)
+    units = state_db.save_state(db(), obj, replace_papers=replace_papers and force_backup, ui_key=ui_key)
     bump_state_version()
     return units or {}
 
@@ -867,13 +914,154 @@ class Handler(BaseHTTPRequestHandler):
         if body:
             self.wfile.write(body)
 
+    # ------------------------------------------------------------- хто питає
+    remote = False
+    who = ""
+
     def do_GET(self):
+        if self._admit("GET"):
+            self._get()
+
+    def do_POST(self):
+        if self._admit("POST"):
+            self._post()
+
+    def do_PUT(self):
+        if self._admit("PUT"):
+            self._put()
+
+    def _drain(self):
+        """Тіло запиту, на який відповідаємо відмовою, теж вичитується: інакше воно
+        лишилося б у з'єднанні й зіпсувало наступний запит."""
+        try:
+            n = int(self.headers.get("Content-Length", 0) or 0)
+        except ValueError:
+            n = 0
+        if n > 0:
+            self.rfile.read(n)
+
+    def _admit(self, method):
+        """Хто зробив запит. Вікно на самому основному ПК — без перепустки; з іншого ПК —
+        лише з перепусткою, виданою після входу з кодом доступу."""
+        route = self.path.split("?", 1)[0]
+        ip = self.client_address[0]
+        if ip in network.LOCAL:
+            self.remote, self.who = False, host_name()
+            return True
+        self.remote = True
+        cfg = net_cfg()
+        if not cfg.get("on") or not cfg.get("code"):
+            self._drain()
+            self._send(403, "Робота в мережі на основному ПК вимкнена.".encode("utf-8"))
+            return False
+        if method == "POST" and route == "/api/login":
+            self._login(cfg, ip)
+            return False
+        name = network.read(cfg, network.cookie_of(self.headers.get("Cookie")))
+        if name:
+            self.who = name
+            if method == "POST" and route == "/api/logout":
+                self._drain()
+                self._send(200, b"{}", MIME[".json"], {"Set-Cookie": network.drop_cookie()})
+                return False
+            return True
+        self._drain()
+        if method == "GET" and route in ("/", "/index.html"):
+            self._send(200, network.LOGIN_PAGE.encode("utf-8"), MIME[".html"])
+        else:
+            self._send(401, "Потрібно ввійти: відкрийте головну сторінку програми.".encode("utf-8"))
+        return False
+
+    def _login(self, cfg, ip):
+        """Вхід з іншого ПК: ім'я для журналу змін і код доступу. Після кількох невдалих
+        спроб з тієї самої адреси — пауза."""
+        try:
+            n = int(self.headers.get("Content-Length", 0) or 0)
+            req = json.loads(self.rfile.read(n).decode("utf-8") or "{}") if n else {}
+        except ValueError:
+            req = {}
+        wait = GATE.wait(ip)
+        if wait:
+            return self._send(429, f"Забагато невдалих спроб. Спробуйте за {wait} с.".encode("utf-8"))
+        name = network.clean_name(req.get("name") if isinstance(req, dict) else "")
+        if not name:
+            return self._send(400, "Впишіть своє ім'я.".encode("utf-8"))
+        if not network.check_code(cfg, req.get("code")):
+            GATE.fail(ip)
+            return self._send(401, "Код доступу не той.".encode("utf-8"))
+        GATE.ok(ip)
+        body = json.dumps({"ok": True, "name": name}, ensure_ascii=False).encode("utf-8")
+        return self._send(200, body, MIME[".json"], {"Set-Cookie": network.set_cookie(network.issue(cfg, name))})
+
+    def _me(self):
+        """Хто працює в цьому вікні; основному ПК — ще й налаштування мережі."""
+        out = {"name": self.who, "remote": self.remote}
+        if not self.remote:
+            cfg = net_cfg()
+            port = int(cfg.get("port") or network.DEFAULT_PORT)
+            out["net"] = {"on": bool(cfg.get("on")), "port": port, "host_name": cfg.get("host_name") or "",
+                          "has_code": bool(cfg.get("code")), "addresses": network.addresses(port),
+                          "listening": bool(cfg.get("on") and cfg.get("code")) and NET_LISTENING["on"]}
+        return self._send(200, json.dumps(out, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+
+    def _set_network(self):
+        """Налаштування мережі з ⚙ основного ПК. Діють після перезапуску програми."""
+        n = int(self.headers.get("Content-Length", 0) or 0)
+        req = json.loads(self.rfile.read(n).decode("utf-8") or "{}") if n else {}
+        cfg = dict(net_cfg())
+        try:
+            port = int(req.get("port") or cfg.get("port") or network.DEFAULT_PORT)
+        except (TypeError, ValueError):
+            port = 0
+        if not 1024 <= port <= 65535:
+            return self._send(400, "Порт — число від 1024 до 65535.".encode("utf-8"))
+        cfg["port"] = port
+        cfg["on"] = bool(req.get("on"))
+        if "host_name" in req:
+            cfg["host_name"] = network.clean_name(req.get("host_name"))
+        code = str(req.get("code") or "")
+        if code:
+            if len(code) < 4:
+                return self._send(400, "Код доступу — щонайменше 4 знаки.".encode("utf-8"))
+            network.set_code(cfg, code)
+        if cfg["on"] and not cfg.get("code"):
+            return self._send(400, "Задайте код доступу: без нього з іншого ПК програму не відкрити.".encode("utf-8"))
+        network.save(DATA, cfg)
+        _NET["cfg"] = None
+        body = {"ok": True, "addresses": network.addresses(port), "restart": True}
+        return self._send(200, json.dumps(body, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+
+    def _send_export(self, rel):
+        """Вивантаження для браузера іншого ПК: файл із теки «вивантаження» на основному ПК."""
+        base = os.path.realpath(os.path.join(DATA, "вивантаження"))
+        full = os.path.realpath(os.path.join(base, rel))
+        if not full.startswith(base + os.sep) or not os.path.isfile(full):
+            return self._send(404, b"not found")
+        with open(full, "rb") as f:
+            body = f.read()
+        name = os.path.basename(full)
+        ext = os.path.splitext(name)[1].lower()
+        return self._send(200, body, MIME.get(ext, "application/octet-stream"),
+                          {"Content-Disposition": f"attachment; filename*=UTF-8''{quote(name)}"})
+
+    def _get(self):
         # Шлях приходить закодованим (%D1%81%D0%BA…), бо в іменах сканів кирилиця.
         path = unquote(self.path.split("?", 1)[0].lstrip("/"))
         if path in ("", "index.html"):
             return self._send(200, ASSET_CACHE["index.html"], MIME[".html"])
         if path == "api/ping":
             return self._send(200, APP_NAME.encode("utf-8"))
+        if path == "api/me":
+            return self._me()
+        if path == "api/version":
+            # Вікна питають раз на кілька секунд, чи не записав хтось інший: тоді вони
+            # підтягують свіжі дані. Хто й коли — для підпису «оновлено».
+            with STATE_LOCK:
+                body = json.dumps({"version": state_version(), **LAST_WRITE}, ensure_ascii=False).encode("utf-8")
+            return self._send(200, body, MIME[".json"])
+        if path == "api/file":
+            query = parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+            return self._send_export((query.get("p") or [""])[0])
         if path == "api/backups":
             body = json.dumps(list_backups(), ensure_ascii=False).encode("utf-8")
             return self._send(200, body, MIME[".json"])
@@ -895,7 +1083,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "api/state":
             try:
                 with STATE_LOCK:
-                    body = json.dumps(load_state(), ensure_ascii=False).encode("utf-8")
+                    body = json.dumps(load_state(self._ui_key()), ensure_ascii=False).encode("utf-8")
                     version = state_version()
             except StateBroken as e:
                 return self._send(500, str(e).encode("utf-8"))
@@ -1109,11 +1297,23 @@ class Handler(BaseHTTPRequestHandler):
         answer = {"ok": True, "path": rel, "file": os.path.basename(target), "size": n}
         self._send(200, json.dumps(answer, ensure_ascii=False).encode("utf-8"), MIME[".json"])
 
-    def do_POST(self):
+    def _ui_key(self):
+        """Налаштування вікна (оформлення, чернетки) — свої в кожної людини."""
+        return f"ui@{self.who}" if self.remote else "ui"
+
+    def _post(self):
         """Вивантаження в Excel: сторінка описує таблицю, сервер пише .xlsx
-        у «Дані обліку/вивантаження» й одразу відкриває його в Excel.
-        /api/scan — підшити скан до документа."""
+        у «Дані обліку/вивантаження» й одразу відкриває його в Excel (на іншому ПК —
+        віддає файл браузеру). /api/scan — підшити скан до документа."""
         route = self.path.split("?", 1)[0]
+        if self.remote and route in HOST_ONLY:
+            self._drain()
+            return self._send(403, "Це можна зробити лише на основному ПК, де стоїть база.".encode("utf-8"))
+        if route == "/api/network":
+            try:
+                return self._set_network()
+            except (OSError, ValueError) as e:
+                return self._send(500, str(e).encode("utf-8"))
         if route == "/api/scan":
             try:
                 return self._save_scan()
@@ -1193,6 +1393,10 @@ class Handler(BaseHTTPRequestHandler):
             if path.lower().endswith(".xlsx"):
                 with contextlib.suppress(OSError):
                     excel_names.localize_file(path)
+            if self.remote:
+                body = json.dumps(dict({"ok": True, "opened": False}, **remote_export(folder, path)),
+                                  ensure_ascii=False).encode("utf-8")
+                return self._send(200, body, MIME[".json"])
             opened = open_file(path)
             body = json.dumps({"ok": True, "path": path, "opened": opened},
                               ensure_ascii=False).encode("utf-8")
@@ -1201,8 +1405,25 @@ class Handler(BaseHTTPRequestHandler):
             body = json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
             self._send(500, body.encode("utf-8"), MIME[".json"])
 
-    def do_PUT(self):
+    def _put_ui(self):
+        """Налаштування вікна окремо від обліку — без звірки версії."""
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+            ui = json.loads(self.rfile.read(n).decode("utf-8"))
+            if not isinstance(ui, dict):
+                return self._send(422, "налаштування вікна мають бути об'єктом".encode("utf-8"))
+            with STATE_LOCK:
+                save_ui(ui, self._ui_key())
+                version = state_version()
+            body = json.dumps({"ok": True, "version": version}).encode("utf-8")
+            return self._send(200, body, MIME[".json"])
+        except (ValueError, OSError, sqlite3.Error, StateBroken) as e:
+            return self._send(500, str(e).encode("utf-8"))
+
+    def _put(self):
         path, _, query = self.path.partition("?")
+        if path == "/api/ui":
+            return self._put_ui()
         if path != "/api/state":
             return self._send(404, b"not found")
         try:
@@ -1216,7 +1437,9 @@ class Handler(BaseHTTPRequestHandler):
                 if seen and seen != state_version():
                     msg = "дані змінено в іншому вікні програми"
                     return self._send(409, msg.encode("utf-8"))
-                units = save_state(state, force_backup="backup=1" in query, replace_papers="papers=replace" in query)
+                units = save_state(state, force_backup="backup=1" in query, replace_papers="papers=replace" in query,
+                                   ui_key=self._ui_key())
+                LAST_WRITE.update(who=self.who, at=time.strftime("%H:%M"))
                 # Id щойно внесених документів: вікно впише їх у свої рядки, і
                 # виправлення оновить запис, а не створить документ наново. Так
                 # само — id щойно заведених одиниць реєстру й рапортів про знищення.
@@ -1237,6 +1460,24 @@ class Handler(BaseHTTPRequestHandler):
             # запис без кінця. Відповідь — словами, слід — у консолі.
             traceback.print_exc()
             self._send(500, f"{type(e).__name__}: {e}".encode("utf-8"))
+
+
+def remote_export(folder, path):
+    """Що віддати браузеру іншого ПК: сам файл або — коли вивантаження лягло в теку
+    (комплект 21/Прод, книги за рік) — цю теку одним zip-архівом."""
+    rel = os.path.relpath(path, folder)
+    top = rel.split(os.sep)[0]
+    target = path
+    if top != rel:
+        target = os.path.join(folder, top + ".zip")
+        import zipfile                                         # noqa: PLC0415
+        with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as z:
+            for dp, _, fs in os.walk(os.path.join(folder, top)):
+                for f in sorted(fs):
+                    full = os.path.join(dp, f)
+                    z.write(full, os.path.relpath(full, folder))
+    name = os.path.relpath(target, folder).replace(os.sep, "/")
+    return {"path": target, "download": "api/file?p=" + quote(name)}
 
 
 def open_file(path):
@@ -1392,6 +1633,14 @@ def window_args(browser, url, profile):
 
 
 RUNNING = ".програма запущена"
+# Чи слухає сервер мережу (налаштування могли змінити без перезапуску).
+NET_LISTENING = {"on": False}
+
+
+class NetServer(ThreadingHTTPServer):
+    """Сервер для інших ПК. Порт — лише свій: у Windows SO_REUSEADDR дав би другій програмі
+    (інша частина на тому самому ПК) «зайняти» той самий порт, і запити йшли б навмання."""
+    allow_reuse_address = False
 
 
 def close_database():
@@ -1465,8 +1714,20 @@ def main():
         say(f"«{APP_NAME}» уже відкрито. Знайдіть його вікно на панелі завдань.")
         return
     sweep_window_profiles()
-    port = free_port()
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    server = None
+    cfg = net_cfg()
+    if cfg.get("on") and cfg.get("code"):
+        # Інші ПК знаходять програму за сталою адресою: ім'я цього ПК і порт.
+        try:
+            port = int(cfg.get("port") or network.DEFAULT_PORT)
+            server = NetServer(("0.0.0.0", port), Handler)
+            NET_LISTENING["on"] = True
+        except (OSError, ValueError) as e:
+            say(f"Робота в мережі: порт {cfg.get('port')} зайнятий чи недоступний ({e}). "
+                "Програма відкриється лише на цьому ПК.")
+    if server is None:
+        port = free_port()
+        server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     mark_running(port)
     url = f"http://127.0.0.1:{port}/index.html"

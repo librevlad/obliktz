@@ -279,6 +279,19 @@
    *  файл тим часом змінило інше вікно. */
   let stateVersion = null;
   let stateConflict = false;
+  /** Хто працює в цьому вікні: ім'я для журналу змін, з іншого ПК (remote) чи на
+   *  основному; основному ПК — ще й налаштування роботи в мережі (net). */
+  let me = { name: '', remote: false, net: null };
+  async function meLoad() {
+    try {
+      const r = await fetch('api/me', { cache: 'no-store' });
+      if (r.ok) me = Object.assign({ name: '', remote: false, net: null }, await r.json());
+    } catch (e) { /* не десктоп-режим */ }
+    try {
+      const r = await fetch('api/version', { cache: 'no-store' });
+      if (r.ok) sync.last = await r.json();
+    } catch (e) { /* ignore */ }
+  }
 
   async function loadState() {
     try {
@@ -286,7 +299,11 @@
       if (r.ok) {
         stateVersion = r.headers.get('X-State-Version');
         const j = await r.json();
-        if (j && typeof j === 'object') { Object.assign(store, j); native = true; return; }
+        if (j && typeof j === 'object') { Object.assign(store, j); native = true; await meLoad(); return; }
+      } else if (r.status === 401) {
+        // Перепустка з іншого ПК більше не діє (новий код доступу): сторінка входу.
+        location.reload();
+        await new Promise(() => {});
       } else if (r.status === 500) {
         native = true;
         stateBroken = (await r.text()) || 'файл стану не читається';
@@ -425,6 +442,7 @@
 
   async function flush() {
     clearTimeout(saving.timer);
+    if (sync.leaving) return false;          // вікно саме оновлюється: правки відкладено
     if (saving.busy) { saving.again = true; return saving.busy; }
     if (!saving.dirty) return true;
     if (stateBroken) {
@@ -438,11 +456,16 @@
     if (Array.isArray(store.people)) {
       store.people = store.people.filter((p) => p.id === state.personId || !blankPerson(p) || personUses(p.id));
     }
-    const body = JSON.stringify(store);
+    // Змінилися лише налаштування цього вікна (чернетка, оформлення) — вони пишуться
+    // окремо: без звірки з чужими записами, і інші вікна через них не оновлюються.
+    const shared = native ? syncShared() : '';
+    const uiOnly = native && sync.base !== null && shared === sync.base && !saving.backup && !saving.papers;
+    const body = uiOnly ? '' : JSON.stringify(store);
     saving.busy = (async () => {
       if (!native) {
         try { localStorage.setItem(LS, body); return true; } catch (e) { return 'у браузері забракло місця для даних'; }
       }
+      if (uiOnly) return syncPutUi();
       try {
         const headers = { 'Content-Type': 'application/json' };
         if (stateVersion) headers['X-State-Version'] = stateVersion;
@@ -462,14 +485,20 @@
         try {
           const r = await fetch('api/state' + (query ? `?${query}` : ''), { method: 'PUT', headers, body });
           if (r.status === 409) res = 'conflict';
+          else if (r.status === 401) res = 'login';
           else if (r.status === 422) res = { refused: (await r.text()) || 'база не прийняла запис' };
           else if (!r.ok) res = (await r.text()) || `помилка ${r.status}`;
           else {
             const j = await r.json().catch(() => ({}));
             if (j.version) stateVersion = j.version;
+            sync.base = shared;
             if (Array.isArray(j.ids)) adoptIds(j.ids);
             if (j.units && typeof j.units === 'object') adoptUnits(j.units);
             if (j.reports && typeof j.reports === 'object') adoptReports(j.reports);
+            // Id, які щойно дала база, — теж її стан: інакше наступне злиття вважало б
+            // їх правками вікна. Правки, внесені поки йшов запис, лишаються правками.
+            if (!saving.dirty) sync.base = syncShared();
+            syncTriesSet(0);
             res = true;
           }
         } catch (e) {
@@ -493,11 +522,18 @@
       saveBar(`Зміни НЕ записано: ${res.refused}. Виправте це — усе внесене запишеться з наступною зміною.`);
       return false;
     }
-    if (res === 'conflict') {
-      // Інше вікно вже записало свіжіші дані: наш запис їх затер би. Далі це
-      // вікно не пише нічого — лише каже, що робити.
-      stateConflict = true;
+    if (res === 'conflict' || res === 'login') {
+      // Інше вікно (чи інша людина) вже записало свіжіші дані: наш запис їх затер би.
+      // Вікно бере свіжі дані й накладає на них лише свої правки. Не вийшло й утретє —
+      // далі не пише нічого, лише каже, що робити.
       saving.dirty = true;
+      if (syncLeave(res)) return false;
+      if (res === 'login') {
+        saving.failed = true;
+        saveBar('Зміни НЕ записано: потрібно ввійти знову. Оновіть сторінку (F5) і впишіть ім’я та код доступу.');
+        return false;
+      }
+      stateConflict = true;
       saveBar('Дані змінено в іншому вікні програми. Це вікно більше не зберігає зміни. '
         + 'Закрийте його або перезавантажте (F5).');
       return false;
@@ -509,14 +545,304 @@
     } else {
       saving.dirty = true;
       saving.failed = true;
-      saveBar(`Зміни НЕ записано у файл (${res}). Програма повторює спробу кожні 5 секунд. `
-        + 'Не закривайте вікно. Якщо смуга не зникає — ⚙ → «Зберегти копію бази…»: незаписане програма '
-        + 'збереже окремим файлом.');
+      saveBar(me.remote
+        ? `Зміни НЕ записано (${res}). Програма повторює спробу кожні 5 секунд. Не закривайте вікно: `
+          + 'перевірте, що основний ПК увімкнений і програма на ньому відкрита.'
+        : `Зміни НЕ записано у файл (${res}). Програма повторює спробу кожні 5 секунд. `
+          + 'Не закривайте вікно. Якщо смуга не зникає — ⚙ → «Зберегти копію бази…»: незаписане програма '
+          + 'збереже окремим файлом.');
       clearTimeout(saving.retry);
       saving.retry = setTimeout(flush, 5000);
     }
     if (saving.again) { saving.again = false; if (saving.dirty) return flush(); }
     return res === true;
+  }
+
+  // ------------------------------------------------ робота кількох людей
+  /* Програма й база — на основному ПК; інші люди працюють з неї в браузері по мережі.
+     Вікно записує стан обліку цілком, тож запис вікна, яке не бачило чужих змін, затер
+     би їх. Тому вікно пам'ятає, з якими даними почало (sync.base), і коли сервер каже
+     «тим часом записав хтось інший», бере свіжі дані, накладає на них лише свої правки
+     й записує знову. Зливаються записи: документ, людина, позиція, скан. Той самий
+     запис правили обоє — лишається правка того, хто записав пізніше, і він бачить про
+     це слово. Вікно, у якому нічого не вносять, саме підтягує чужі зміни. */
+
+  // ЗЛИТТЯ: ПОЧАТОК — чисті функції без стану вікна (їх перевіряють окремо).
+  /** Розділи самого вікна: налаштування людини й разове прохання видати номери. */
+  const SYNC_OWN = new Set(['ui', 'invIssue']);
+  /** Ключ запису там, де записи без id. Журнал змін і переміщення номерів лише
+   *  доповнюються — запис сам собі ключ. */
+  const SYNC_KEYS = {
+    items: (r) => String(r.code),
+    scans: (r) => `${r.key}|${r.path}`,
+    ownLines: (r) => `${r.form}|${String(r.name || '').trim()}`,
+    log: (r) => JSON.stringify(r),
+    invMoves: (r) => JSON.stringify(r),
+  };
+  /** Документ — усі його рядки разом: за id документа бази (поле за хвостом рядка,
+   *  TAIL_AT + 1), а в ще не записаного — за датою, номером і маршрутом. */
+  const syncDocKey = (r) => (r[10] ? `id:${r[10]}`
+    : `k:${[r[0], String(r[2]).trim(), r[3] || '', r[4] || ''].join('|')}`);
+  const syncPlain = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+  const syncSame = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  const syncKeyBy = (by) => (by === 'docs' ? syncDocKey : by === 'id' ? (r) => String(r.id) : SYNC_KEYS[by]);
+
+  /** Як ключувати перелік: 'docs', назва розділу, 'id' або '' — перелік береться цілком. */
+  function syncBy(path, list) {
+    if (path.length === 2 && path[0] === 'docs') return 'docs';
+    if (path.length === 1 && SYNC_KEYS[path[0]]) return path[0];
+    if (list.length && list.every((r) => syncPlain(r) && r.id != null && r.id !== '')) return 'id';
+    return '';
+  }
+  function syncGroup(list, key) {
+    const out = new Map();
+    for (const r of list) {
+      const k = key(r);
+      if (!out.has(k)) out.set(k, []);
+      out.get(k).push(r);
+    }
+    return out;
+  }
+
+  /** Правки вікна: що змінилося від даних, з якими воно почало (base), до теперішніх. */
+  function syncDiff(base, cur, path = []) {
+    const ops = [];
+    const keys = new Set(Object.keys(base || {}).concat(Object.keys(cur || {})));
+    for (const k of keys) {
+      const b = (base || {})[k], c = (cur || {})[k], p = path.concat([k]);
+      if (syncSame(b, c)) continue;
+      if (!path.length && SYNC_OWN.has(k)) { ops.push({ p, own: 1, now: c }); continue; }
+      if ((syncPlain(b) || b === undefined) && (syncPlain(c) || c === undefined)) {
+        ops.push(...syncDiff(b, c, p));
+        continue;
+      }
+      const by = (Array.isArray(b) || b === undefined) && (Array.isArray(c) || c === undefined)
+        ? syncBy(p, (b || []).concat(c || [])) : '';
+      if (by) {
+        const key = syncKeyBy(by);
+        const gb = syncGroup(b || [], key), gc = syncGroup(c || [], key);
+        for (const id of new Set([...gb.keys(), ...gc.keys()])) {
+          const was = gb.get(id) || null, now = gc.get(id) || null;
+          if (!syncSame(was, now)) ops.push({ p, by, id, was, now });
+        }
+        continue;
+      }
+      ops.push({ p, was: b, now: c });
+    }
+    return ops;
+  }
+
+  /** Накласти правки вікна на свіжі дані. Повертає правки, де той самий запис тим часом
+   *  змінив хтось інший (лишається правка вікна). */
+  function syncApply(theirs, ops) {
+    const clashes = [];
+    for (const op of ops) {
+      let at = theirs;
+      for (const k of op.p.slice(0, -1)) {
+        if (!syncPlain(at[k])) {
+          if (op.now === undefined || op.now === null) { at = null; break; }
+          at[k] = {};
+        }
+        at = at[k];
+      }
+      if (!at) continue;
+      const k = op.p[op.p.length - 1];
+      if (op.own) {
+        if (op.now === undefined) delete at[k]; else at[k] = op.now;
+        continue;
+      }
+      if (op.by) {
+        const key = syncKeyBy(op.by);
+        if (!Array.isArray(at[k])) at[k] = [];
+        const list = at[k];
+        const idx = [];
+        list.forEach((r, i) => { if (key(r) === op.id) idx.push(i); });
+        const have = idx.length ? idx.map((i) => list[i]) : null;
+        if (!syncSame(have, op.was) && !syncSame(have, op.now)) clashes.push(op);
+        const pos = idx.length ? idx[0] : list.length;
+        for (let i = idx.length - 1; i >= 0; i--) list.splice(idx[i], 1);
+        if (op.now) list.splice(pos, 0, ...op.now);
+        continue;
+      }
+      if (!syncSame(at[k], op.was) && !syncSame(at[k], op.now)) clashes.push(op);
+      if (op.now === undefined) delete at[k]; else at[k] = op.now;
+    }
+    return clashes;
+  }
+  // ЗЛИТТЯ: КІНЕЦЬ
+
+  /** base — спільні дані (без налаштувань вікна) такими, якими їх востаннє бачила база;
+   *  leaving — вікно саме перезавантажується; last — хто й коли записав останнім. */
+  const sync = { base: null, leaving: false, touched: Date.now(), last: null, note: '' };
+  const SYNC_PACK = 'oblik.sync', SYNC_TRIES = 'oblik.sync.tries';
+  /** Спільні дані вікна одним рядком: без налаштувань вікна й без порожніх розділів — база
+   *  порожніх розділів не віддає, а сторінка заводить їх, щойно до них дійшла. */
+  function syncShared() {
+    const out = {};
+    for (const [k, v] of Object.entries(store)) {
+      if (k === 'ui' || v === undefined || (Array.isArray(v) ? !v.length : syncPlain(v) && !Object.keys(v).length)) continue;
+      out[k] = v;
+    }
+    return JSON.stringify(out);
+  }
+  function syncTriesGet() {
+    try { return +(sessionStorage.getItem(SYNC_TRIES) || 0); } catch (e) { return 99; }
+  }
+  function syncTriesSet(n) {
+    try { if (n) sessionStorage.setItem(SYNC_TRIES, String(n)); else sessionStorage.removeItem(SYNC_TRIES); } catch (e) { /* ignore */ }
+  }
+  /** Що з екрана повернути після оновлення: розділ, відкрита картка, фільтри, прокрутка.
+   *  Форми й чернетки сюди не йдуть — чернетки й так лежать у налаштуваннях вікна. */
+  const SYNC_VIEW = ['view', 'asOf', 'q', 'group', 'sub', 'onlyShort', 'onlyMine', 'noScan', 'assetF', 'subAsset',
+    'subHolder', 'subFilterFor', 'stId', 'stSub', 'mtzMonth', 'peopleTab', 'personId', 'movesKindF', 'staffForm',
+    'movesFrom', 'movesTo', 'movesLimit', 'itemCode', 'reconDate', 'reconId', 'j14sub', 'j14page', 'j47code',
+    'moveKind', 'docKey', 'docBack', 'subName', 'paperId', 'paperVer', 'staffAll', 'normTerms', 'purCut', 'purFold',
+    'paperHist', 'staffOpen', 'sort', 'tf'];
+  function syncView() {
+    const v = {};
+    for (const k of SYNC_VIEW) {
+      if (!(k in state)) continue;
+      try { v[k] = JSON.parse(JSON.stringify(state[k] === undefined ? null : state[k])); } catch (e) { /* ignore */ }
+    }
+    const sc = $('#scroll'), tb = sc && sc.querySelector('.card--fill');
+    return { state: v, scroll: { page: sc ? sc.scrollTop : 0, table: tb ? tb.scrollTop : 0 } };
+  }
+  const SYNC_PART = { docs: 'документи', people: 'люди', items: 'номенклатура', destroyed: 'знищене', scans: 'скани',
+    recon: 'звірки', inventories: 'інвентаризації', mtz: 'відомість МТЗ', subs: 'підрозділи', norms: 'штат',
+    units: 'одиниці', papers: 'документи служби', mvo: 'посадові особи', cmdrs: 'посадові особи',
+    officials: 'посадові особи', locations: 'дислокація', unit: 'реквізити', subst: 'заміни',
+    ownLines: 'форма 21/Прод', lineCodes: 'форма 21/Прод' };
+  /** «(Міша, 10:42)» — ім'я не відмінюється, тож стоїть у дужках. */
+  const syncWho = (x) => { const t = [x && x.who, x && x.at].filter(Boolean).join(', '); return t ? ` (${t})` : ''; };
+
+  async function syncPutUi() {
+    try {
+      const r = await fetch('api/ui', { method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(store.ui || {}) });
+      if (r.status === 401) return 'login';
+      return r.ok ? true : ((await r.text()) || `помилка ${r.status}`);
+    } catch (e) {
+      return 'програма не відповідає';
+    }
+  }
+
+  /** Запис не прийнято: тим часом записав хтось інший (або треба ввійти знову). Правки
+   *  вікна відкладаються, сторінка бере свіжі дані й накладає правки на них. */
+  function syncLeave(reason) {
+    const tries = syncTriesGet();
+    if (sync.base === null || tries >= 3) return false;
+    clearTimeout(draftTimer);
+    keepDrafts();
+    const ops = syncDiff(JSON.parse(sync.base), JSON.parse(syncShared()));
+    ops.push({ p: ['ui'], own: 1, now: store.ui });
+    try {
+      sessionStorage.setItem(SYNC_PACK, JSON.stringify({ ops, view: syncView(), reason }));
+      sessionStorage.setItem(SYNC_TRIES, String(tries + 1));
+    } catch (e) {
+      return false;
+    }
+    sync.leaving = true;
+    clearTimeout(saving.timer);
+    clearTimeout(saving.retry);
+    saveBar(reason === 'login' ? 'Потрібно ввійти знову. Внесене не загубиться.'
+      : 'Тим часом зміни записала інша людина. Програма поєднує їх із вашими…');
+    location.reload();
+    return true;
+  }
+
+  /** У вікні нічого не вносять, а хтось записав зміни — вікно підтягує їх. */
+  function syncFresh(info) {
+    try {
+      sessionStorage.setItem(SYNC_PACK, JSON.stringify({ ops: [], view: syncView(), reason: 'fresh',
+        who: info.who || '', at: info.at || '' }));
+    } catch (e) {
+      return;
+    }
+    sync.leaving = true;
+    location.reload();
+  }
+
+  /** Відкладене перед оновленням — одразу після читання даних: налаштування вікна
+   *  мають бути на місці до того, як із них підніматимуться чернетки. */
+  function syncTake() {
+    let pack = null;
+    try {
+      pack = JSON.parse(sessionStorage.getItem(SYNC_PACK) || 'null');
+      sessionStorage.removeItem(SYNC_PACK);
+    } catch (e) {
+      pack = null;
+    }
+    if (!pack || !native || stateBroken) return null;
+    const ui = (pack.ops || []).find((op) => op.own && op.p[0] === 'ui');
+    if (ui && syncPlain(ui.now)) store.ui = ui.now;
+    return pack;
+  }
+
+  /** Після того, як вікно розклало свіжі дані (люди, позиції, норми): це й є дані бази,
+   *  з якими вікно почало. Відкладені правки лягають поверх і записуються. */
+  function syncStart(pack) {
+    if (!native || stateBroken) return;
+    sync.base = syncShared();
+    if (!pack) return;
+    const ops = (pack.ops || []).filter((op) => !(op.own && op.p[0] === 'ui'));
+    const clashes = syncApply(store, ops);
+    if (ops.length) {
+      mergeOwnItems();
+      rebuildSubs(store.subs, subMentions());
+      save(true);
+    }
+    const v = pack.view || {};
+    for (const k of SYNC_VIEW) if (v.state && k in v.state) state[k] = v.state[k];
+    if (v.scroll) { scrollMemo.set(screenKey(), v.scroll); state.restoreScroll = true; }
+    if (pack.reason === 'fresh') {
+      sync.note = `Оновлено: дані змінено в іншому вікні${syncWho(pack)}.`;
+    } else if (ops.length) {
+      const parts = [...new Set(clashes.map((op) => SYNC_PART[op.p[0]] || 'інше'))];
+      sync.note = (pack.reason === 'login' ? 'Ви знову ввійшли — внесене записано.'
+        : `Ваші зміни записано разом зі змінами, внесеними одночасно в іншому вікні${syncWho(sync.last)}.`)
+        + (parts.length ? ` Той самий запис правили обоє (${parts.join(', ')}) — лишилася ваша правка.` : '');
+    }
+    sync.fresh = pack.reason === 'fresh';
+  }
+
+  /** Вікно вільне: людина нічого не набирає й не тримає відкритою форму чи вікно. */
+  function syncIdle() {
+    if (Date.now() - sync.touched < 5000) return false;
+    if (saving.dirty || saving.busy || saving.failed) return false;
+    const a = document.activeElement;
+    if (a && a !== document.body && a.matches('input, textarea, select, [contenteditable="true"]')
+      && !a.matches('#q, #as-of')) return false;
+    if ($('#modal') || $('#palette') || formOpen()) return false;
+    const pick = $('#pick-pop');
+    if (pick && pick.style.display !== 'none' && pick.innerHTML) return false;
+    for (const k of ['viewer', 'editingReport', 'newItem', 'assign', 'subNew', 'subRen', 'unitEdit', 'invMove', 'imp']) {
+      if (state[k]) return false;
+    }
+    if (state.ownLineOpen) return false;
+    return !String(window.getSelection ? window.getSelection() : '');
+  }
+
+  /** Раз на кілька секунд: чи не записав хтось інший. */
+  function syncWatch() {
+    if (!native || stateBroken) return;
+    const touch = () => { sync.touched = Date.now(); };
+    for (const ev of ['keydown', 'pointerdown', 'wheel']) document.addEventListener(ev, touch, { capture: true, passive: true });
+    const tick = async () => {
+      if (sync.leaving || stateConflict || document.hidden) return;
+      const mine = stateVersion;
+      let j = null;
+      try {
+        const r = await fetch('api/version', { cache: 'no-store' });
+        if (r.ok) j = await r.json();
+      } catch (e) {
+        return;
+      }
+      if (!j || !j.version || !mine || mine !== stateVersion || j.version === stateVersion) return;
+      if (saving.dirty || saving.busy) return;          // власний запис і так зіллється з чужим
+      if (syncIdle()) syncFresh(j);
+    };
+    setInterval(tick, 4000);
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) tick(); });
   }
 
   // ------------------------------------------------ чернетки документів
@@ -986,6 +1312,7 @@
     destroyed: renderDestroyed, recon: renderRecon, subst: renderSubst,
     stocktake: renderStocktake, people: renderPeople, sub: renderSubCard, mtz: renderMtz,
     purch: renderPurchases, val: () => renderPapers('valuation'), yats: () => renderPapers('tech_act'),
+    settings: renderSettings,
   };
 
   // Пункти згруповані за тим, навіщо людина сюди заходить: облік ведуть,
@@ -1126,6 +1453,7 @@
     j47: () => '',
     j14: () => '',
     sub: () => `Картка підрозділу на ${fmtDate(state.asOf)}`,
+    settings: () => (me.remote ? `Вхід з іншого ПК: ${me.name}` : 'Оформлення, мережа, копії й перевірка бази'),
   };
   const subtitle = () => { const f = SUB_TEXT[state.view]; return f ? f() : ''; };
 
@@ -1175,6 +1503,7 @@
           : state.view === 'val' || state.view === 'yats' ? `${state.paperId || ''}|${state.paperVer || ''}` : '');
 
   function render() {
+    $('#gear').classList.toggle('is-on', state.view === 'settings');
     pickClose();
     comboClose();
     renderNav();
@@ -6393,13 +6722,15 @@
         ${list.length > 1 ? '<button class="btn btn--sm" data-vw-do="prev" title="Попередній файл (←)">◀</button>'
           + '<button class="btn btn--sm" data-vw-do="next" title="Наступний файл (→)">▶</button>' : ''}
         <button class="btn btn--sm" data-vw-do="open" title="Відкрити програмою Windows">Відкрити окремо</button>
-        <button class="btn btn--sm" data-vw-do="reveal">Показати в теці</button>
+        ${me.remote ? '' : '<button class="btn btn--sm" data-vw-do="reveal">Показати в теці</button>'}
         <button class="btn btn--sm" data-vw-do="close" title="Закрити (Esc)">✕</button>
       </div>
       <div class="viewer__body">${body}</div></div>`;
   }
   async function fileOpen(f, reveal = false) {
     if (!f) return;
+    // З іншого ПК файл відкриває браузер: програми Windows основного ПК тут ні до чого.
+    if (me.remote) { window.open(fileUrl(f.path), '_blank'); return; }
     try {
       const r = await fetch(reveal ? 'api/reveal' : 'api/open', { method: 'POST',
         headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: f.path }) });
@@ -7706,7 +8037,7 @@
     add('info', unsure.length, `${plural(unsure.length, 'позиція', 'позиції', 'позицій')} з непідтвердженим видом обліку`,
       () => go('nomen', { assetF: 'unsure', group: '', sub: '', q: '', onlyShort: false }),
       'уточніть у ФЕС, необоротний актив це чи запаси', 'Показати перелік');
-    if (native) {
+    if (native && !me.remote) {
       // Автоматичні копії лежать на тому самому диску, що й база: втрата теки
       // чи диска забирає їх разом з обліком. Копію поза комп’ютером людина
       // робить сама — програма лише не дає про це забути.
@@ -10958,7 +11289,6 @@
   }
 
   function impOpen() {
-    closeTweaks();
     if (!native) { toast('Імпорт з Excel є лише в програмі на комп’ютері.', true); return; }
     state.imp = null;
     impShow();
@@ -11125,7 +11455,9 @@
     store.log = store.log || [];
     const d = new Date();
     const t = new Date(d.getTime() - d.getTimezoneOffset() * 6e4).toISOString().slice(0, 16).replace('T', ' ');
-    store.log.push({ t, what, key: key || '', text: text || '' });
+    const rec = { t, what, key: key || '', text: text || '' };
+    if (me.name) rec.who = me.name;               // хто вніс — коли працюють кілька людей
+    store.log.push(rec);
     if (store.log.length > 3000) store.log.splice(0, store.log.length - 3000);
   }
   const logOf = (pred) => (store.log || []).filter(pred).slice().reverse();
@@ -11141,12 +11473,12 @@
   }
 
   /** Вікно поверх програми: копії даних, журнал змін. */
-  function modalOpen(title, html) {
+  function modalOpen(title, html, cls = '') {
     modalClose();
     const el = document.createElement('div');
     el.id = 'modal';
     el.className = 'viewer';
-    el.innerHTML = `<div class="viewer__box modal__box"><div class="viewer__bar"><b class="viewer__name">${esc(title)}</b>
+    el.innerHTML = `<div class="viewer__box modal__box${cls ? ' ' + cls : ''}"><div class="viewer__bar"><b class="viewer__name">${esc(title)}</b>
       <button class="btn btn--sm" data-md="close" title="Закрити (Esc)">✕</button></div>
       <div class="modal__body">${html}</div></div>`;
     el.addEventListener('click', (e) => {
@@ -11160,7 +11492,6 @@
   function modalClose() { const el = $('#modal'); if (el) el.remove(); }
 
   async function openBackups() {
-    closeTweaks();
     if (!native) { toast('Автоматичні копії є лише в програмі на комп’ютері.', true); return; }
     let list = [];
     try { list = await fetch('api/backups', { cache: 'no-store' }).then((r) => r.json()); } catch (e) { list = []; }
@@ -11193,7 +11524,6 @@
    *  Дата останньої такої копії лишається в налаштуваннях: її видно на кнопці,
    *  а через 30 днів без копії Зведення нагадує. */
   async function copyAway() {
-    closeTweaks();
     if (!native) { exportState(); return; }
     // Копія бази — лише те, що вже записано у файл. Незаписане (смуга «Зміни НЕ
     // записано») спершу пробуємо записати; не вийшло — воно йде окремим файлом
@@ -11236,7 +11566,6 @@
   /** «Перевірити базу…» — звірка за правилами обліку (та сама, що й у
    *  build/verify_db.py), але без Python: перелік перевірок із поясненнями. */
   async function openVerify() {
-    closeTweaks();
     if (!native) { toast('Перевірка бази є лише в програмі на комп’ютері.', true); return; }
     let list;
     try {
@@ -11263,7 +11592,6 @@
    *  копії, скорочення. Для того, хто приймає справи; друкується з тієї ж
    *  картки — на папері лишається тільки текст. */
   function openMemo() {
-    closeTweaks();
     const li = (arr) => arr.map((x) => `<li>${x}</li>`).join('');
     const html = `<div class="memo">
       <div class="memo__head"><h2>Пам’ятка з обліку технічних засобів продовольчої служби</h2>
@@ -11323,18 +11651,23 @@
     window.print();
   }
   function openLog() {
-    closeTweaks();
     const list = logOf(() => true);
     const whats = [...new Set(list.map((x) => x.what))].sort((a, b) => a.localeCompare(b, 'uk'));
+    // Хто вніс — лише коли з програмою працює кілька людей: записи, внесені до того, без імені.
+    const whos = [...new Set(list.map((x) => x.who).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'uk'));
     const spec = () => ({
       id: 'log', rows: list, minWidth: '760px', limit: REG_LIMIT, placeholder: 'Пошук: номер, підрозділ, позиція',
-      search: (x) => [x.t, x.what, x.text, x.key || ''],
+      search: (x) => [x.t, x.what, x.text, x.key || '', x.who || ''],
       filters: [
         { type: 'select', key: 'what', label: 'дія', all: 'усі', options: whats.map((w) => [w, w]), test: (x, v) => x.what === v },
+        ...(whos.length ? [{ type: 'select', key: 'who', label: 'хто', all: 'усі', options: whos.map((w) => [w, w]),
+          test: (x, v) => x.who === v }] : []),
         { type: 'period', key: 'd', label: 'дата', get: (x) => x.t },
       ],
       columns: [
         { key: 't', label: 'час', cls: 'c-date', style: 'width:130px', sort: (x) => x.t, cell: (x) => esc(x.t) },
+        ...(whos.length ? [{ key: 'who', label: 'хто', cls: 'c-txt', style: 'flex:0 0 130px', sort: (x) => x.who || '',
+          cell: (x) => esc(x.who || '') }] : []),
         { key: 'what', label: 'дія', cls: 'c-tag', style: 'width:170px', first: 1, sort: (x) => x.what, cell: (x) => `<span class="tag tag--mv">${esc(x.what)}</span>` },
         { key: 'text', label: 'зміст', cls: 'c-txt', first: 1, sort: (x) => x.text, cell: (x) => esc(x.text) },
       ],
@@ -12257,10 +12590,6 @@
   /** Один делегований обробник на всю оболонку: пункти меню, рядки таблиць,
    *  кнопки дій. Так нічого не «відвалюється» після перемальовування. */
   function bindGlobal() {
-    // Панель оформлення закривається як звичайний поповер: клац повз неї або Esc.
-    document.addEventListener('pointerdown', (e) => {
-      if ($('#tweaks') && !e.target.closest('#tweaks, #gear')) closeTweaks();
-    });
     // Enter у полі норми переводить у наступне — заповнення штату йде колонкою.
     // Зміна норми перемальовує таблицю, тож наступне поле шукаємо вже після цього.
     // Обробник один на весь час роботи: #scroll не перестворюється, і прив'язка
@@ -12310,7 +12639,6 @@
       if ($('#palette')) { paletteClose(); return; }
       if ($('#modal')) { modalClose(); return; }
       if (state.viewer) { viewerClose(); return; }
-      if ($('#tweaks')) { closeTweaks(); return; }
       const q = $('#q');
       if (q && q.value && document.activeElement === q) { q.value = ''; state.q = ''; render(); }
     });
@@ -12475,19 +12803,19 @@
       if (d.sub) return go('sub', { subName: d.sub });
       if (d.accent) {
         state.accent = d.accent; store.ui.accent = d.accent; save();
-        applyTheme(); return openTweaks(true);
+        applyTheme(); return render();
       }
       if (d.density) {
         state.density = d.density; store.ui.density = d.density; save();
-        applyTheme(); return openTweaks(true);
+        applyTheme(); return render();
       }
       if (d.textsize) {
         state.textSize = d.textsize; store.ui.textSize = d.textsize; save();
-        applyTheme(); return openTweaks(true);
+        applyTheme(); return render();
       }
       if (d.wrap != null) {
         state.wrap = d.wrap === '1'; store.ui.wrap = state.wrap; save();
-        applyTheme(); render(); return openTweaks(true);
+        applyTheme(); return render();
       }
     });
   }
@@ -13145,6 +13473,17 @@
       });
       const j = await r.json();
       if (!j.ok) throw new Error(j.error || 'помилка вивантаження');
+      if (j.download) {
+        // З іншого ПК: файл лягає на основному ПК, а браузер забирає його собі в «Завантаження».
+        const a = document.createElement('a');
+        a.href = j.download;
+        a.download = '';
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => a.remove(), 1000);
+        toast(`Файл завантажено: ${String(j.path || '').split(/[\\/]/).pop()}` + (spec.note ? `. ${spec.note}` : ''));
+        return;
+      }
       toast((j.opened ? `Відкрито ${spec.word ? 'у Word' : 'в Excel'}: ${j.path}` : `Файл збережено: ${j.path}`)
         + (spec.note ? `. ${spec.note}` : ''));
     } catch (e) {
@@ -14450,6 +14789,9 @@ ${r.other ? r.name : it ? it.name : r.code} — ${fmtNum(r.qty)}, `
       case 'memo-print': printMemo(); break;
       case 'backups': openBackups(); break;
       case 'log': openLog(); break;
+      case 'net-open': netOpen(); break;
+      case 'net-save': netSave(); break;
+      case 'net-logout': netLogout(); break;
       case 'search': paletteOpen(); break;
       case 'lines-all': linesAll(); break;
       case 'short-xls': shortageExcel(); break;
@@ -14738,7 +15080,7 @@ ${r.other ? r.name : it ? it.name : r.code} — ${fmtNum(r.qty)}, `
   const DENSITIES = [['comfort', 'Вільна'], ['dense', 'Щільна'], ['compact', 'Дуже щільна']];
   const TEXT_SIZES = [['normal', 'Звичайний'], ['big', 'Більший'], ['bigger', 'Великий']];
 
-  /** Версія програми й схема бази: два рядки в панелі ⚙. */
+  /** Версія програми й схема бази: два рядки в картці «Довідка». */
   function versionLines() {
     const m = D.meta || {};
     if (!m.version) return [];
@@ -14746,86 +15088,145 @@ ${r.other ? r.name : it ? it.name : r.code} — ${fmtNum(r.qty)}, `
       m.schema ? `Схема бази ${m.schema}` : ''].filter(Boolean);
   }
 
-  function tweaksPanel() {
-    return `<div class="tweaks" id="tweaks" role="dialog" aria-label="Оформлення">
-      <h4>Оформлення</h4>
-      <div class="tweaks__row">
-        <span class="tweaks__label">акцентний колір</span>
-        <div class="swatches">${ACCENTS.map((c, n) =>
-      `<button class="swatch${state.accent === c ? ' is-on' : ''}" data-accent="${c}"
-          style="background:${c}" title="${ACCENT_NAMES[n]}" aria-label="${ACCENT_NAMES[n]}"></button>`).join('')}</div>
-      </div>
-      <div class="tweaks__row">
-        <span class="tweaks__label">щільність рядків</span>
-        <div class="seg">${DENSITIES
-        .map(([k, l]) => `<button data-density="${k}"${state.density === k ? ' class="is-on"' : ''}>${l}</button>`).join('')}</div>
-      </div>
-      <div class="tweaks__row">
-        <span class="tweaks__label">розмір тексту</span>
-        <div class="seg">${TEXT_SIZES
-        .map(([k, l]) => `<button data-textsize="${k}"${(state.textSize || 'normal') === k ? ' class="is-on"' : ''}>${l}</button>`).join('')}</div>
-      </div>
-      <div class="tweaks__row">
-        <span class="tweaks__label">довгі назви</span>
-        <div class="seg">
-          <button data-wrap="0"${state.wrap ? '' : ' class="is-on"'} title="Повну назву видно в підказці">Обрізати</button>
-          <button data-wrap="1"${state.wrap ? ' class="is-on"' : ''}>Переносити</button>
-        </div>
-      </div>
-      <h4>Дані та копії</h4>
-      <div class="tweaks__row">
-        ${native ? `<button class="btn" data-act="backups" style="width:100%;margin-bottom:6px"
-          title="Відновити дані з копії">Автоматичні копії…${lastBackup
-            ? ` <small>(остання ${esc(lastBackup)})</small>` : ''}</button>` : ''}
-        <button class="btn" data-act="state-export" style="width:100%;margin-bottom:6px" title="${native
-          ? 'На флешку, інший диск чи комп’ютер'
-          : 'Файл із даними програми'}">Зберегти копію ${native ? 'бази' : 'даних'}…${native && store.ui.lastCopy
-            ? ` <small>(остання ${esc(fmtDate(store.ui.lastCopy))})</small>` : ''}</button>
-        <button class="btn" data-act="state-import" style="width:100%;margin-bottom:6px">Відновити з файла…</button>
-        <button class="btn" data-act="imp-open" style="width:100%;margin-bottom:6px"
-          title="Підрозділи, позиції й документи за минулі роки одним файлом">Імпорт історії з Excel…</button>
-        <div class="tweaks__hint">${native
-          ? 'Автоматичні копії лежать на цьому ж диску. Раз на місяць зберігайте копію бази на флешку.'
-          : 'Дані зберігаються в цьому браузері. Перед очищенням браузера збережіть копію.'}</div>
-      </div>
-      <h4>Перевірка</h4>
-      <div class="tweaks__row">
-        <button class="btn" data-act="log" style="width:100%;margin-bottom:6px">Журнал змін…</button>
-        ${native ? `<button class="btn" data-act="verify" style="width:100%"
-          title="Пошук помилок в обліку">Перевірити базу…</button>` : ''}
-      </div>
-      <h4>Небезпечні дії</h4>
-      <div class="tweaks__row">
-        <button class="btn btn--danger" data-act="clear-dz" style="width:100%;margin-bottom:6px"
-          title="Рапорти з паперових журналів лишаться">Видалити рапорти про знищення, внесені в програмі…</button>
-        <button class="btn btn--danger" data-act="reset-all" style="width:100%"
-          title="Документи, рапорти, нові позиції, звірки, інвентаризації, заміни й скани, внесені в програмі">Видалити все внесене в програмі…</button>
-        <div class="tweaks__hint">Обидві дії видаляють лише внесене в програмі: дані з паперових журналів, штат, люди, МВО,
-          дислокація й підрозділи лишаються. Перед видаленням робиться копія.</div>
-      </div>
-      <h4>Довідка</h4>
-      <div class="tweaks__row">
-        <button class="btn" data-act="memo" style="width:100%"
-          title="Інструкція на одну сторінку">Пам’ятка для служби…</button>
-        ${versionLines().length
-          ? `<div class="tweaks__hint" id="app-version">${versionLines().map(esc).join('<br>')}</div>` : ''}
-      </div>
-      <h4>Скорочення</h4>
-      <div class="tweaks__row tweaks__gloss">${Object.entries(GLOSSARY).filter(([k]) => k !== 'ФЄС')
-        .map(([k, v]) => `<div><b>${esc(k)}</b><span>${esc(v)}</span></div>`).join('')}
-      </div>
-    </div>`;
+  // ============================================================ НАЛАШТУВАННЯ
+  /** Налаштування — окремий екран (до 1.10 — спливна панель біля ⚙): оформлення,
+   *  робота в мережі, копії бази, перевірка, небезпечні дії й довідка. Людина з
+   *  іншого ПК бачить лише те, що може зробити звідти: копії, відновлення й
+   *  видалення всього внесеного — справа основного ПК. */
+  function renderSettings() {
+    const host = native && !me.remote;
+    const card = (title, body, cls = '') => `<section class="card set-card${cls}">
+      <div class="card__head"><div class="card__title">${esc(title)}</div></div>
+      <div class="set-card__body">${body}</div></section>`;
+    const row = (label, ctl) => `<div class="set-row"><span class="set-label">${esc(label)}</span>${ctl}</div>`;
+    const act = (btn, hint) => `<div class="set-act">${btn}${hint ? `<span class="set-hint">${hint}</span>` : ''}</div>`;
+    const seg = (list, on, attr) => `<div class="seg">${list.map(([k, l]) =>
+      `<button type="button" data-${attr}="${k}"${on === k ? ' class="is-on"' : ''}>${l}</button>`).join('')}</div>`;
+
+    const look = row('акцентний колір', `<div class="swatches">${ACCENTS.map((c, n) =>
+      `<button type="button" class="swatch${state.accent === c ? ' is-on' : ''}" data-accent="${c}"
+        style="background:${c}" title="${ACCENT_NAMES[n]}" aria-label="${ACCENT_NAMES[n]}"></button>`).join('')}</div>`)
+      + row('щільність рядків', seg(DENSITIES, state.density, 'density'))
+      + row('розмір тексту', seg(TEXT_SIZES, state.textSize || 'normal', 'textsize'))
+      + row('довгі назви', seg([['0', 'Обрізати'], ['1', 'Переносити']], state.wrap ? '1' : '0', 'wrap'));
+
+    let net = '';
+    if (me.remote) {
+      net = row('ви ввійшли як', `<b>${esc(me.name)}</b>`)
+        + '<p class="set-note">Програма й база — на основному ПК служби. Ваші зміни записуються туди, разом зі змінами інших.</p>'
+        + act('<button type="button" class="btn" data-act="net-logout">Вийти</button>', 'наступного разу — знову ім’я й код');
+    } else if (host) {
+      const n = me.net || {};
+      const status = n.listening ? 'увімкнено' : n.on ? 'після перезапуску' : 'вимкнено';
+      net = row('робота з інших ПК', `<b class="${n.listening ? 'num-ok' : n.on ? 'num-warn' : ''}">${status}</b>`)
+        + (n.on ? row('адреса для інших ПК', `<div class="set-addr">${(n.addresses || []).map((a) =>
+          `<code>${esc(a)}</code>`).join('')}</div>`) : '')
+        + row('ваше ім’я в журналі змін', n.host_name ? `<b>${esc(n.host_name)}</b>` : '<span class="set-hint">не задано</span>')
+        + act('<button type="button" class="btn" data-act="net-open">Налаштувати…</button>',
+          n.on ? 'інші відкривають адресу в Edge чи Chrome і вписують ім’я та код доступу'
+            : 'щоб інші ПК служби працювали з цією ж базою одночасно з вами');
+    }
+
+    const copies = host
+      ? act(`<button type="button" class="btn" data-act="backups">Автоматичні копії…</button>`,
+        lastBackup ? `остання ${esc(lastBackup)}` : 'лежать на цьому ж диску')
+        + act(`<button type="button" class="btn" data-act="state-export">Зберегти копію бази…</button>`,
+          store.ui.lastCopy ? `остання ${esc(fmtDate(store.ui.lastCopy))}` : 'раз на місяць — на флешку чи інший диск')
+        + act('<button type="button" class="btn" data-act="state-import">Відновити з файла…</button>', 'копія бази з флешки')
+      : native
+        ? '<p class="set-note">Копії бази робляться й відновлюються на основному ПК.</p>'
+        : act('<button type="button" class="btn" data-act="state-export">Зберегти копію даних…</button>',
+          'дані зберігаються в цьому браузері')
+          + act('<button type="button" class="btn" data-act="state-import">Відновити з файла…</button>', '');
+    const data = copies + act('<button type="button" class="btn" data-act="imp-open">Імпорт історії з Excel…</button>',
+      'підрозділи, позиції й документи за минулі роки');
+
+    const check = act('<button type="button" class="btn" data-act="log">Журнал змін…</button>', 'хто, що й коли змінив')
+      + (native ? act('<button type="button" class="btn" data-act="verify">Перевірити базу…</button>', 'пошук помилок в обліку') : '');
+
+    const danger = me.remote ? '' : card('Небезпечні дії',
+      act('<button type="button" class="btn btn--danger" data-act="clear-dz">Видалити рапорти про знищення…</button>',
+        'лише внесені в програмі')
+      + act('<button type="button" class="btn btn--danger" data-act="reset-all">Видалити все внесене в програмі…</button>',
+        'документи, рапорти, звірки, інвентаризації, скани')
+      + '<p class="set-note">Дані з паперових журналів, штат, люди, МВО, дислокація й підрозділи лишаються. '
+      + 'Перед видаленням програма робить копію.</p>', ' set-card--danger');
+
+    const help = act('<button type="button" class="btn" data-act="memo">Пам’ятка для служби…</button>', 'інструкція на одну сторінку')
+      + (versionLines().length ? `<div class="set-version" id="app-version">${versionLines().map(esc).join('<br>')}</div>` : '');
+    const gloss = `<div class="set-gloss">${Object.entries(GLOSSARY).filter(([k]) => k !== 'ФЄС')
+      .map(([k, v]) => `<div><b>${esc(k)}</b><span>${esc(v)}</span></div>`).join('')}</div>`;
+
+    return {
+      head: head('програма', 'Налаштування'),
+      body: `<div class="set-grid" id="settings">
+        ${card('Оформлення', look)}
+        ${net ? card('Робота в мережі', net) : ''}
+        ${card('Дані та копії', data)}
+        ${card('Перевірка', check)}
+        ${danger}
+        ${card('Довідка', help)}
+        ${card('Скорочення', gloss, ' set-card--wide')}
+      </div>`,
+    };
   }
 
-  /** keepOpen=true перемальовує панель на місці (після зміни налаштування). */
-  function openTweaks(keepOpen = false) {
-    const ex = $('#tweaks');
-    if (ex) { ex.remove(); if (!keepOpen) { markGear(false); return; } }
-    document.body.insertAdjacentHTML('beforeend', tweaksPanel());
-    markGear(true);
+  /** Робота в мережі — лише на основному ПК: увімкнути, код доступу, своє ім'я, порт. */
+  function netOpen() {
+    if (me.remote || !native) return;
+    const n = me.net || {};
+    modalOpen('Робота в мережі', `<div class="set-form" id="net-form">
+      <label class="set-check"><input type="checkbox" name="on"${n.on ? ' checked' : ''}>
+        <span>Дозволити роботу з інших ПК служби</span></label>
+      <div class="form__grid">
+        <div class="field"><label>Ваше ім’я на цьому ПК</label>
+          <input name="host_name" maxlength="40" value="${esc(n.host_name || '')}" autocomplete="off">
+          <div class="field__hint">так ваші зміни підписані в журналі змін</div></div>
+        <div class="field"><label>Код доступу</label>
+          <input name="code" type="password" autocomplete="new-password" placeholder="${n.has_code ? 'без змін' : 'щонайменше 4 знаки'}">
+          <div class="field__hint">${n.has_code ? 'новий код — і всі вписують його заново' : 'його вписують на інших ПК разом зі своїм ім’ям'}</div></div>
+        <div class="field"><label>Порт</label>
+          <input name="port" type="number" min="1024" max="65535" value="${esc(String(n.port || 8770))}">
+          <div class="field__hint">зазвичай 8770</div></div>
+      </div>
+      <p class="set-note">Основний ПК має бути ввімкнений, а програма на ньому — відкрита. Увімкнення, вимкнення
+        й новий порт діють після перезапуску програми. Під час першого запуску Windows спитає дозвіл для мережі —
+        дозвольте для приватних мереж.</p>
+      <div class="set-form__acts"><button type="button" class="btn btn--primary" data-act="net-save">Зберегти</button></div>
+    </div>`, 'modal__box--form');
   }
-  const markGear = (on) => $('#gear').classList.toggle('is-on', on);
-  const closeTweaks = () => { if ($('#tweaks')) openTweaks(); };
+
+  async function netSave() {
+    const f = $('#net-form');
+    if (!f) return;
+    const field = (name) => f.querySelector(`[name="${name}"]`);
+    const was = me.net || {};
+    const body = { on: field('on').checked, host_name: field('host_name').value.trim(), code: field('code').value,
+      port: Number(field('port').value) || 8770 };
+    try {
+      const r = await fetch('api/network', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body) });
+      if (!r.ok) throw new Error((await r.text()) || `помилка ${r.status}`);
+    } catch (e) {
+      toast(`Не вдалося зберегти: ${e.message || e}`, true);
+      return;
+    }
+    await meLoad();
+    modalClose();
+    render();
+    const restart = body.on !== !!was.listening || (body.on && body.port !== was.port);
+    toast(restart ? `Збережено. Перезапустіть програму на цьому ПК — тоді робота з інших ПК ${body.on ? 'запрацює' : 'припиниться'}.`
+      : 'Збережено.');
+  }
+
+  /** Вихід з іншого ПК: перепустка зникає, наступного разу — знову ім'я й код. */
+  async function netLogout() {
+    if (!confirm('Вийти? Наступного разу програма знову спитає ім’я й код доступу.')) return;
+    await flush();
+    try { await fetch('api/logout', { method: 'POST' }); } catch (e) { /* ignore */ }
+    sync.leaving = true;
+    location.replace('./');
+  }
 
   function applyTheme() {
     document.documentElement.style.setProperty('--accent', state.accent);
@@ -14841,6 +15242,7 @@ ${r.other ? r.name : it ? it.name : r.code} — ${fmtNum(r.qty)}, `
   async function boot() {
     await loadState();
     normalizeStore();
+    const syncPack = syncTake();
     peopleInit();
     Object.assign(state, {
       accent: store.ui.accent || state.accent,
@@ -14859,11 +15261,13 @@ ${r.other ? r.name : it ? it.name : r.code} — ${fmtNum(r.qty)}, `
       draftsSaved = JSON.stringify(state.drafts);
     }
     mergeOwnItems();
+    syncStart(syncPack);
     ledger = buildLedger();
     docs = buildDocs();
     applyPrices();
     allocateLots();
     if (native) document.body.classList.add('is-native');
+    if (me.remote) document.body.classList.add('is-remote');
     // Відомість МТЗ: перший місяць, за поданням якого стежить програма, запам'ятовується одразу —
     // інакше після строку він зсунувся б на наступний, і прострочене подання зникло б із контролю.
     if (mtzInit() && !stateBroken) save();
@@ -14878,6 +15282,7 @@ ${r.other ? r.name : it ? it.name : r.code} — ${fmtNum(r.qty)}, `
     const nKept = Object.keys(state.drafts).length;
     window.addEventListener('beforeunload', (e) => {
       // Чернетка, що чекає на таймер, теж має піти в базу перед закриттям.
+      if (sync.leaving) return;               // вікно саме оновлюється: правки відкладено
       clearTimeout(draftTimer);
       keepDrafts();
       if (stateConflict || (!saving.dirty && !saving.busy && !saving.failed)) return;
@@ -14888,6 +15293,7 @@ ${r.other ? r.name : it ? it.name : r.code} — ${fmtNum(r.qty)}, `
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'hidden' && saving.dirty) flush();
     });
+    syncWatch();
     $('#side-role').textContent = `${unitInfo().legalName}`;
     $('#unit-name').textContent =
       `ТЗ ПС — облік технічних засобів продовольчої служби · ${unitInfo().legalName}`;
@@ -14899,7 +15305,7 @@ ${r.other ? r.name : it ? it.name : r.code} — ${fmtNum(r.qty)}, `
       balCache.key = null;
       render();
     });
-    $('#gear').addEventListener('click', () => openTweaks());
+    $('#gear').addEventListener('click', () => (state.view === 'settings' ? goBack('dash') : go('settings')));
     bindGlobal();
     applyTheme();
     try { history.replaceState(navSnap(), ''); } catch (e) { /* ignore */ }
@@ -14915,7 +15321,9 @@ ${r.other ? r.name : it ? it.name : r.code} — ${fmtNum(r.qty)}, `
     if (stateBroken) {
       saveBar(`База обліку не читається (${stateBroken}), зміни не записуються. `
         + 'Відновіть дані з копії: ⚙ → «Автоматичні копії…».');
-    } else if (nKept) {
+    } else if (sync.note) {
+      toast(sync.note);
+    } else if (nKept && !sync.fresh) {
       const KIND_OF = { in: 'приходу', mv: 'переміщення', wr: 'списання', dz: 'рапорту про знищення' };
       const kinds = Object.keys(state.drafts);
       state.moveKind = kinds.includes(state.moveKind) ? state.moveKind : kinds[0];

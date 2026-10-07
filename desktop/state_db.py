@@ -2027,12 +2027,13 @@ def _load_subst(con):
 def _save_log(con, rows):
     con.execute("DELETE FROM app_log")
     for r in rows or []:
-        con.execute("INSERT INTO app_log(at, what, key, text) VALUES(?, ?, ?, ?)",
-                    (r.get("t"), r.get("what"), r.get("key"), r.get("text")))
+        # who — хто вніс зміну: ім'я, під яким людина ввійшла по мережі, чи ім'я основного ПК.
+        con.execute("INSERT INTO app_log(at, what, key, text, who) VALUES(?, ?, ?, ?, ?)",
+                    (r.get("t"), r.get("what"), r.get("key"), r.get("text"), r.get("who") or None))
 
 
 def _load_log(con):
-    return [_clean({"t": r["at"], "what": r["what"], "key": r["key"], "text": r["text"]})
+    return [_clean({"t": r["at"], "what": r["what"], "key": r["key"], "text": r["text"], "who": r["who"]})
             for r in con.execute("SELECT * FROM app_log ORDER BY id")]
 
 
@@ -2141,25 +2142,48 @@ SETTINGS = ["ui", "unit", "baseSeen", "baseSig", "mtz"]
 RETIRED = {"dzActs", "reportFix"}
 
 
-def _save_settings(con, state):
-    con.execute("DELETE FROM app_setting WHERE key NOT LIKE 'orphan_line:%'")
+def _save_settings(con, state, ui_key="ui"):
+    """Налаштування вікна (`ui`: оформлення, відкладені чернетки) — свої в кожної людини:
+    основний ПК тримає їх під ключем «ui», людина з іншого ПК — під «ui@ім'я». Запис одного
+    вікна чужих налаштувань не чіпає."""
+    con.execute("DELETE FROM app_setting WHERE key NOT LIKE 'orphan_line:%' AND key NOT LIKE 'ui@%' "
+                "AND key <> 'ui'")
+    con.execute("DELETE FROM app_setting WHERE key = ?", (ui_key,))
     for key in SETTINGS:
         if key in state:
             con.execute("INSERT INTO app_setting(key, value) VALUES(?, ?)",
-                        (key, json.dumps(state[key], ensure_ascii=False)))
+                        (ui_key if key == "ui" else key, json.dumps(state[key], ensure_ascii=False)))
     rest = {k: v for k, v in state.items() if k not in KNOWN and k not in ONE_TIME}
     if rest:
         con.execute("INSERT INTO app_setting(key, value) VALUES('_решта', ?)",
                     (json.dumps(rest, ensure_ascii=False),))
 
 
-def _load_settings(con):
+def save_ui(con, ui, ui_key="ui"):
+    """Лише налаштування одного вікна: чернетки пишуться з кожною паузою в наборі,
+    і тягти за ними весь облік (та ще й звіряти з чужими записами) нема чого."""
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        con.execute("DELETE FROM app_setting WHERE key = ?", (ui_key,))
+        con.execute("INSERT INTO app_setting(key, value) VALUES(?, ?)",
+                    (ui_key, json.dumps(ui if isinstance(ui, dict) else {}, ensure_ascii=False)))
+        con.execute("COMMIT")
+    except BaseException:
+        con.execute("ROLLBACK")
+        raise
+
+
+def _load_settings(con, ui_key="ui"):
     out = {}
     for key, value in con.execute("SELECT key, value FROM app_setting"):
         if key.startswith("orphan_line:"):
             continue
         if key == "_решта":
             out.update(json.loads(value))
+        elif key == ui_key:
+            out["ui"] = json.loads(value)
+        elif key == "ui" or key.startswith("ui@"):
+            continue                          # налаштування вікна іншої людини
         else:
             out[key] = json.loads(value)
     return out
@@ -2298,7 +2322,7 @@ def _refusal(e):
 LAST_SAVE = {"reports": {}}
 
 
-def save_state(con, state, replace_papers=False):
+def save_state(con, state, replace_papers=False, ui_key="ui"):
     """Записати модель застосунку в базу. Все або нічого. Відмова бази (строки,
     що перекриваються, дві записи на ту саму дату) приходить як SaveError зі
     словами — інакше вікно бачило лише «програма не відповідає».
@@ -2307,7 +2331,7 @@ def save_state(con, state, replace_papers=False):
     LAST_SAVE["reports"] = {}
     state = _legacy_reports(_legacy(state))
     try:
-        return _save_state(con, state, replace_papers)
+        return _save_state(con, state, replace_papers, ui_key)
     except sqlite3.IntegrityError as e:
         raise SaveError(_refusal(e)) from e
 
@@ -2472,7 +2496,7 @@ def _check_dates(con, state):
                             f"або з опискою — виправте дату")
 
 
-def _save_state(con, state, replace_papers=False):
+def _save_state(con, state, replace_papers=False, ui_key="ui"):
     _check_dates(con, state)
     con.execute("BEGIN IMMEDIATE")
     try:
@@ -2518,7 +2542,7 @@ def _save_state(con, state, replace_papers=False):
         _save_subst(con, state.get("subst"))
         _save_papers(con, state.get("papers"), replace_papers)
         _save_log(con, state.get("log"))
-        _save_settings(con, state)
+        _save_settings(con, state, ui_key)
         if prices is not None:
             added = {k: v - prices.get(k, set()) for k, v in code_prices(con).items()
                      if len(v) > 1 and v - prices.get(k, set())}
@@ -2539,7 +2563,7 @@ def _save_state(con, state, replace_papers=False):
     return units
 
 
-def load_state(con):
+def load_state(con, ui_key="ui"):
     """Зібрати модель застосунку з бази — у тому вигляді, в якому він її віддав.
 
     Порожні розділи не вигадуємо: чиста база має віддати порожній стан, а не
@@ -2555,7 +2579,7 @@ def load_state(con):
     state["subst"] = _load_subst(con)
     state["papers"] = _load_papers(con)
     state["log"] = _load_log(con)
-    state.update(_load_settings(con))
+    state.update(_load_settings(con, ui_key))
     state = _legacy_reports(state)
     if not any(state["docs"].values()):
         del state["docs"]

@@ -692,31 +692,39 @@ body {
 .jr__hit small { font-weight: 500; font-size: 9.5px; color: var(--mut-2); margin-right: 3px; }
 .jr__was { font-weight: 400; color: var(--mut-3); }
 
-/* ------------------------------------------------------------------- налашт. */
-/* Панель відкривається біля ⚙, а не в протилежному куті екрана. */
-.tweaks {
-  position: fixed; left: 12px; bottom: 54px; z-index: 20; width: 264px;
-  background: var(--card); border: 1px solid var(--bd-strong); border-radius: 4px;
-  box-shadow: 0 10px 30px rgba(25, 28, 25, .24); padding: 14px;
-  /* зі скороченнями панель вища за екран ноутбука — гортається всередині,
-     а не виїжджає верхом (оформленням) за край */
-  max-height: calc(100vh - 66px); overflow-y: auto;
+/* ------------------------------------------------------------- налаштування */
+/* Налаштування — екран із карток (до 1.10 — панель біля ⚙): на 1366×768 три
+   колонки, словничок скорочень — на всю ширину внизу. */
+.set-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 12px; align-items: start;
 }
-.tweaks h4 {
-  margin: 0 0 12px; font: 600 9px var(--mono); letter-spacing: .7px;
-  color: var(--mut-2); text-transform: uppercase;
-}
-.tweaks__row { margin-bottom: 14px; }
-.tweaks__row:last-child { margin-bottom: 0; }
-.tweaks__label {
-  display: block; margin-bottom: 7px;
-  font: 500 9px var(--mono); letter-spacing: .7px;
-  color: var(--mut-2); text-transform: uppercase;
-}
-/* Три режими щільності — три рівні колонки. Раніше «Дуже щільна» переносилась
-   на другий рядок і сегмент розвалювався. */
-.tweaks .seg { display: grid; grid-template-columns: repeat(3, 1fr); }
-.tweaks .seg button { padding: 6px 4px; text-align: center; font-size: 11px; }
+.set-card--wide { grid-column: 1 / -1; }
+.set-card__body { padding: 12px 16px 14px; display: grid; gap: 11px; }
+.set-row { display: grid; gap: 6px; }
+.set-label { font: 500 9px var(--mono); letter-spacing: .7px; color: var(--mut-2); text-transform: uppercase; }
+/* Режими — рівні колонки: «Дуже щільна» не переноситься й сегмент не розвалюється. */
+.set-row .seg { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; }
+.set-row .seg button { padding: 6px 4px; text-align: center; font-size: 11px; }
+.set-act { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.set-act .btn { flex: none; }
+.set-hint { font: 400 11px/1.35 var(--sans); color: var(--mut-2); }
+.set-note { margin: 0; font: 400 11.5px/1.45 var(--sans); color: var(--mut-2); }
+.set-version { font: 400 10.5px/1.5 var(--mono); color: var(--mut-2); }
+.set-row b { font: 600 13px var(--sans); }
+.set-addr { display: grid; gap: 3px; }
+.set-addr code { font: 500 12px var(--mono); color: var(--ink); user-select: all; }
+.set-card--danger .card__title { color: var(--bad); }
+/* Словничок: скорочення служби для тих, хто тільки починає. */
+.set-gloss { columns: 3 240px; column-gap: 28px; }
+.set-gloss div { display: flex; gap: 8px; align-items: baseline; padding: 2px 0; font: 400 11px/1.35 var(--sans); break-inside: avoid; }
+.set-gloss b { flex: 0 0 62px; font: 600 10.5px var(--mono); color: var(--ink); }
+.set-gloss span { color: var(--mut-2); }
+/* Вікно «Робота в мережі». */
+.set-form { display: grid; gap: 14px; padding: 14px 18px 4px; }
+.set-form .form__grid { padding: 0; border: 0; }
+.set-check { display: flex; gap: 8px; align-items: center; font: 600 12.5px var(--sans); color: var(--ink); cursor: pointer; }
+.set-form__acts { display: flex; justify-content: flex-end; }
 .swatches { display: flex; gap: 7px; }
 .swatch {
   width: 26px; height: 22px; border-radius: 3px; border: 1px solid rgba(0, 0, 0, .2);
@@ -755,7 +763,7 @@ body.is-native .titlebar { display: none; }
   .app { height: auto; display: block; }
   .body { display: block; }
   /* На папері не лишається жодного органу керування — лише дані. */
-  .titlebar, .side, .btn, .search, .tweaks, .seg, .chip, .pager,
+  .titlebar, .side, .btn, .search, .seg, .chip, .pager,
   .panel__count, .empty__acts { display: none !important; }
   .head__stamp {
     display: block; width: 100%; order: 9;
@@ -957,11 +965,6 @@ body.is-native .titlebar { display: none; }
 .tbl__more { display: flex; align-items: center; gap: 12px; padding: 10px 16px; }
 @media print { .c-acts, .tbl__more, #doc-form { display: none !important; } }
 
-.tweaks__hint { margin-top: 8px; font: 400 10px var(--mono); color: var(--mut-2); line-height: 1.4; }
-/* Словничок у ⚙: скорочення служби для тих, хто тільки починає. */
-.tweaks__gloss div { display: flex; gap: 8px; align-items: baseline; padding: 2px 0; font: 400 11px/1.35 var(--sans); }
-.tweaks__gloss b { flex: 0 0 62px; font: 600 10.5px var(--mono); color: var(--ink); }
-.tweaks__gloss span { color: var(--mut-2); }
 
 /* Повідомлення в куті вікна: про вивантаження в Excel, видно на будь-якому екрані. */
 .toast {
@@ -1221,6 +1224,9 @@ details.fold > summary .fold__hint { font: 400 11px var(--sans); color: var(--mu
 
 /* ---------------------------------------------------- вікно: копії, журнал змін */
 .modal__box { max-width: 980px; }
+/* Вікно з кількома полями (робота в мережі) — за висотою вмісту, а не на весь екран. */
+.viewer:has(.modal__box--form) { align-items: flex-start; padding-top: 12vh; }
+.modal__box--form { max-width: 760px; }
 /* Пам’ятка: текст на одну сторінку, дві колонки; на папері — лише вона. */
 .memo { padding: 8px 20px 14px; font: 400 12.5px/1.45 var(--sans); color: var(--ink); }
 .memo__head { display: flex; align-items: center; gap: 12px; padding: 6px 0 4px; border-bottom: 1px solid var(--bd); }
