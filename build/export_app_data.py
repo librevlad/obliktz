@@ -53,7 +53,7 @@ def items_of(con):
     for r in con.execute("""
             SELECT n.id, n.code, n.name, g.code AS grp, u.code AS uom,
                    n.is_fixed_asset, n.source, n.fes_code, n.note, n.old_code, n.archived_at,
-                   COALESCE(p.price_kop, n.app_price_kop) AS price_kop
+                   n.per_ration, COALESCE(p.price_kop, n.app_price_kop) AS price_kop
               FROM nomen n
               JOIN nomen_group g ON g.id = n.group_id
               JOIN uom u ON u.id = n.uom_id
@@ -73,6 +73,8 @@ def items_of(con):
             # Примітка картки, коди з «Облік ТЗ 3.0», згорнуті в позицію, і дата,
             # з якої позиція в архіві (її не пропонують у нових документах).
             r["note"] or "", r["old_code"] or "", r["archived_at"] or "",
+            # «Дободач» книги ОП: скільки добових видач покриває одиниця (порожньо — не задано).
+            r["per_ration"],
         ])
     return out
 
@@ -303,11 +305,42 @@ def report_lines_of(con):
             SELECT m.report_line_id AS lid, n.code FROM nomen_report_line m
               JOIN nomen n ON n.id = m.nomen_id ORDER BY n.code"""):
         codes[r["lid"]].append(r["code"])
+    # 2/Прод іде окремо (form2_of): рядки бланка за номером, з одиницею й множником прив'язки.
     return [[r["form"], r["name"], r["section"] or "", codes[r["id"]]]
             for r in con.execute("""
                 SELECT rl.id, rl.name, rl.section, f.code AS form FROM report_line rl
                   JOIN report_form f ON f.id = rl.form_id
+                 WHERE f.code <> '2/Прод'
                  ORDER BY f.code, rl.sort""")]
+
+
+def form2_of(con):
+    """Перелік 2/Прод (рядок бланка, назва, розділ, одиниця, заголовок), прив'язки кодів із
+    множником і перевіркою, коди поза формою, здані звіти."""
+    rows = [[r["row_no"], r["name"], r["section"] or "", r["uom"] or "", bool(r["is_header"])]
+            for r in con.execute("""SELECT rl.* FROM report_line rl JOIN report_form f ON f.id = rl.form_id
+                                     WHERE f.code = '2/Прод' AND rl.row_no IS NOT NULL ORDER BY rl.row_no""")]
+    mp = [[r["code"], r["row_no"], r["factor"], r["checked_by"] or "", r["checked_on"] or "", None]
+          for r in con.execute("""SELECT n.code, rl.row_no, m.factor, m.checked_by, m.checked_on
+                                    FROM nomen_report_line m JOIN nomen n ON n.id = m.nomen_id
+                                    JOIN report_line rl ON rl.id = m.report_line_id
+                                    JOIN report_form f ON f.id = rl.form_id
+                                   WHERE f.code = '2/Прод' AND rl.row_no IS NOT NULL ORDER BY n.code""")]
+    mp += [[r["code"], None, 1, "", "", r["reason"] or "поза 2/прод"]
+           for r in con.execute("""SELECT n.code, s.reason FROM nomen_form_skip s JOIN nomen n ON n.id = s.nomen_id
+                                     JOIN report_form f ON f.id = s.form_id WHERE f.code = '2/Прод' ORDER BY n.code""")]
+    sub = {}
+    for r in con.execute("SELECT * FROM form2_submitted ORDER BY year, row_no, col"):
+        v = r["value_milli"] / 1000
+        sub.setdefault(str(r["year"]), {})[f"{r['row_no']}|{r['col']}"] = int(v) if v.is_integer() else v
+    return rows, mp, sub
+
+
+def parties_of(con):
+    """Контрагенти з видом (військова частина, постачальник, фонд, інше)."""
+    return [[r["name"], r["kind"]] for r in con.execute(
+        "SELECT c.name, k.code AS kind FROM counterparty c JOIN counterparty_kind k ON k.id = c.kind_id "
+        "ORDER BY c.name")]
 
 
 def responsible_of(con):
@@ -461,10 +494,18 @@ def payload(con) -> dict:
     # Реквізити частини для бланків: назва юридичної особи, ЄДРПОУ, повна
     # назва служби й строк дії накладної. Раніше вони жили в самому бланку.
     conf = dict(con.execute("SELECT key, value FROM settings"))
-    groups = [[r["code"], r["name"]] for r in con.execute(
-        "SELECT code, name FROM nomen_group ORDER BY sort, code")]
+    # Група несе книгу обліку: ТЗ чи ОП (посуд одноразового використання, миючі, серветки).
+    groups = [[r["code"], r["name"], r["book"]] for r in con.execute(
+        "SELECT code, name, book FROM nomen_group ORDER BY sort, code")]
+    form2_rows, form2_map, form2_sub = form2_of(con)
     period = con.execute(
         "SELECT MIN(doc_date), MAX(doc_date) FROM document").fetchone()
+    # Коли книгу «Облік ОП» вивантажували востаннє — для нагадування на Зведенні.
+    op_export = con.execute("SELECT value FROM app_setting WHERE key = 'op_book_export'").fetchone()
+    try:
+        op_export = json.loads(op_export[0]) if op_export else ""
+    except ValueError:
+        op_export = ""
 
     legal = conf.get("unit_legal_name", "") or ""
     unit_code = (re.search(r"частина\s+(\S+)", legal, re.I) or [None, ""])[1] if legal else ""
@@ -487,10 +528,12 @@ def payload(con) -> dict:
         "edrpou": conf.get("unit_edrpou", ""),
         "serviceFull": conf.get("service_full", ""),
         "validDays": int(conf.get("invoice_valid_days") or 1),
+        "opBookExport": op_export if isinstance(op_export, str) else "",
     },
     "groups": groups,
     "itemCols": ["code", "name", "group", "unit", "price", "cat",
-                 "serial", "chassis", "year", "nonrev", "own", "fes", "note", "old", "archived"],
+                 "serial", "chassis", "year", "nonrev", "own", "fes", "note", "old", "archived",
+                 "perRation"],
     "items": items,
     "subCols": ["name", "parent", "kind", "depth", "sort", "used", "active", "note", "id", "refs"],
     "subs": subs,
@@ -517,6 +560,12 @@ def payload(con) -> dict:
     "recon": recon,
     "lineCols": ["form", "line", "section", "codes"],
     "lines": report_lines,
+    "form2RowCols": ["row", "name", "section", "uom", "header"],
+    "form2Rows": form2_rows,
+    "form2MapCols": ["code", "row", "factor", "checked", "checkedOn", "skip"],
+    "form2Map": form2_map,
+    "form2Submitted": form2_sub,
+    "parties": parties_of(con),
     "respCols": ["sub", "name", "position"],
     "responsible": responsible,
     "personCols": ["id", "surname", "name", "patr", "note", "hist"],

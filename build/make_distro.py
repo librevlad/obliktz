@@ -43,7 +43,7 @@ EXTRACT = ROOT / "build" / "data" / "extract.json"
 VERSIONS = ROOT / "docs" / "версії.md"
 EXE = ROOT / "dist" / "Облік ТЗ ПС.exe"          # зібрана програма (build_exe.py)
 # Табельні форми й каталог табельних позицій — загальні для служби.
-CATALOG_SEEDS = ["form21_lines.sql", "form21_map.sql", "form3_lines.sql", "form2_lines.sql"]
+CATALOG_SEEDS = ["form21_lines.sql", "form21_map.sql", "form3_lines.sql", "form2_map.sql"]
 # Номери ФЕС потрібні лише на мить — виставити вид обліку за правилом db/rules/asset_class.sql;
 # далі стираються.
 FES_SEEDS = ["fes_codes.sql", "nomen_enrich.sql"]
@@ -70,16 +70,26 @@ MUST_BE_EMPTY = ("document", "document_line", "document_link", "attachment", "pe
 SOURCE_GLOBS = {
     "app": ["*.html", "*.css", "*.js"],
     "desktop": ["*.py", "icon.ico", "templates/*.xlsx"],
-    "db": ["*.py", "migrations/*.sql", "rules/*.sql", "seed/form21_lines.sql", "seed/form2_lines.sql",
+    "db": ["*.py", "migrations/*.sql", "rules/*.sql", "seed/form21_lines.sql",
            "seed/form3_lines.sql"],
     "reports": ["*.py"],
     "build": ["__init__.py", "build_exe.py", "export_app_data.py", "verify_db.py", "model.py", "version.py",
               "nomen_groups.py", "migrate_to_db.py", "make_distro.py", "make_manual.py", "check_seeds.py"],
     "docs": ["інструкція-користувача.md", "довідник-адміністратора.md", "довідник-розробника.md",
-             "питання-і-відповіді.md", "версії.md"],
+             "питання-і-відповіді.md", "версії.md", "картки/*.md"],
 }
 
 # Документи поставки з Markdown у Word: (джерело в docs/, назва файла в дистрибутиві).
+# Картки ручного шляху (одна дія — одна сторінка): у дистрибутиві й у теці релізу — Word у теці «Картки».
+CARDS_DIR = ROOT / "docs" / "картки"
+CARDS = "Картки"
+
+
+def card_name(src):
+    """«2прод-як-скласти.md» → «2прод як скласти.docx»."""
+    return src.stem.replace("-", " ") + ".docx"
+
+
 MANUALS = [("інструкція-користувача.md", "Інструкція користувача.docx"),
            ("довідник-адміністратора.md", "Довідник адміністратора.docx"),
            ("питання-і-відповіді.md", "Питання і відповіді.docx")]
@@ -248,6 +258,8 @@ def release_folder(out_dir, archive, folder):
     shutil.copy2(archive, rel / archive.name)
     for _, name in MANUALS:
         shutil.copy2(folder / name, rel / name)
+    if (folder / CARDS).exists():
+        shutil.copytree(folder / CARDS, rel / CARDS)
     (rel / f"Що нового {APP_VERSION}.txt").write_text(whats_new_text(), encoding="utf-8-sig")
     (rel / "Версії.txt").write_text(versions_text(), encoding="utf-8-sig")
     return rel
@@ -357,6 +369,9 @@ def build(out_dir=None, exe=EXE):
     make_clean_db(folder / "Дані обліку" / "oblik.sqlite")
     for src, name in MANUALS:
         build_manual(source=VERSIONS.parent / src, out=folder / name)
+    (folder / CARDS).mkdir()
+    for src in sorted(CARDS_DIR.glob("*.md")):
+        build_manual(source=src, out=folder / CARDS / card_name(src))
     (folder / "ПРОЧИТАЙТЕ.txt").write_text(readme_text(), encoding="utf-8-sig")
     (folder / "Версії.txt").write_text(versions_text(), encoding="utf-8-sig")
     copy_sources(folder)
@@ -391,4 +406,7 @@ if __name__ == "__main__":
         rel = release_folder(Path(a.out) if a.out else ROOT / "dist", archive, folder)
         print(f"тека релізу для Google Drive: {rel}")
         for f in sorted(rel.iterdir()):
-            print("  ", f.name, f"{f.stat().st_size / 1024:.0f} КБ")
+            if f.is_dir():
+                print(f"   {f.name}/ — {sum(1 for x in f.rglob('*') if x.is_file())} файлів")
+            else:
+                print("  ", f.name, f"{f.stat().st_size / 1024:.0f} КБ")

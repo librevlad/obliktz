@@ -52,9 +52,13 @@ def command(version_file):
             "--hidden-import", "book47_export", "--hidden-import", "mtz_export",
             "--hidden-import", "history_import", "--hidden-import", "excel_names",
             "--hidden-import", "valuation_export", "--hidden-import", "techact_export",
+            # Книга «Облік ОП», заявка на посуд і миючі, звірка з ФЕС.
+            "--hidden-import", "op_book", "--hidden-import", "op_request",
+            "--hidden-import", "op_fes", "--hidden-import", "fes_read",
             # Акт ЯТС складає python-docx: йому потрібні його шаблони документа.
             "--collect-data", "docx",
-            "--hidden-import", "reports.form21", "--collect-submodules", "reports.journals"]
+            "--hidden-import", "reports.form21", "--hidden-import", "reports.form2",
+            "--collect-submodules", "reports.journals"]
     cmd.append(os.path.join(ROOT, "desktop", "launcher.py"))
     return cmd
 

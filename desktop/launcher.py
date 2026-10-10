@@ -132,7 +132,7 @@ from db.connect import (apply_migrations, checked_version, current_version,   # 
                         APP_SCHEMA_VERSION, SchemaTooNewError, SchemaTooOldError)
 from build import export_app_data                     # noqa: E402
 from build import verify_db                           # noqa: E402
-from reports import form21, journals                  # noqa: E402
+from reports import form2, form21, journals           # noqa: E402
 
 ROOT = base_dir()
 DATA = data_dir()
@@ -144,7 +144,8 @@ GATE = network.Gate()
 LAST_WRITE = {"who": "", "at": ""}
 # Що можна зробити лише на самому основному ПК: відновити базу з копії чи файла, зберегти
 # копію діалогом Windows, відкрити файл чи теку програмою цього ПК, змінити налаштування мережі.
-HOST_ONLY = {"/api/restore", "/api/restore-file", "/api/copy", "/api/reveal", "/api/open", "/api/network"}
+HOST_ONLY = {"/api/restore", "/api/restore-file", "/api/copy", "/api/reveal", "/api/open", "/api/network",
+             "/api/folders"}
 
 
 def net_cfg() -> dict:
@@ -472,23 +473,65 @@ def backup_state(force=False):
             pass
 
 
+def named_backup(con, label) -> str:
+    """Іменована копія бази в «Дані обліку/копії» («облік … перед прийомом книги ОП»): такі
+    програма не прибирає, і з них відновлюються через «Автоматичні копії…»."""
+    backups = os.path.join(DATA, "копії")
+    stamp = time.strftime("%Y-%m-%d %H%M%S")
+    target = os.path.join(backups, f"{BACKUP_NAME}{stamp} {label}{BACKUP_EXT}")
+    n = 2
+    while os.path.exists(target):
+        target = os.path.join(backups, f"{BACKUP_NAME}{stamp} {label}-{n}{BACKUP_EXT}")
+        n += 1
+    os.makedirs(backups, exist_ok=True)
+    con.execute("VACUUM INTO ?", (target,))
+    copy_away(target)
+    return target
+
+
 def backup_before_upgrade(con) -> str:
     """Копія бази перед оновленням схеми — у «Дані обліку/копії», з позначкою
     в імені. Без копії оновлення не йде: міграція може змінювати дані."""
-    backups = os.path.join(DATA, "копії")
-    stamp = time.strftime("%Y-%m-%d %H%M%S")
-    target = os.path.join(backups, f"{BACKUP_NAME}{stamp} перед оновленням{BACKUP_EXT}")
-    n = 2
-    while os.path.exists(target):
-        target = os.path.join(backups, f"{BACKUP_NAME}{stamp} перед оновленням-{n}{BACKUP_EXT}")
-        n += 1
     try:
-        os.makedirs(backups, exist_ok=True)
-        con.execute("VACUUM INTO ?", (target,))
+        return named_backup(con, "перед оновленням")
     except (OSError, sqlite3.Error) as e:
         raise StateBroken(f"перед оновленням бази не вдалося зберегти її копію: {e}") from e
-    copy_away(target)
-    return target
+
+
+# Теки, куди програма кладе файли ручного шляху: (ключ, підпис у «Налаштуваннях», типова тека
+# відносно «Дані обліку»). Перелік спільний: інші розділи (закупівлі) дописують сюди свої теки.
+FOLDERS = [
+    ("opBook", "Книга «Облік ОП»", "вивантаження"),
+    ("reports", "Звіти", os.path.join("вивантаження", "Звіти")),
+    ("requests", "Заявки", "вивантаження"),
+    ("fes", "Звірки з ФЕС", "вивантаження"),
+]
+
+
+def _folders_set():
+    try:
+        row = db().execute("SELECT value FROM app_setting WHERE key = 'folders'").fetchone()
+        mine = json.loads(row[0]) if row else {}
+    except (sqlite3.Error, ValueError, StateBroken):
+        mine = {}
+    return mine if isinstance(mine, dict) else {}
+
+
+def folders() -> dict:
+    """{ключ: тека}: задана в «Налаштуваннях» або типова в «Дані обліку»."""
+    mine = _folders_set()
+    out = {}
+    for key, _label, default in FOLDERS:
+        v = mine.get(key)
+        out[key] = v.strip() if isinstance(v, str) and v.strip() else os.path.join(DATA, default)
+    return out
+
+
+def folders_listing() -> list:
+    mine, have = _folders_set(), folders()
+    return [{"key": key, "label": label, "path": have[key], "default": os.path.join(DATA, default),
+             "set": bool(isinstance(mine.get(key), str) and mine[key].strip())}
+            for key, label, default in FOLDERS]
 
 
 def _window_title() -> str:
@@ -1062,6 +1105,18 @@ class Handler(BaseHTTPRequestHandler):
         if path == "api/file":
             query = parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
             return self._send_export((query.get("p") or [""])[0])
+        if path == "api/form2":
+            # Звіт 2/прод за рік — з бази обох книг обліку (екран «2/Прод»).
+            query = parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+            try:
+                year = int((query.get("year") or [""])[0])
+            except ValueError:
+                return self._send(400, "рік звіту — число".encode("utf-8"))
+            with STATE_LOCK:
+                rep = form2.collect(db(), year, (query.get("asOf") or [""])[0] or None)
+            return self._send(200, json.dumps(rep, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+        if path == "api/folders":
+            return self._send(200, json.dumps(folders_listing(), ensure_ascii=False).encode("utf-8"), MIME[".json"])
         if path == "api/backups":
             body = json.dumps(list_backups(), ensure_ascii=False).encode("utf-8")
             return self._send(200, body, MIME[".json"])
@@ -1236,6 +1291,189 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps({"ok": True, **got}, ensure_ascii=False).encode("utf-8")
         return self._send(200, body, MIME[".json"])
 
+    def _set_folders(self):
+        """Теки з «Налаштувань» ({ключ: повний шлях або ""}): «» — типова тека."""
+        try:
+            n = int(self.headers.get("Content-Length", 0) or 0)
+            req = json.loads(self.rfile.read(n).decode("utf-8") or "{}") if n else {}
+        except ValueError:
+            req = None
+        if not isinstance(req, dict):
+            return self._send(400, "теки — це перелік «ключ → шлях»".encode("utf-8"))
+        known = {k for k, _, _ in FOLDERS}
+        clean = {}
+        for key, value in req.items():
+            if key not in known:
+                return self._send(400, f"невідома тека «{key}»".encode("utf-8"))
+            value = str(value or "").strip()
+            if value and not os.path.isabs(value):
+                return self._send(400, f"«{value}» — не повний шлях до теки".encode("utf-8"))
+            clean[key] = value
+        with STATE_LOCK:
+            mine = dict(_folders_set(), **clean)
+            db().execute("INSERT INTO app_setting(key, value) VALUES('folders', ?) "
+                         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                         (json.dumps({k: v for k, v in mine.items() if v}, ensure_ascii=False),))
+            bump_state_version()
+        return self._send(200, json.dumps(folders_listing(), ensure_ascii=False).encode("utf-8"), MIME[".json"])
+
+    def _form2_upload(self, submitted):
+        """Файл служби для 2/прод: зданий звіт (графи 5–18 по рядках — у базу) або таблиця
+        відповідності кодів (лише читається: прийняти її вирішує людина на сторінці)."""
+        n = int(self.headers.get("Content-Length", 0) or 0)
+        if n <= 0 or n > MAX_RESTORE:
+            self._drain()
+            return self._send(413, "файл порожній або завеликий".encode("utf-8"))
+        data = self.rfile.read(n)
+        try:
+            if not submitted:
+                query = parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+                got = form2.read_map(data, (query.get("date") or [time.strftime("%Y-%m-%d")])[0])
+                return self._send(200, json.dumps(got, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+            with STATE_LOCK:
+                got = form2.read_submitted(db(), data)
+                if got["mismatch"]:
+                    body = {"error": "назви рядків у файлі не збігаються з бланком", "problems": got["mismatch"][:50]}
+                    return self._send(422, json.dumps(body, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+                rows = form2.store_submitted(db(), got["year"], got["values"])
+                bump_state_version()
+                LAST_WRITE.update(who=self.who, at=time.strftime("%H:%M"))
+        except Exception as e:                                       # noqa: BLE001 — будь-який зіпсований файл
+            body = {"error": "файл не прочитано", "problems": [str(e)]}
+            return self._send(422, json.dumps(body, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+        body = {"ok": True, "year": got["year"], "rows": rows, "unknown": got["unknown"]}
+        return self._send(200, json.dumps(body, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+
+    def _op_fes(self):
+        """Звірка книги ОП зі звітом ФЕС «Залишки ТМЦ»: результат — на сторінку й книгою в теку звірок."""
+        import fes_read                                          # noqa: PLC0415
+        import op_fes                                            # noqa: PLC0415
+        n = int(self.headers.get("Content-Length", 0) or 0)
+        if n <= 0 or n > MAX_RESTORE:
+            self._drain()
+            return self._send(413, "файл порожній або завеликий".encode("utf-8"))
+        data = self.rfile.read(n)
+        query = parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+        try:
+            report = fes_read.read_report(data)
+        except ValueError as e:
+            body = {"error": "звіт ФЕС не прочитано", "problems": [str(e)]}
+            return self._send(422, json.dumps(body, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+        with STATE_LOCK:
+            con = db()
+            row = con.execute("SELECT value FROM app_setting WHERE key = 'fesPlaces'").fetchone()
+            try:
+                places = json.loads(row[0]) if row else {}
+            except ValueError:
+                places = {}
+            got = op_fes.compare(con, report, (query.get("asOf") or [""])[0] or None,
+                                 places if isinstance(places, dict) else {})
+        got["path"] = op_fes.write_result(got, folders()["fes"])
+        got["ok"] = True
+        got["places"] = [p["name"] for p in report["places"]]
+        if self.remote:
+            got.update(remote_any(got["path"]))
+        return self._send(200, json.dumps(got, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+
+    def _op_export(self):
+        """Книга «Облік ОП» — у теку з налаштувань. Файл, у якому є внесене руками, чого немає в
+        базі, не перезаписується: спершу «Прийняти книгу…»."""
+        import op_book                                           # noqa: PLC0415
+        path = os.path.join(folders()["opBook"], "Облік ОП.xlsx")
+        with STATE_LOCK:
+            con = db()
+            if os.path.exists(path):
+                try:
+                    with open(path, "rb") as f:
+                        have = op_book.read_book(f.read())
+                    plan = op_book.diff(con, have)
+                    extra = plan["docs"]["new"] + plan["docs"]["changed"] + plan["items"]["new"]
+                except op_book.BookError as e:
+                    extra = e.problems
+                except OSError as e:
+                    extra = [f"файл зайнятий: {e}"]
+                if extra:
+                    body = {"error": "у книзі є внесене руками, чого немає в програмі: спершу «Прийняти книгу…»",
+                            "rows": extra[:50]}
+                    return self._send(409, json.dumps(body, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                got = op_book.export_book(con, path)
+            except PermissionError:
+                body = {"error": "книга «Облік ОП.xlsx» відкрита в Excel: закрийте її й вивантажте знову"}
+                return self._send(409, json.dumps(body, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+            con.execute("INSERT INTO app_setting(key, value) VALUES('op_book_export', ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        (json.dumps(time.strftime("%Y-%m-%d")),))
+            bump_state_version()
+        got["ok"] = True
+        if self.remote:
+            got.update(remote_any(path))
+        return self._send(200, json.dumps(got, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+
+    def _op_upload_dir(self):
+        d = os.path.join(DATA, "вивантаження", ".прийом книги ОП")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _op_preview(self):
+        """Перегляд змін книги проти бази; файл лежить до «Прийняти» під своїм sha."""
+        import hashlib                                           # noqa: PLC0415
+        import op_book                                           # noqa: PLC0415
+        n = int(self.headers.get("Content-Length", 0) or 0)
+        if n <= 0 or n > MAX_RESTORE:
+            self._drain()
+            return self._send(413, "файл порожній або завеликий".encode("utf-8"))
+        data = self.rfile.read(n)
+        legacy = "legacy=1" in self.path
+        try:
+            model = op_book.read_book(data, legacy=legacy)
+        except op_book.BookError as e:
+            body = {"error": "книга не приймається", "problems": e.problems[:200]}
+            return self._send(422, json.dumps(body, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+        sha = hashlib.sha256(data).hexdigest()
+        with open(os.path.join(self._op_upload_dir(), sha + ".xlsx"), "wb") as f:
+            f.write(data)
+        with STATE_LOCK:
+            plan = op_book.diff(db(), model)
+        body = {"ok": True, "sha": sha, "diff": plan, "places": op_book.legacy_places(model) if legacy else [],
+                "report": model.get("report", [])}
+        return self._send(200, json.dumps(body, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+
+    def _op_apply(self):
+        """Прийняти книгу: копія бази «перед прийомом книги ОП» (чи «перед перенесенням…»), тоді
+        книга ОП у базі стає такою, як у файлі. Усе або нічого."""
+        import op_book                                           # noqa: PLC0415
+        try:
+            n = int(self.headers.get("Content-Length", 0) or 0)
+            req = json.loads(self.rfile.read(n).decode("utf-8") or "{}") if n else {}
+        except ValueError:
+            req = {}
+        sha = re.sub(r"[^0-9a-f]", "", str(req.get("sha") or ""))
+        path = os.path.join(self._op_upload_dir(), sha + ".xlsx")
+        if not sha or not os.path.exists(path):
+            return self._send(400, "оберіть книгу ще раз: перегляд застарів".encode("utf-8"))
+        with open(path, "rb") as f:
+            data = f.read()
+        legacy = bool(req.get("legacy"))
+        try:
+            model = op_book.read_book(data, legacy=legacy)
+            if legacy:
+                model = op_book.normalize_legacy(model, req.get("mapping") or {})
+            with STATE_LOCK:
+                con = db()
+                backup = named_backup(con, "перед перенесенням книги ОП" if legacy else "перед прийомом книги ОП")
+                plan = op_book.apply(con, model)
+                bump_state_version()
+                LAST_WRITE.update(who=self.who, at=time.strftime("%H:%M"))
+        except op_book.BookError as e:
+            body = {"error": "книгу не прийнято", "problems": e.problems[:200]}
+            return self._send(422, json.dumps(body, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+        with contextlib.suppress(OSError):
+            os.remove(path)
+        body = {"ok": True, "diff": plan, "backup": os.path.basename(backup), "report": model.get("report", [])}
+        return self._send(200, json.dumps(body, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+
     def _open_scan(self, reveal=False):
         """Відкрити файл програмою Windows або показати його в теці."""
         full = self._scan_file()
@@ -1350,6 +1588,33 @@ class Handler(BaseHTTPRequestHandler):
                 return self._read_mtz()
             except (OSError, ValueError) as e:
                 return self._send(400, str(e).encode("utf-8"))
+        if route == "/api/folders":
+            return self._set_folders()
+        if route == "/api/form2/submitted":
+            return self._form2_upload(submitted=True)
+        if route == "/api/form2/map-read":
+            return self._form2_upload(submitted=False)
+        if route == "/api/form2/submit":
+            try:
+                n = int(self.headers.get("Content-Length", 0) or 0)
+                req = json.loads(self.rfile.read(n).decode("utf-8") or "{}") if n else {}
+                year = int(req.get("year"))
+            except (ValueError, TypeError):
+                return self._send(400, "рік звіту — число".encode("utf-8"))
+            with STATE_LOCK:
+                rows = form2.snapshot(db(), year)
+                bump_state_version()
+                LAST_WRITE.update(who=self.who, at=time.strftime("%H:%M"))
+            return self._send(200, json.dumps({"ok": True, "rows": rows}).encode("utf-8"), MIME[".json"])
+        if route == "/api/op-fes":
+            return self._op_fes()
+        if route == "/api/op-book/export":
+            self._drain()
+            return self._op_export()
+        if route == "/api/op-book/preview":
+            return self._op_preview()
+        if route == "/api/op-book/apply":
+            return self._op_apply()
         if route == "/api/history-read":
             try:
                 return self._read_history()
@@ -1363,6 +1628,7 @@ class Handler(BaseHTTPRequestHandler):
             import excel_names                                  # noqa: PLC0415
             import history_import                               # noqa: PLC0415
             import mtz_export                                   # noqa: PLC0415
+            import op_request                                   # noqa: PLC0415
             import techact_export                               # noqa: PLC0415
             import valuation_export                             # noqa: PLC0415
             n = int(self.headers.get("Content-Length", 0))
@@ -1386,6 +1652,11 @@ class Handler(BaseHTTPRequestHandler):
                       "form21set": lambda s, f: form21.save_form21_set(db(), s, f),
                       # Книги обліку № 47 і № 14 за рік — паперові томи й електронні, по базі.
                       "journals": lambda s, f: journals.save_journals(db(), s, f),
+                      # Звіт-заявка 2/прод у бланку А2788 і проєкт пояснювальної — у теку звітів.
+                      "form2": lambda s, f: form2.save_package(db(), s, folders()["reports"]),
+                      "form2note": lambda s, f: form2.save_note(db(), s, folders()["reports"]),
+                      # Заявка на посуд, миючі й серветки на 30 днів за нормами наказу №390 — у Word.
+                      "op_request": lambda s, f: op_request.save_request(db(), s, folders()["requests"]),
                       }.get(spec.get("kind"), excel_export.save)
             path = writer(spec, folder)
             # Шапка на кожній сторінці й область друку — іменами, які розуміє Excel цього
@@ -1394,7 +1665,8 @@ class Handler(BaseHTTPRequestHandler):
                 with contextlib.suppress(OSError):
                     excel_names.localize_file(path)
             if self.remote:
-                body = json.dumps(dict({"ok": True, "opened": False}, **remote_export(folder, path)),
+                # Файл міг лягти в теку з налаштувань (пакет 2/прод) — тоді віддаємо його копію.
+                body = json.dumps(dict({"ok": True, "opened": False}, **remote_any(path)),
                                   ensure_ascii=False).encode("utf-8")
                 return self._send(200, body, MIME[".json"])
             opened = open_file(path)
@@ -1460,6 +1732,18 @@ class Handler(BaseHTTPRequestHandler):
             # запис без кінця. Відповідь — словами, слід — у консолі.
             traceback.print_exc()
             self._send(500, f"{type(e).__name__}: {e}".encode("utf-8"))
+
+
+def remote_any(path):
+    """Що віддати браузеру іншого ПК, коли файл ліг у теку з налаштувань (поза «вивантаженням»,
+    звідки його віддає `api/file`): його копію у «вивантаженні»."""
+    base = os.path.join(DATA, "вивантаження")
+    if not os.path.realpath(path).startswith(os.path.realpath(base) + os.sep):
+        os.makedirs(base, exist_ok=True)
+        copy = os.path.join(base, os.path.basename(path))
+        shutil.copy2(path, copy)
+        path = copy
+    return remote_export(base, path)
 
 
 def remote_export(folder, path):

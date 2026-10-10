@@ -66,10 +66,49 @@
   const items = D.items.map((r) => ({
     code: r[0], name: r[1], group: r[2], unit: r[3], price: r[4],
     cat: r[5], serial: r[6], chassis: r[7], year: r[8], nonrev: r[9], own: !!r[10], fes: r[11] || '',
-    note: r[12] || '', old: r[13] || '', archived: r[14] || '',
+    note: r[12] || '', old: r[13] || '', archived: r[14] || '', perRation: r[15] ?? null,
   }));
   const itemBy = new Map(items.map((i) => [i.code, i]));
   const groupName = new Map(D.groups);
+
+  // КНИГИ ОБЛІКУ: ПОЧАТОК
+  /** Дві книги обліку: ТЗ (техзасоби, обладнання, багаторазовий посуд) і ОП (посуд одноразового
+   *  використання, миючі засоби, серветки). Позиція належить книзі своєї групи; «Номенклатура»,
+   *  «Документи» й книги № 47/14 показують книгу `state.book`. */
+  const BOOK_OF_GROUP = new Map((D.groups || []).map((g) => [g[0], g[2] || 'ТЗ']));
+  const bookOfItem = (it) => (it && BOOK_OF_GROUP.get(it.group)) || 'ТЗ';
+  const bookOf = (code) => bookOfItem(itemBy.get(String(code)));
+  /** Чернетки документів — свої в кожної книги: прихід ТЗ і прихід посуду не змішуються. */
+  const slotOf = (kind, book) => (book === 'ОП' ? kind + '@ОП' : kind);
+  // КНИГИ ОБЛІКУ: КІНЕЦЬ
+
+  // 2/ПРОД: ПОЧАТОК
+  /** Вид контрагента за назвою — пропозиція, яку людина підтверджує: від нього залежить
+   *  графа 2/прод приходу (військова частина — гр.14, постачальник — гр.12). */
+  function partyGuess(name) {
+    const s = String(name || '').trim();
+    if (/(^|[\s/])А\d{4}\b/.test(s) || /^в\/ч/i.test(s)) return 'військова частина';
+    if (/^(ТОВ|ФОП|ПП|ПрАТ|АТ)[\s"«]/.test(s)) return 'постачальник';
+    if (/^(БО|БФ|ГО|МБФ)[\s"«]/.test(s)) return 'фонд';
+    return 'інше';
+  }
+  /** Прив'язки кодів до рядків 2/Прод: з бази (D.form2Map) і правки сторінки поверх. */
+  function form2MapNow() {
+    const out = new Map();
+    for (const [code, row, factor, checked, checkedOn, skip] of D.form2Map || []) {
+      out.set(String(code), { code: String(code), row, factor: factor || 1, checked: checked || null,
+        checkedOn: checkedOn || null, skip: skip || null });
+    }
+    for (const [code, e] of Object.entries(store.form2Map || {})) {
+      if (e.row == null && !e.skip) { out.delete(code); continue; }
+      out.set(code, Object.assign({ code }, e));
+    }
+    return [...out.values()];
+  }
+  // 2/ПРОД: КІНЕЦЬ
+  const tzItems = () => items.filter((i) => bookOfItem(i) === 'ТЗ');
+  /** Де документ у ФЕС. Перелік — книги ОП; той самий у документів закупівель. */
+  const FES_STATUSES = ['немає витяга', 'на підписі', 'їде на ФЕС', 'проведено', 'переробка'];
 
   /** Вид обліку позиції: необоротний актив (субрахунки 10/11 — основні засоби
    *  й інші необоротні матеріальні активи) чи запаси (15/18). Вирішує
@@ -711,7 +750,9 @@
     recon: 'звірки', inventories: 'інвентаризації', mtz: 'відомість МТЗ', subs: 'підрозділи', norms: 'штат',
     units: 'одиниці', papers: 'документи служби', mvo: 'посадові особи', cmdrs: 'посадові особи',
     officials: 'посадові особи', locations: 'дислокація', unit: 'реквізити', subst: 'заміни',
-    ownLines: 'форма 21/Прод', lineCodes: 'форма 21/Прод' };
+    ownLines: 'форма 21/Прод', lineCodes: 'форма 21/Прод', docFes: 'статус ФЕС', docMeta: 'поля документів',
+    form2Map: 'прив’язки 2/Прод', form2Own: 'рядки 2/Прод', form2Cells: '2/прод', form2Notes: 'записки 2/прод',
+    parties: 'контрагенти', fesMap: 'звірка з ФЕС', fesPlaces: 'звірка з ФЕС' };
   /** «(Міша, 10:42)» — ім'я не відмінюється, тож стоїть у дужках. */
   const syncWho = (x) => { const t = [x && x.who, x && x.at].filter(Boolean).join(', '); return t ? ` (${t})` : ''; };
 
@@ -935,6 +976,8 @@
 
   const state = {
     view: 'dash',
+    book: 'ТЗ',
+    subBook: 'ТЗ',
     asOf: today(),
     q: '',
     group: '',
@@ -1312,7 +1355,7 @@
     destroyed: renderDestroyed, recon: renderRecon, subst: renderSubst,
     stocktake: renderStocktake, people: renderPeople, sub: renderSubCard, mtz: renderMtz,
     purch: renderPurchases, val: () => renderPapers('valuation'), yats: () => renderPapers('tech_act'),
-    settings: renderSettings,
+    settings: renderSettings, form2: renderForm2,
   };
 
   // Пункти згруповані за тим, навіщо людина сюди заходить: облік ведуть,
@@ -1335,11 +1378,17 @@
   const NAV = [
     { id: 'dash', ico: '▤', label: 'Зведення' },
     { group: 'облік' },
-    { id: 'moves', ico: '⇄', label: 'Документи', badge: () => docCount(docs) },
-    { id: 'nomen', ico: '≡', label: 'Номенклатура', badge: () => items.length },
+    { id: 'moves', book: 'ТЗ', ico: '⇄', label: 'Документи', badge: () => docCount(docs.filter((r) => bookOf(r.code) === 'ТЗ')) },
+    { id: 'nomen', book: 'ТЗ', ico: '≡', label: 'Номенклатура', badge: () => tzItems().length },
     { id: 'subs', ico: '⊞', label: 'Підрозділи', badge: () => subs.filter((s) => s.used).length },
     { id: 'inv', ico: '№', label: 'Інвентарні номери',
       badge: () => inventory.reduce((a, r) => a + r.to - r.from + 1, 0) || '' },
+    { group: 'посуд і миючі' },
+    { id: 'nomen', book: 'ОП', ico: '◌', label: 'Позиції й залишки',
+      badge: () => items.filter((i) => bookOfItem(i) === 'ОП' && !i.archived).length || '' },
+    { id: 'moves', book: 'ОП', ico: '⇆', label: 'Документи',
+      badge: () => docCount(docs.filter((r) => bookOf(r.code) === 'ОП')) || '' },
+    { id: 'j47', book: 'ОП', ico: '▦', label: 'Книги 47 і 14', views: ['j14'] },
     { group: 'контроль' },
     { id: 'destroyed', ico: '⚠', label: 'Знищене майно', badge: () => allDestroyed().filter((x) => x.status !== 'списано').length || '' },
     { id: 'recon', ico: '✓', label: 'Звірки з підрозділами', badge: () => reconDue() || '' },
@@ -1348,6 +1397,8 @@
     { id: 'mtz', ico: '₴', label: 'Відомість МТЗ', badge: () => mtzTodo() || '' },
     { id: 'purch', ico: '⊕', label: 'Закупівлі' },
     { id: 'supply', ico: '∑', label: 'Штат і потреба', views: ['subst'] },
+    { group: 'звіти' },
+    { id: 'form2', ico: '◫', label: '2/Прод', badge: () => form2MapNow().filter((m) => m.row && !m.checked).length || '' },
     { group: 'оцінка' },
     { id: 'val', ico: '◔', label: 'Залишкова вартість', badge: () => papers().filter((p) => p.kind === 'valuation'
       && (p.state === 'чернетка' || p.state === 'підготовлено')).length || '' },
@@ -1356,7 +1407,7 @@
     { group: 'люди' },
     { id: 'people', ico: '☺', label: 'Люди й МВО' },
     { group: 'журнали' },
-    { id: 'j47', ico: '▥', label: 'Журнали № 47 і № 14', views: ['j14'] },
+    { id: 'j47', book: 'ТЗ', ico: '▥', label: 'Журнали № 47 і № 14', views: ['j14'] },
     { sep: true },
   ];
   /** Перемикач між потребою й замінами: один пункт меню на два екрани. */
@@ -1393,7 +1444,8 @@
     const g = (k) => $(`#modal [data-jr="${k}"]`);
     const spec = { kind: 'journals', year: g('year') ? g('year').value : '', paper: !!(g('paper') && g('paper').checked),
       electronic: !!(g('electronic') && g('electronic').checked), pdf: !!(g('pdf') && g('pdf').checked),
-      as_of: state.asOf, unit: unitInfo().legalName.replace(/^Військова частина\s*/i, ''), file: 'Книги обліку' };
+      as_of: state.asOf, unit: unitInfo().legalName.replace(/^Військова частина\s*/i, ''), file: 'Книги обліку',
+      book: state.book };
     if (!spec.paper && !spec.electronic) { toast('Оберіть, що складати.', true); return null; }
     modalClose();
     toast('Складаю книги обліку…');
@@ -1419,7 +1471,8 @@
       ? '<div class="nav__sep"></div>'
       : n.group
         ? `<div class="nav__group">${esc(n.group)}</div>`
-        : `<button class="nav__item${state.view === n.id || (n.views || []).includes(state.view) ? ' is-active' : ''}" data-nav="${n.id}">
+        : `<button class="nav__item${(state.view === n.id || (n.views || []).includes(state.view))
+          && (!n.book || n.book === state.book) ? ' is-active' : ''}" data-nav="${n.id}"${n.book ? ` data-book="${n.book}"` : ''}>
            <span class="nav__ico">${n.ico}</span>
            <span class="nav__label">${esc(n.label)}</span>
            <span class="nav__badge">${n.badge ? esc(n.badge()) : ''}</span>
@@ -1437,6 +1490,7 @@
     item: () => 'Картка позиції',
     doc: () => '',
     moves: () => 'Первинні документи за весь період',
+    form2: () => `Бланк А2788 за ${f2Year()} рік: рух з документів обох книг, зданий звіт і записки`,
     recon: () => (state.reconId
       ? 'Звірка за Додатком 1/9'
       : 'Щомісячні відомості звірки за Додатком 1/9'),
@@ -1496,7 +1550,7 @@
    *  місці; перехід на інший екран починається згори. */
   let lastScreen = '';
   const scrollMemo = new Map();
-  const screenKey = () => state.view + '|' + (state.view === 'item' ? state.itemCode
+  const screenKey = () => state.view + '|' + state.book + '|' + (state.view === 'item' ? state.itemCode
     : state.view === 'doc' ? state.docKey : state.view === 'recon' ? (state.reconId || '')
       : state.view === 'stocktake' ? `${state.stId || ''}|${state.stSub || ''}`
         : state.view === 'people' ? `${state.peopleTab || ''}` : state.view === 'sub' ? (state.subName || '')
@@ -1597,12 +1651,12 @@
   function renderDash() {
     const b = balances();
     const total = [...b.byCode.values()].reduce((s, v) => s + v, 0);
-    const positions = items.filter((i) => balCode(i.code) !== 0).length;
+    const positions = tzItems().filter((i) => balCode(i.code) !== 0).length;
     const activeSubs = [...b.bySub.entries()].filter(([, v]) => v !== 0).length;
     const destroyed = destroyedTotal();
     const cls = { na: { n: 0, q: 0 }, stock: { n: 0, q: 0 } };
     let unsure = 0;
-    for (const i of items) {
+    for (const i of tzItems()) {
       const q = balCode(i.code);
       if (q <= 1e-9) continue;
       cls[assetOf(i)].n++; cls[assetOf(i)].q += q;
@@ -1610,7 +1664,7 @@
     }
 
     const byGroup = new Map();
-    for (const i of items) {
+    for (const i of tzItems()) {
       const cur = byGroup.get(i.group) || { n: 0, q: 0 };
       cur.n++; cur.q += balCode(i.code);
       byGroup.set(i.group, cur);
@@ -1768,7 +1822,8 @@
     return `<div class="tbl__row" data-open="${key}" title="${esc(name)}">
       <div class="c-date">${fmtDate(r.d)}</div>
       <div class="c-tag"><span class="tag ${cls}">${lbl}</span></div>
-      <div class="c-status">${statusTag(docStatus(r))}</div>
+      <div class="c-status">${statusTag(docStatus(r))}${(fesOf(r.id) || {}).status
+        ? `<small class="fes-mini" title="Статус у ФЕС">${esc(fesOf(r.id).status)}</small>` : ''}</div>
       <div class="c-code" title="${esc(r.no)}">${esc(r.no)}${scanMark(r)}</div>
       ${compact ? '' : `<div class="c-name"><b class="lnk" data-code="${esc(r.code)}" title="Відкрити картку позиції">${esc(name)}</b><small>${r.code}${unit ? ' · ' + esc(unit) : ''}</small></div>`}
       <div class="c-txt">${esc(route)}${compact && unit ? `<small>${esc(unit)}</small>` : ''}</div>
@@ -1809,7 +1864,9 @@
   function filteredItems(opts = {}) {
     const words = qWords(state.q);
     const inv = invQuery(state.q);
+    const book = opts.book || state.book;
     return items.filter((i) => {
+      if (bookOfItem(i) !== book) return false;
       if (state.group && i.group !== state.group) return false;
       if (state.assetF === 'na' && !i.nonrev) return false;
       if (state.assetF === 'stock' && i.nonrev) return false;
@@ -1831,30 +1888,31 @@
   }
 
   function filterBar(count, extra = '') {
-    const groups = D.groups.filter(([g]) => items.some((i) => i.group === g));
+    const tz = state.book === 'ТЗ';
+    const groups = D.groups.filter(([g, , book]) => (book || 'ТЗ') === state.book && items.some((i) => i.group === g));
     return `<div class="panel">
       <label class="chip${state.group ? ' is-on' : ''}">
         <span class="chip__label">група</span>
-        <select id="f-group"><option value="">Усі 21.xx</option>
-          ${groups.map(([g, l]) => `<option value="${g}"${state.group === g ? ' selected' : ''}>${g} · ${esc(l)}</option>`).join('')}
+        <select id="f-group"><option value="">${tz ? 'Усі 21.xx' : 'Усі групи'}</option>
+          ${groups.map(([g, l]) => `<option value="${g}"${state.group === g ? ' selected' : ''}>${tz ? g + ' · ' : ''}${esc(l)}</option>`).join('')}
         </select></label>
-      <label class="chip${state.assetF ? ' is-on' : ''}"
+      ${tz ? `<label class="chip${state.assetF ? ' is-on' : ''}"
         title="Вид обліку за ФЕС">
         <span class="chip__label">облік</span>
         <select id="f-asset"><option value="">усе майно</option>
           <option value="na"${state.assetF === 'na' ? ' selected' : ''}>необоротні активи</option>
           <option value="stock"${state.assetF === 'stock' ? ' selected' : ''}>запаси</option>
           <option value="unsure"${state.assetF === 'unsure' ? ' selected' : ''}>не підтверджено ФЕС</option>
-        </select></label>
+        </select></label>` : ''}
       <label class="chip${state.sub ? ' is-on' : ''}">
         <span class="chip__label">підрозділ</span>
         <select id="f-sub"><option value="">Уся бригада</option>
           ${subs.filter((s) => s.used).map((s) => `<option value="${esc(s.name)}"${state.sub === s.name ? ' selected' : ''}>${esc(s.name)}</option>`).join('')}
         </select></label>
-      <button class="chip${state.onlyShort ? ' is-on' : ''}" data-act="short">
+      ${tz ? `<button class="chip${state.onlyShort ? ' is-on' : ''}" data-act="short">
         <span class="chip__label">стан</span>
         <span class="chip__value">${state.onlyShort ? 'Некомплект > 0' : 'Усі позиції'}</span>
-      </button>
+      </button>` : ''}
       ${extra}
       <div class="panel__spacer"></div>
       <div class="panel__count">${count}</div>
@@ -1867,8 +1925,9 @@
     const groups = [...new Set(list.map((i) => i.group))].sort();
     // Колонки, які нема чим заповнити, не показуємо: сотні рядків прочерків
     // з'їдали 250px ширини й виштовхували «некомплект» за екран.
-    const showNorm = hasNorms();
-    const showDestr = destroyedTotal() > 0;
+    const tz = state.book === 'ТЗ';
+    const showNorm = tz && hasNorms();
+    const showDestr = tz && destroyedTotal() > 0;
     // 254px фіксованих колонок + 300px мінімум на найменування, далі по колонках.
     const width = 554 + (showNorm ? 211 : 0) + (showDestr ? 158 : 0);
     let rows = '';
@@ -1912,14 +1971,23 @@
       }
     }
     const form = itemForm();
-    const empty = !list.length ? emptyBlock('⌕', 'Нічого не знайдено',
-      'Змініть пошуковий запит або скиньте фільтри.',
-      '<button class="btn btn--primary" data-act="reset">Скинути фільтри</button>') : '';
+    // У книзі ОП до першої позиції чи перенесення старої книги позицій немає зовсім — фільтри тут ні до чого.
+    const bookEmpty = !tz && !items.some((i) => bookOfItem(i) === 'ОП');
+    const empty = bookEmpty ? emptyBlock('◌', 'Позицій посуду й миючих ще немає',
+      'Заведіть позицію або перенесіть стару книгу «Облік ОП».',
+      '<button class="btn btn--primary" data-act="item-new">+ Нова позиція</button>'
+      + (native ? '<button class="btn" data-act="op-legacy">Перенести стару книгу…</button>' : ''))
+      : !list.length ? emptyBlock('⌕', 'Нічого не знайдено',
+        'Змініть пошуковий запит або скиньте фільтри.',
+        '<button class="btn btn--primary" data-act="reset">Скинути фільтри</button>') : '';
 
     return {
       fill: true,
-      head: head(`облік / ${state.sub ? state.sub : 'уся бригада'}`, 'Номенклатура за розділами 21/Прод',
-        searchBox() + '<button class="btn" data-act="item-new">+ Нова позиція</button>' + actions),
+      head: head(`${tz ? 'облік' : 'посуд і миючі'} / ${state.sub ? state.sub : 'уся бригада'}`,
+        tz ? 'Номенклатура за розділами 21/Прод' : 'Посуд, миючі засоби й серветки',
+        searchBox() + '<button class="btn" data-act="item-new">+ Нова позиція</button>'
+        + (tz ? '' : '<button class="btn" data-act="op-request">Заявка на 30 днів…</button>'
+          + (native ? '<button class="btn" data-act="op-fes">Звірка з ФЕС…</button>' : '')) + actions),
       body: form + filterBar(`${cnt(list.length, 'позиція', 'позиції', 'позицій')}
         · ${cnt(groups.length, 'група', 'групи', 'груп')}`) + (empty || `
         <div class="card card--scroll card--fill"><div class="tbl" style="--tbl-min:${width}px">
@@ -1955,7 +2023,7 @@
     const data = subs.filter((sb) => sb.used || sb.depth <= 1 || made(sb)).map((sb) => ({ s: sb,
       own: b.bySub.get(sb.name) || 0,
       roll: [...b.bySub.entries()].reduce((acc, [n, v]) => (inSubtree(sb.name, n) ? acc + v : acc), 0),
-      kinds: items.filter((i) => balOf(i.code, sb.name) !== 0).length }));
+      kinds: tzItems().filter((i) => balOf(i.code, sb.name) !== 0).length }));
     const spec = {
       id: 'subs', rows: data, placeholder: 'Пошук: підрозділ',
       search: (x) => [x.s.name, x.s.type || '', x.s.note || ''],
@@ -2350,7 +2418,7 @@
     const lines = [];
     let kept = 0;
     const gone = destroyedUnitsAt(from, date);
-    for (const it of items) {
+    for (const it of tzItems()) {
       const units = unitsAt(it.code, from, date);
       for (const u of units) {
         if (gone.has(String(u.id))) { kept += 1; continue; }
@@ -3176,7 +3244,7 @@
     const scope = state.sub || rootName();
     // Для норм потрібні й позиції, яких у підрозділі ще немає: «норма 2, наявно 0»
     // — найтиповіший випадок, і ховати такий рядок не можна.
-    const list = filteredItems({ keepEmpty: true });
+    const list = filteredItems({ keepEmpty: true, book: 'ТЗ' });
     const showDestr = destroyedTotal() > 0;
     const rows = list.map((i) => {
       const own = normOwn(scope, i.code);
@@ -3260,7 +3328,17 @@
       for (const l of arr) { value += l.q * l.price; if (Math.abs(l.q) > 1e-9) prices.add(l.price); }
     }
 
-    const spec = [
+    const op = bookOfItem(i) === 'ОП';
+    const spec = op ? [
+      ['Код номенклатури', i.code, true],
+      ['Група', groupName.get(i.group) || i.group],
+      ['Одиниця виміру', i.unit],
+      ['Ціна', fmtMoney(i.price) + ' грн', true],
+      ['Дободач', i.perRation != null && i.perRation !== '' ? fmtNum(i.perRation) : '—', true],
+    ].concat(i.note ? [['Примітка', i.note]] : [])
+      .concat(i.archived ? [['В архіві', `з ${fmtDate(i.archived)}: у нових приходах не пропонується`]] : [])
+      .map(([k, v, mono]) => `<div><div class="spec__k">${esc(k)}</div>
+        <div class="spec__v${mono ? ' spec__v--mono' : ''}">${esc(v)}</div></div>`).join('') : [
       ['Код номенклатури', i.code, true],
       ['Група', `${i.group} · ${groupName.get(i.group) || ''}`],
       ['Одиниця виміру', i.unit],
@@ -3283,7 +3361,7 @@
         <div class="spec__v${mono ? ' spec__v--mono' : ''}">${esc(v)}</div></div>`).join('');
 
     return {
-      head: head(`номенклатура / ${i.group}`, i.name, `
+      head: head(op ? `посуд і миючі / ${groupName.get(i.group) || i.group}` : `номенклатура / ${i.group}`, i.name, `
         <button class="btn" data-act="back">← Назад</button>
         <button class="btn" data-act="item-edit" title="${i.own ? 'Позицію заведено в програмі'
           : 'Код позиції не змінюється'}">Виправити позицію</button>${i.own ? `
@@ -3311,8 +3389,9 @@
         <div class="card__head"><div class="card__title">Реквізити</div></div>
         <div style="padding:18px"><div class="spec">${spec}</div></div>
       </div>
+      ${form2ItemCard(i)}
       ${filesCard('item|' + i.code, 'Фото й документи позиції', 'фото зразка, паспорт, інструкція')}
-      ${unitsCard(i)}
+      ${op ? '' : unitsCard(i)}
       ${docScansCard(i.code)}
 
       <div class="grid-2">
@@ -3777,6 +3856,39 @@
   /** Картка одного документа: шапка, усі його рядки, скан і дії з ним. Сюди
    *  ведуть клацання по рядках руху — з картки засобу, зі стрічки операцій, із
    *  журналів 47 і 14; сюди ж відкривається щойно проведений документ. */
+  const fesOf = (docId) => (docId ? (store.docFes || {})[String(docId)] || null : null);
+  /** Правка статусу ФЕС документа; дата — коли змінився сам статус. */
+  function fesSet(docId, patch) {
+    store.docFes = store.docFes || {};
+    const key = String(docId);
+    const was = store.docFes[key] || { status: '', date: '', register: '', ref: '', note: '' };
+    const cur = Object.assign({}, was, patch);
+    if ('status' in patch && patch.status !== was.status) cur.date = patch.status ? today() : '';
+    if (!cur.status) delete store.docFes[key];
+    else store.docFes[key] = cur;
+    logChange('статус ФЕС', 'fes|' + key, cur.status || 'статус знято');
+    save();
+  }
+  /** Картка «ФЕС» документа: статус, реєстр, витяг. У ще не записаного документа id немає. */
+  function fesCard(r0) {
+    if (!r0.id) {
+      return `<div class="card" style="margin-bottom:12px"><div class="card__head"><div class="card__title">ФЕС</div>
+        <div class="panel__spacer"></div><span class="panel__count">статус — після запису документа</span></div></div>`;
+    }
+    const f = fesOf(r0.id) || {};
+    return `<div class="card" style="margin-bottom:12px"><div class="card__head"><div class="card__title">ФЕС</div>
+        <div class="panel__spacer"></div>${f.date ? `<span class="panel__count">статус з ${fmtDate(f.date)}</span>` : ''}</div>
+      <div class="panel fes-panel">
+        <label class="chip${f.status ? ' is-on' : ''}"><span class="chip__label">статус</span>
+          <select data-fes="status" data-doc="${r0.id}"><option value="">—</option>${FES_STATUSES.map((st) =>
+            `<option${f.status === st ? ' selected' : ''}>${esc(st)}</option>`).join('')}</select></label>
+        <label class="chip"><span class="chip__label">реєстр</span>
+          <input data-fes="register" data-doc="${r0.id}" value="${esc(f.register || '')}" placeholder="номер і дата реєстру"></label>
+        <label class="chip"><span class="chip__label">витяг</span>
+          <input data-fes="ref" data-doc="${r0.id}" value="${esc(f.ref || '')}" placeholder="номер витягу чи проводки"></label>
+      </div></div>`;
+  }
+
   function renderDoc() {
     const rows = docs.filter((r) => keyOfRow(r) === state.docKey);
     if (!rows.length) { state.view = 'moves'; renderNav(); return renderMoves(); }
@@ -3883,6 +3995,7 @@
       <div class="card" style="margin-bottom:12px">
         <div class="card__head"><div class="card__title">Реквізити</div></div>
         <div style="padding:18px"><div class="spec">${spec}</div></div></div>
+      ${fesCard(r0)}
       ${filesCard(fileKey, 'Скани й файли документа', 'скан, фото, лист, електронний документ')}
       <div class="card"><div class="card__head"><div class="card__title">Найменування в документі</div></div>
         <div class="card--scroll"><div class="tbl" style="--tbl-min:900px">
@@ -3953,6 +4066,11 @@
   function movesFound() {
     const words = qWords(state.q);
     return docs.filter((r) => {
+      if (bookOf(r.code) !== state.book) return false;
+      if (state.movesFes) {
+        const st = (fesOf(r.id) || {}).status || '';
+        if (state.movesFes === '-' ? st : st !== state.movesFes) return false;
+      }
       if (state.onlyMine && !r.mine) return false;
       if (state.noScan && scansOf(r).length) return false;
       if (state.movesKindF && r.kind !== state.movesKindF) return false;
@@ -3984,15 +4102,25 @@
   function renderMoves() {
     const found = movesSorted();
     const filtered = state.onlyMine || state.noScan || state.movesKindF || state.movesFrom || state.movesTo
-      || state.sub || state.q.trim();
+      || state.sub || state.q.trim() || state.movesFes;
+    const bookDocs = docs.filter((r) => bookOf(r.code) === state.book);
     // Показуємо порціями: сотні рядків одразу гальмують, а обрізати мовчки
     // не можна — старіші документи ставали недосяжними інакше як пошуком.
     const limit = state.movesLimit || 200;
     const shown = found.slice(0, limit);
     const rest = found.length - shown.length;
+    const op = state.book === 'ОП';
+    // Порожня книга — не те саме, що фільтри, які нічого не лишили.
+    const empty = found.length ? '' : bookDocs.length
+      ? emptyBlock('⌕', 'Нічого не знайдено', 'Змініть пошуковий запит або скиньте фільтри.',
+        '<button class="btn btn--primary" data-act="reset">Скинути фільтри</button>')
+      : emptyBlock('⇆', op ? 'Документів посуду й миючих ще немає' : 'Документів ще немає',
+        op ? 'Внесіть прихід або перенесіть стару книгу «Облік ОП».' : 'Внесіть перший прихід.',
+        (formOpen() ? '' : '<button class="btn btn--primary" data-act="doc-new">+ Новий документ</button>')
+        + (op && native ? '<button class="btn" data-act="op-legacy">Перенести стару книгу…</button>' : ''));
 
     return {
-      head: head('облік / первинні документи', 'Документи',
+      head: head(op ? 'посуд і миючі / документи' : 'облік / первинні документи', 'Документи',
         // Своя кнопка нового документа, а не спільна: вона ховається, поки
         // форма відкрита, — інакше в шапці стояли дві однакові.
         searchBox('Пошук: номер, код, найменування, підрозділ, зав. №, примітка') + actionsExcel
@@ -4016,12 +4144,16 @@
           data-act="only-mine">${state.onlyMine ? '✓ ' : ''}внесені в програмі</button>
         <button type="button" class="chip chip--btn${state.noScan ? ' is-on' : ''}" data-act="no-scan"
           title="Документи без підшитого скану">${state.noScan ? '✓ ' : ''}без скану</button>
+        <label class="chip${state.movesFes ? ' is-on' : ''}"><span class="chip__label">ФЕС</span>
+          <select id="f-fes"><option value="">усі</option>${FES_STATUSES.map((st) =>
+            `<option${state.movesFes === st ? ' selected' : ''}>${esc(st)}</option>`).join('')}
+            <option value="-"${state.movesFes === '-' ? ' selected' : ''}>без статусу</option></select></label>
         ${filtered ? '<button type="button" class="chip chip--btn" data-act="reset">Скинути фільтри</button>' : ''}
         <div class="panel__spacer"></div>
-        <div class="panel__count">${filtered ? `${docCount(found)} із ${docCount(docs)}`
-          : cnt(docCount(docs), 'документ', 'документи', 'документів')}</div>
+        <div class="panel__count">${filtered ? `${docCount(found)} із ${docCount(bookDocs)}`
+          : cnt(docCount(bookDocs), 'документ', 'документи', 'документів')}</div>
       </div>
-      <div class="card card--scroll card--fill"><div class="tbl" style="--tbl-min:980px;--acts:230px">
+      ${empty || `<div class="card card--scroll card--fill"><div class="tbl" style="--tbl-min:980px;--acts:230px">
         <div class="tbl__head">
           ${sortHead('moves', 'date', 'дата', 'c-date')}${sortHead('moves', 'kind', 'вид', 'c-tag')}${sortHead('moves', 'status', 'стан', 'c-status')}
           ${sortHead('moves', 'no', '№', 'c-code')}${sortHead('moves', 'name', 'найменування', 'c-name')}
@@ -4031,7 +4163,7 @@
         <div class="tbl__more">
           <button type="button" class="btn" data-act="more">Показати ще ${Math.min(rest, 200)}</button>
           <span class="panel__count">показано ${shown.length} із ${found.length} рядків</span>
-        </div>` : ''}</div></div>`,
+        </div>` : ''}</div></div>`}`,
       fill: true,
     };
   }
@@ -4127,21 +4259,23 @@
   function draft() {
     const k = state.moveKind;
     const stash = state.drafts || (state.drafts = {});
-    // Перемкнули вид документа — поточна чернетка відкладається, а не пропадає.
-    if (state.draft && state.draft.kind !== k) {
-      if (hasContent(state.draft)) stash[state.draft.kind] = state.draft;
+    // Перемкнули вид документа чи книгу — поточна чернетка відкладається, а не пропадає.
+    if (state.draft && (state.draft.kind !== k || (state.draft.book || 'ТЗ') !== state.book)) {
+      if (hasContent(state.draft)) stash[slotOf(state.draft.kind, state.draft.book || 'ТЗ')] = state.draft;
       state.draft = null;
     }
     if (!state.draft) {
-      state.draft = stash[k] || {
+      const slot = slotOf(k, state.book);
+      state.draft = stash[slot] || {
         kind: k,
+        book: state.book,
         head: {
           no: '', date: today(), from: k === 'in' ? '' : 'склад',
           to: '', basis: '', report: '', reportDate: '', act: '', note: '',
         },
         lines: [{ code: '', qty: '', price: '', note: '', lot: '' }],
       };
-      delete stash[k];
+      delete stash[slot];
     }
     return state.draft;
   }
@@ -4305,7 +4439,9 @@
     }
     // Позицію в архіві нових приходів не пропонуємо; видати чи списати те, що
     // ще числиться, можна й з архівної.
-    const pool = k === 'in' ? items.filter((it) => !it.archived) : items.filter((it) => (st.get(it.code) || 0) > 1e-9);
+    const book = d.book || state.book;
+    const pool = (k === 'in' ? items.filter((it) => !it.archived) : items.filter((it) => (st.get(it.code) || 0) > 1e-9))
+      .filter((it) => bookOfItem(it) === book);
     // Прихід: та сама позиція буває в акті двічі за різними цінами, тож там
     // позначаємо лише «уже є», а рядок стає окремим.
     const lineOf = new Map();
@@ -4327,9 +4463,9 @@
       }
       // Кожна одиниця із заводським номером — окремий пункт (у накладній, акті й
       // рапорті), а в накладній і акті ще й кожна ціна партії.
-      const units = (byUnit() && where ? unitsAt(it.code, where, date) : [])
+      const units = (byUnit() && where && book !== 'ОП' ? unitsAt(it.code, where, date) : [])
         .filter((u) => !gone.has(String(u.id)));
-      const lots = byLot() && where ? lotChoices(it.code, where, date) : [];
+      const lots = byLot() && where && book !== 'ОП' ? lotChoices(it.code, where, date) : [];
       for (const u of units) {
         const lot = byLot() ? { d: u.d, price: u.price } : null;
         list.push({ it, qty: 1, unit: u, lot,
@@ -4361,8 +4497,9 @@
     const base = `У «${esc(where)}» на ${fmtDate(date)} такого немає`;
     const toks = query.toLowerCase().split(/\s+/).filter(Boolean);
     if (!toks.length) return base + '. Перевірте відправника й дату документа.';
-    const hit = items.filter((it) => toks.every((t) => (it.code + ' ' + it.name).toLowerCase().includes(t)))
-      .slice(0, 3);
+    const book = (state.draft && state.draft.book) || state.book;
+    const hit = items.filter((it) => bookOfItem(it) === book
+      && toks.every((t) => (it.code + ' ' + it.name).toLowerCase().includes(t))).slice(0, 3);
     if (!hit.length) return base + ', і в довіднику теж. Перевірте запит.';
     const parts = hit.map((it) => {
       const at = holdersAt(it.code, date, where).slice(0, 3);
@@ -4693,7 +4830,8 @@
              що вноситься, і ніколи не фільтрував стрічку під ним. -->
         <!-- Чернетка з запису «Знищене майно» — акт, і тільки акт: перемикач виду тут
              підмінив би готовий акт порожнім бланком. -->
-        <div class="seg"${d.src && d.src.kind === 'dz' ? ' title="Вид документа визначено записом «Знищене майно»"' : ''}>${MOVE_KINDS.map(([kk, l]) =>
+        <div class="seg"${d.src && d.src.kind === 'dz' ? ' title="Вид документа визначено записом «Знищене майно»"' : ''}>${MOVE_KINDS
+      .filter(([kk]) => kk !== 'dz' || (d.book || 'ТЗ') === 'ТЗ').map(([kk, l]) =>
       `<button type="button" data-kind="${kk}"${state.moveKind === kk ? ' class="is-on"' : ''}${
         d.src && d.src.kind === 'dz' && kk !== k ? ' disabled' : ''}>${l}</button>`).join('')}</div>
         <button type="button" class="chip chip--btn${histOn() ? ' is-on' : ''}" data-act="hist"
@@ -7939,9 +8077,12 @@
       'Відкрити картку позиції');
     const draftsOpen = Object.entries(state.drafts || {}).filter(([, v]) => hasContent(v));
     if (state.draft && !state.editing && hasContent(state.draft)
-      && !draftsOpen.some(([k]) => k === state.draft.kind)) draftsOpen.push([state.draft.kind, state.draft]);
+      && !draftsOpen.some(([k]) => k === slotOf(state.draft.kind, state.draft.book || 'ТЗ'))) {
+      draftsOpen.push([slotOf(state.draft.kind, state.draft.book || 'ТЗ'), state.draft]);
+    }
     add('warn', draftsOpen.length, `${plural(draftsOpen.length, 'незавершений документ', 'незавершені документи',
-      'незавершених документів')} у формі`, () => go('moves', { moveKind: draftsOpen[0][0], formOpen: true }),
+      'незавершених документів')} у формі`, () => go('moves', { moveKind: draftsOpen[0][1].kind,
+      book: draftsOpen[0][1].book || 'ТЗ', formOpen: true }),
       draftsOpen.map(([, v]) => `${KIND_NAME[v.kind] || 'рапорт'}${v.head.no ? ' ' + numNo(v.head.no) : ''}`).join(', '),
       'Дописати документ');
     const due = reconSubs(t).filter((x) => x.pos && reconStatus(x.sub).kind !== 'ok');
@@ -8033,10 +8174,23 @@
     const short = staffRows(t).filter((g) => g.staffed && g.short > 0);
     add('info', short.length, `${plural(short.length, 'табельна позиція', 'табельні позиції', 'табельних позицій')} із некомплектом`, () => go('supply'),
       `разом ${fmtNum(short.reduce((a, g) => a + g.short, 0))} од.`, 'Відкрити штат');
-    const unsure = items.filter((i) => !assetSure(i) && balCode(i.code) > 1e-9);
+    const unsure = tzItems().filter((i) => !assetSure(i) && balCode(i.code) > 1e-9);
     add('info', unsure.length, `${plural(unsure.length, 'позиція', 'позиції', 'позицій')} з непідтвердженим видом обліку`,
       () => go('nomen', { assetF: 'unsure', group: '', sub: '', q: '', onlyShort: false }),
       'уточніть у ФЕС, необоротний актив це чи запаси', 'Показати перелік');
+    if (native && !me.remote && items.some((i) => bookOfItem(i) === 'ОП')) {
+      // Книга «Облік ОП» — запасний шлях: коли програма недоступна, ведуть останнє вивантаження.
+      const last = (D.meta || {}).opBookExport || '';
+      const days = last ? daysBetween(last, t) : null;
+      add('info', days == null || days >= 7 ? 1 : 0,
+        days == null ? 'книгу «Облік ОП» ще не вивантажували'
+          : `книгу «Облік ОП» не вивантажували ${cnt(days, 'день', 'дні', 'днів')}`,
+        () => go('j47', { book: 'ОП' }), 'запасний шлях обліку посуду й миючих', 'Вивантажити');
+    }
+    const late = Object.values(store.docFes || {}).filter((f) => ['на підписі', 'їде на ФЕС'].includes(f.status)
+      && f.date && daysBetween(f.date, t) > 14);
+    add('info', late.length, `${plural(late.length, 'документ', 'документи', 'документів')} понад 14 днів «на підписі» чи «їде на ФЕС»`,
+      () => go('moves', { movesFes: late[0] ? late[0].status : '' }), '', 'Показати');
     if (native && !me.remote) {
       // Автоматичні копії лежать на тому самому диску, що й база: втрата теки
       // чи диска забирає їх разом з обліком. Копію поза комп’ютером людина
@@ -8091,6 +8245,7 @@
       const i = k.indexOf('|');
       const s = k.slice(0, i), code = k.slice(i + 1);
       if (!inSubtree(sub, s)) continue;
+      if (bookOf(code) !== (state.subBook || 'ТЗ')) continue;
       let q = 0, value = 0;
       for (const l of arr) { q += l.q; value += l.q * l.price; }
       if (Math.abs(q) <= 1e-9) continue;
@@ -8211,10 +8366,13 @@
           </div></div></div>` : ''}
         ${rehold}
         <div class="card" style="margin-bottom:12px"><div class="card__head"><div class="card__title">Майно на ${fmtDate(date)}</div>
+            <div class="panel__spacer"></div>
+            <div class="seg">${[['ТЗ', 'Техзасоби'], ['ОП', 'Посуд і миючі']].map(([v, l]) =>
+              `<button type="button" data-act="sub-book" data-v="${v}"${(state.subBook || 'ТЗ') === v ? ' class="is-on"' : ''}>${l}</button>`).join('')}</div>
             </div>
           <div class="panel sub-filter">
-            <div class="seg" title="Вид обліку за ФЕС">${[['', 'усе майно'], ['na', 'необоротні активи'], ['stock', 'запаси']]
-              .map(([v, l]) => `<button type="button" data-act="sub-asset" data-v="${v}"${state.subAsset === v ? ' class="is-on"' : ''}>${l}</button>`).join('')}</div>
+            ${(state.subBook || 'ТЗ') === 'ТЗ' ? `<div class="seg" title="Вид обліку за ФЕС">${[['', 'усе майно'], ['na', 'необоротні активи'], ['stock', 'запаси']]
+              .map(([v, l]) => `<button type="button" data-act="sub-asset" data-v="${v}"${state.subAsset === v ? ' class="is-on"' : ''}>${l}</button>`).join('')}</div>` : ''}
             ${hasKids ? `<label class="chip${state.subHolder ? ' is-on' : ''}"><span class="chip__label">підрозділ</span>
               <select id="f-holder"><option value="">${esc(sub)} і всі підлеглі</option>${holders
                 .filter((h) => h.name !== sub && [...all.holders].some((n) => inSubtree(h.name, n)))
@@ -8521,17 +8679,19 @@
     lines.forEach((ln) => { ln.qty = String(ln.qty); });
     stashDraft();
     state.drafts = state.drafts || {};
-    if (state.drafts[kind] && hasContent(state.drafts[kind])
+    const book = bookOf(r0.code);
+    if (state.drafts[slotOf(kind, book)] && hasContent(state.drafts[slotOf(kind, book)])
       && !confirm(`Замінити незавершену чернетку «${KIND_NAME[kind]}»?\n\nНаписане в ній буде втрачено.`)) return;
     const head = mode === 'return'
       ? { type: r0.t || 'Накладна', no: '', date: today(), from: r0.to, to: r0.from,
           basis: `повернення за документом ${numNo(r0.no)} від ${fmtDate(r0.d)}`, report: '', reportDate: '', act: '', note: '' }
       : { type: r0.t || '', no: '', date: today(), from: r0.from, to: r0.to || '', basis: basisOf(r0.note),
           report: '', reportDate: '', act: '', note: '' };
-    delete state.drafts[kind];
+    delete state.drafts[slotOf(kind, book)];
     state.editing = null;
     state.moveKind = kind;
-    state.draft = { kind, head, lines: lines.concat([emptyLine()]) };
+    state.book = book;
+    state.draft = { kind, book, head, lines: lines.concat([emptyLine()]) };
     state.flash = mode === 'return'
       ? `Зворотна накладна за документом ${numNo(r0.no)}: ${head.from} → ${head.to}, `
         + `${cnt(lines.length, 'найменування', 'найменування', 'найменувань')}. Перевірте кількості й впишіть номер.`
@@ -8548,7 +8708,7 @@
     const date = dr.head.date || today();
     if (!from) { toast('Оберіть відправника.', true); return; }
     const have = [];
-    for (const it of items) {
+    for (const it of items.filter((x) => bookOfItem(x) === (dr.book || 'ТЗ'))) {
       // Одиниці із заводськими номерами — своїми рядками, решта — кількістю.
       for (const u of (byLot() ? unitsAt(it.code, from, date) : [])) {
         have.push({ code: it.code, qty: '1', price: String(u.price), note: '', lot: u.d, unit: String(u.id) });
@@ -10630,7 +10790,7 @@
       el.querySelectorAll('[data-vp-tab]').forEach((b) => b.classList.toggle('is-on', b.dataset.vpTab === st.tab));
       let html = '';
       if (st.tab === 'stock' && !st.code) {
-        const list = items.filter((it) => !words().length || hitAll(words(), it.code, it.name)).slice(0, 60);
+        const list = tzItems().filter((it) => !words().length || hitAll(words(), it.code, it.name)).slice(0, 60);
         html = list.map((it) => row(`<div class="c-code">${esc(it.code)}</div><div class="c-name"><b>${esc(cleanName(it.name))}</b></div>
           <div class="c-unit">${esc(it.unit || '')}</div><div class="c-num" title="Числиться на ${fmtDate(date)}">${fmtNum(stockOn(it.code), '0')}</div>`,
         `data-vp-item="${esc(it.code)}"`)).join('') || row('<div class="c-txt">Позицій за цим пошуком немає.</div>');
@@ -11814,7 +11974,7 @@
         meta: `наявно ${fmtNum(g.fact)}${g.staffed ? ` · штат ${fmtNum(g.qty)}` : ' · без штату'}${
           g.fact > g.qty ? ` · понад штат ${fmtNum(g.fact - g.qty)}` : ''}` }));
     const inForm = new Set(reportLines.filter((l) => l.form === form).flatMap((l) => l.codes));
-    const loose = items.filter((it) => !inForm.has(it.code))
+    const loose = tzItems().filter((it) => !inForm.has(it.code))
       .map((it) => ({ it, q: balCode(it.code) }))
       .sort((a, b) => b.q - a.q || a.it.code.localeCompare(b.it.code, 'uk', { numeric: true }))
       .map(({ it, q }) => ({ value: '#' + it.code, label: `${cleanName(it.name)} · код ${it.code}`, search: it.name,
@@ -12308,7 +12468,7 @@
   function j47Options() {
     const n = new Map();
     for (const r of docs) n.set(r.code, (n.get(r.code) || 0) + 1);
-    return items.filter((i) => n.has(i.code)).map((i) => ({
+    return items.filter((i) => n.has(i.code) && bookOfItem(i) === state.book).map((i) => ({
       value: i.code, label: `${i.code} · ${i.name}`, search: [i.serial, i.chassis, serialsOf.get(i.code)].filter(Boolean).join(' '),
       meta: `${cnt(n.get(i.code), 'запис', 'записи', 'записів')} · залишок ${fmtNum(balCode(i.code), '0')} ${i.unit || ''}`,
       current: i.code === state.j47code,
@@ -12317,7 +12477,10 @@
 
   function j14Options() {
     const n = new Map();
-    for (const r of docs) for (const x of [r.from, r.to]) if (subBy.has(x)) n.set(x, (n.get(x) || 0) + 1);
+    for (const r of docs) {
+      if (bookOf(r.code) !== state.book) continue;
+      for (const x of [r.from, r.to]) if (subBy.has(x)) n.set(x, (n.get(x) || 0) + 1);
+    }
     return subs.filter((sb) => n.has(sb.name)).map((sb) => ({
       value: sb.name, label: sb.name, meta: `${cnt(n.get(sb.name), 'запис', 'записи', 'записів')} · ${sb.type}`,
       current: sb.name === state.j14sub,
@@ -12377,7 +12540,10 @@
   }
 
   function renderJ47() {
-    const code = state.j47code || (items.find((i) => docs.some((r) => r.code === i.code)) || items[0]).code;
+    const mine = items.filter((i) => bookOfItem(i) === state.book);
+    if (state.book === 'ОП' && !mine.length) return opBookEmpty('j47');
+    const code = state.j47code && bookOf(state.j47code) === state.book ? state.j47code
+      : ((mine.find((i) => docs.some((r) => r.code === i.code)) || mine[0] || {}).code || '');
     state.j47code = code;
     const { it, blocks, rows } = j47Model(code);
     // Смуга блоку підрозділу: чергування тла дає прочитати, до якого
@@ -12412,7 +12578,7 @@
           <button type="button" data-act="j-next" title="Наступна позиція (Alt+↓)">▶</button></div>
         <button class="btn" data-act="print" title="Поточна сторінка на бланку Додатка 47">В Excel</button>
         <button class="btn" data-act="j47-book" title="Усі сторінки книги в Excel">Уся книга</button>`),
-      body: `<div class="panel">
+      body: `${state.book === 'ОП' ? opBookPanel() : ''}<div class="panel">
           <div class="panel__note"><b>${esc(it.name)}</b> · ${esc(it.unit)} ·
             ${lotPricesText(it.code) ? 'ціни партій ' + lotPricesText(it.code) : 'ціна ' + fmtMoney(it.price)} грн${it.serial ? ' · зав. № ' + esc(it.serial) : ''}
             · рух у ${cnt(blocks.length, 'підрозділі', 'підрозділах', 'підрозділах')}</div>
@@ -12443,8 +12609,9 @@
   const J14_PER_PAGE = 10;
 
   function renderJ14() {
+    if (state.book === 'ОП' && !docs.some((r) => bookOf(r.code) === 'ОП')) return opBookEmpty('j14');
     const sub = state.j14sub;
-    const lines = chrono(docs.filter((r) => r.from === sub || r.to === sub));
+    const lines = chrono(docs.filter((r) => (r.from === sub || r.to === sub) && bookOf(r.code) === state.book));
     const codes = [...new Set(lines.map((r) => r.code))]
       .sort((a, b) => String(a).localeCompare(String(b), 'uk', { numeric: true }));
     const pages = Math.max(1, Math.ceil(codes.length / J14_PER_PAGE));
@@ -12529,6 +12696,101 @@
   const fold = (title, hint, open, body) => `<details class="fold card" style="margin-bottom:12px"${open ? ' open' : ''}>
       <summary class="card__head"><div class="card__title">${esc(title)}</div><span class="fold__hint">${esc(hint)}</span></summary>${body}</details>`;
 
+  /** Запасний шлях книги ОП: вивантажити «Облік ОП.xlsx», прийняти книгу, яку вели руками,
+   *  і — поки книга ОП порожня — перенести стару книгу «Облік ОП». */
+  function opBookPanel() {
+    const last = (D.meta || {}).opBookExport || '';
+    const empty = !docs.some((r) => bookOf(r.code) === 'ОП');
+    return `<div class="panel">
+        <div class="panel__note">Книга «Облік ОП»: ${last ? `вивантажено ${fmtDate(last)}` : 'ще не вивантажували'}</div>
+        <div class="panel__spacer"></div>
+        ${native ? `<button class="btn" data-act="op-export">Вивантажити книгу «Облік ОП»</button>
+        <button class="btn" data-act="op-import">Прийняти книгу…</button>${empty
+          ? '<button class="btn" data-act="op-legacy">Перенести стару книгу…</button>' : ''}` : ''}
+      </div>`;
+  }
+  function opBookEmpty(view) {
+    return {
+      head: head('посуд і миючі / книги обліку', view === 'j14' ? 'Книга обліку підрозділу' : 'Книга обліку наявності та руху',
+        journalSeg(view)),
+      body: opBookPanel() + emptyBlock('▦', 'У книзі ОП ще немає записів',
+        'Внесіть прихід у «Документи» розділу «Посуд і миючі», прийміть книгу «Облік ОП» або перенесіть стару книгу.'),
+    };
+  }
+  /** Вибір файла кнопкою: прихований input створюється на один вибір. */
+  function pickFile(accept, fn) {
+    const inp = document.createElement('input');
+    inp.type = 'file';
+    inp.accept = accept;
+    inp.addEventListener('change', () => { const f = inp.files && inp.files[0]; if (f) fn(f); });
+    inp.click();
+  }
+  const listHtml = (arr) => `<ul class="op-rows">${(arr || []).map((x) => `<li>${esc(x)}</li>`).join('')}</ul>`;
+  async function opExport() {
+    try {
+      await flush();
+      const r = await fetch('api/op-book/export', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      const j = await r.json();
+      if (r.status === 409) {
+        modalOpen('Книгу не вивантажено', `<div class="pad"><p>${esc(j.error)}</p>${listHtml(j.rows)}</div>`, 'modal__box--form');
+        return;
+      }
+      if (!j.ok) throw new Error(j.error || `помилка ${r.status}`);
+      if (j.download) {
+        const a = document.createElement('a');
+        a.href = j.download; a.download = '';
+        document.body.appendChild(a); a.click(); a.remove();
+      }
+      toast(`Книгу вивантажено: ${j.path}`);
+    } catch (e) { toast(`Не вдалося вивантажити книгу: ${e.message || e}`, true); }
+  }
+  async function opImport(file, legacy) {
+    let j;
+    try {
+      await flush();
+      const r = await fetch('api/op-book/preview' + (legacy ? '?legacy=1' : ''), { method: 'POST', body: file });
+      j = await r.json();
+    } catch (e) { toast(`Книгу не прочитано: ${e.message || e}`, true); return; }
+    if (!j.ok) {
+      modalOpen('Книга не приймається', `<div class="pad">${listHtml(j.problems || [j.error])}</div>`, 'modal__box--form');
+      return;
+    }
+    const d = j.diff;
+    const part = (title, arr) => (arr && arr.length ? `<h4>${esc(title)} · ${arr.length}</h4>${listHtml(arr.slice(0, 50))}` : '');
+    const places = (j.places || []).map((p) => `<div class="field"><label>${esc(p)}</label>
+        <select data-op-place="${esc(p)}"><option value="">як є</option>${subs.filter((sb) => sb.active).map((sb) =>
+          `<option${sb.name === p ? ' selected' : ''}>${esc(sb.name)}</option>`).join('')}</select></div>`).join('');
+    modalOpen(legacy ? 'Перенесення старої книги ОП' : 'Прийняти книгу ОП', `<div class="pad op-preview">
+      ${d.same ? '<p>Книга збігається з програмою.</p>' : ''}
+      ${part('Нові документи', d.docs.new)}${part('Змінені документи', d.docs.changed)}${part('Прибрані документи', d.docs.removed)}
+      ${part('Нові позиції', d.items.new)}${part('Змінені позиції', d.items.changed)}${part('Прибрані позиції', d.items.removed)}
+      ${part('Нові місця', d.subs)}${part('Контрагенти', d.parties)}
+      ${places ? `<h4>Місця старої книги → підрозділи програми</h4><div class="form__grid">${places}</div>` : ''}
+      ${part('Нормалізовано', j.report)}
+      <div class="set-form__acts"><button class="btn btn--primary" data-act="op-apply" data-sha="${esc(j.sha)}"
+        data-legacy="${legacy ? 1 : 0}">Прийняти</button></div></div>`, 'modal__box--form');
+  }
+  async function opApply(sha, legacy) {
+    const mapping = {};
+    document.querySelectorAll('#modal [data-op-place]').forEach((el) => { if (el.value) mapping[el.dataset.opPlace] = el.value; });
+    if (!confirm('Прийняти книгу? Книга ОП у програмі стане такою, як у файлі; перед цим програма збереже копію бази.')) return;
+    await flush();
+    let j = {};
+    let status = 0;
+    try {
+      const r = await fetch('api/op-book/apply', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sha, legacy, mapping }) });
+      status = r.status;
+      j = await r.json().catch(() => ({}));
+    } catch (e) { j = { problems: [String(e.message || e)] }; }
+    if (!j.ok) {
+      modalOpen('Книгу не прийнято', `<div class="pad">${listHtml(j.problems || [j.error || `помилка ${status}`])}</div>`, 'modal__box--form');
+      return;
+    }
+    sync.leaving = true;
+    location.reload();
+  }
+
   function emptyBlock(mark, title, text, acts = '') {
     return `<div class="empty">
       <div class="empty__mark" aria-hidden="true">${mark}</div>
@@ -12563,7 +12825,7 @@
   /** Переходи йдуть в історію вікна: «назад» (кнопка на екрані, Alt+←, бічна
    *  кнопка миші) повертає туди, звідки прийшли, — з документа в картку засобу
    *  й назад у документ, а не завжди в перелік. */
-  const navSnap = () => ({ view: state.view, itemCode: state.itemCode, docKey: state.docKey,
+  const navSnap = () => ({ view: state.view, book: state.book, itemCode: state.itemCode, docKey: state.docKey,
     reconId: state.reconId, docBack: state.docBack, stId: state.stId, stSub: state.stSub,
     peopleTab: state.peopleTab, personId: state.personId, subName: state.subName,
     paperId: state.paperId || null, paperVer: state.paperVer || 0,
@@ -12673,7 +12935,12 @@
       // відкритою: «Звірки» після підписаної відомості вели назад у відомість.
       // Пункт меню — новий екран із чистим пошуком: запит із «Руху й операцій»
       // інакше фільтрував реєстр знищеного, і той показував «записів немає».
-      if (d.nav) return go(d.nav, Object.assign({ q: '' }, NAV_ROOT[d.nav] || {}));
+      if (d.nav) {
+        // Пункт книги ОП чи ТЗ відкриває свою книгу; фільтри іншої книги до неї не переходять.
+        const book = d.book && d.book !== state.book
+          ? { book: d.book, group: '', assetF: '', onlyShort: false, movesKindF: '' } : d.book ? { book: d.book } : {};
+        return go(d.nav, Object.assign({ q: '' }, NAV_ROOT[d.nav] || {}, book));
+      }
       if (d.vw != null && !d.act) return openViewer(d.vwKey, d.vw);
       if (d.act === 'att') return attActs[+d.i] ? attActs[+d.i]() : null;
       if (d.act === 'sort') return sortToggle(d.view, d.k, d.first);
@@ -12686,6 +12953,7 @@
       if (d.act === 'staff-open') { state.staffOpen = state.staffOpen === d.line ? null : d.line; return render(); }
       if (d.act && d.act.startsWith('st-')) return stocktakeAction(d.act, d);
       if (d.act && d.act.startsWith('mtz-')) return mtzAction(d.act, d);
+      if (d.act && d.act.startsWith('f2-')) return form2Action(d.act, d);
       if (d.act && d.act.startsWith('pur-')) return purAction(d.act, d);
       if (d.act && /^(paper|val|yats)-/.test(d.act)) return paperAction(d.act, d);
       if (d.act && d.act.startsWith('imp-')) return impAction(d.act, d);
@@ -12714,6 +12982,8 @@
       if (d.act === 'doc-del') return deleteDoc(d.doc);
       if (d.act === 'mk') { state.movesKindF = d.v || ''; state.movesLimit = 200; return render(); }
       if (d.act === 'sub-asset') { state.subAsset = d.v || ''; return render(); }
+      if (d.act === 'op-apply') return opApply(d.sha, d.legacy === '1');
+      if (d.act === 'sub-book') { state.subBook = d.v === 'ОП' ? 'ОП' : 'ТЗ'; state.subAsset = ''; return render(); }
       if (d.act === 'j-prev' || d.act === 'j-next') return journalStep(d.act === 'j-next' ? 1 : -1);
       if (d.act === 'sf') { state.staffForm = d.v; state.substDraft = { from: '', to: [] }; return render(); }
       if (d.act === 'ws') { store.ui.withSubst = d.v === '1'; save(); return render(); }
@@ -12926,6 +13196,13 @@
     bindSelect('#f-asset', (v) => { state.assetF = v; });
     bindSelect('#f-holder', (v) => { state.subHolder = v; });
     bindSelect('#f-sub', (v) => { state.sub = v; });
+    bindSelect('#f-fes', (v) => { state.movesFes = v; });
+    if (state.view === 'form2' || state.view === 'item') bindForm2Fields($('#scroll'));
+    // Статус ФЕС у картці документа.
+    $('#scroll').querySelectorAll('[data-fes]').forEach((el) => el.addEventListener('change', () => {
+      fesSet(el.dataset.doc, { [el.dataset.fes]: el.value.trim() });
+      render();
+    }));
     bindRegistry($('#scroll'));
     bindSelect('#mf-from', (v) => { state.movesFrom = v; state.movesLimit = 200; });
     bindSelect('#mf-to', (v) => { state.movesTo = v; state.movesLimit = 200; });
@@ -13296,7 +13573,7 @@
   function stashDraft() {
     if (!state.editing && state.draft && hasContent(state.draft)) {
       state.drafts = state.drafts || {};
-      state.drafts[state.draft.kind] = state.draft;
+      state.drafts[slotOf(state.draft.kind, state.draft.book || 'ТЗ')] = state.draft;
     }
   }
 
@@ -13385,10 +13662,11 @@
     stashDraft();
     state.moveKind = kind;
     state.draft = draftFromRows(kind, idx.map((i) => arr[i]));
+    state.draft.book = bookOf(state.draft.lines[0] ? state.draft.lines[0].code : '');
     state.draft.lines.push(emptyLine());
     state.editing = key;
     state.formOpen = true;
-    go('moves', { q: '', formOpen: true });
+    go('moves', { q: '', formOpen: true, book: state.draft.book });
     $('#doc-form')?.scrollIntoView({ block: 'start' });
   }
 
@@ -13630,7 +13908,7 @@
    *  канонічної книги, і жодна позиція не відпадає. */
   function j14Excel() {
     const sub = state.j14sub;
-    const lines = chrono(docs.filter((r) => r.from === sub || r.to === sub));
+    const lines = chrono(docs.filter((r) => (r.from === sub || r.to === sub) && bookOf(r.code) === state.book));
     const codes = [...new Set(lines.map((r) => r.code))].sort((a, b) => a.localeCompare(b));
     const sheets = [];
     for (let p = 0; p < codes.length; p += J14_PER_PAGE) {
@@ -13756,9 +14034,9 @@
 
   /** Наступний вільний код: служба нумерує позиції підряд, тож новий — на
    *  одиницю більший за найбільший числовий код довідника. */
-  function nextCode() {
-    const nums = items.map((i) => +i.code).filter((n) => Number.isFinite(n) && n < 1e6);
-    return String((nums.length ? Math.max(...nums) : 10000) + 1);
+  function nextCode(book = 'ТЗ') {
+    const nums = items.filter((i) => bookOfItem(i) === book).map((i) => +i.code).filter((n) => Number.isFinite(n) && n < 1e6);
+    return String((nums.length ? Math.max(...nums) : book === 'ОП' ? 6000 : 10000) + 1);
   }
 
   const normName = (x) => String(x || '').toLowerCase().replace(/[\s"'«»,.]+/g, '');
@@ -13789,6 +14067,7 @@
     // оприбутковані до правила «інша ціна — інший код».
     const prices = editing ? codePrices(d.editCode) : [];
     const units = [...new Set(items.map((i) => i.unit).filter(Boolean))].sort();
+    const op = (BOOK_OF_GROUP.get(d.group) || 'ТЗ') === 'ОП';
     return `<form class="card form" id="item-form" style="margin-bottom:12px">
       <div class="card__head"><div class="card__title">${editing ? `Виправлення позиції ${esc(d.editCode)}`
         : d.like ? `Нова позиція за зразком ${esc(d.like)}` : 'Нова позиція номенклатури'}</div></div>
@@ -13801,14 +14080,16 @@
         <div class="field"><label>Одиниця виміру <span class="req">*</span></label>
           <input name="unit" value="${esc(d.unit)}" list="units-list" required placeholder="шт">
           <datalist id="units-list">${units.map((u) => `<option value="${esc(u)}">`).join('')}</datalist></div>
-        <div class="field field--span2"><label>Розділ 21/Прод</label>
-          <select name="group">${D.groups.map(([c, l]) =>
-            `<option value="${c}"${c === d.group ? ' selected' : ''}>${c} · ${esc(l)}</option>`).join('')}</select></div>
+        <div class="field field--span2"><label>${op ? 'Група' : 'Розділ 21/Прод'}</label>
+          <select name="group">${D.groups.filter(([, , b]) => (b || 'ТЗ') === (op ? 'ОП' : 'ТЗ')).map(([c, l]) =>
+            `<option value="${c}"${c === d.group ? ' selected' : ''}>${op ? '' : c + ' · '}${esc(l)}</option>`).join('')}</select></div>
         ${prices.length > 1 ? `<div class="field"><label>Ціна, грн</label>
           <input value="${esc(prices.map(fmtMoney).join('; '))}" disabled title="Оприбутковано за різними цінами"></div>` : `<div class="field"><label>Ціна, грн</label>
           <input name="price" type="number" min="0" step="0.01" value="${esc(+d.price > 0 ? (+d.price).toFixed(2) : '')}"${prices.length
             ? ' required title="Зміниться в усіх документах коду"' : ''}></div>`}
-        <div class="field"><label>Номер у ФЕС</label>
+        ${op ? `<div class="field"><label>Дободач</label>
+          <input name="perRation" type="number" min="0" step="any" value="${esc(d.perRation ?? '')}"
+            title="Скільки добових видач покриває одиниця позиції"></div>` : `<div class="field"><label>Номер у ФЕС</label>
           <input name="fes" value="${esc(d.fes || '')}" inputmode="numeric" autocomplete="off"
             placeholder="інвентарний чи номенклатурний"
             title="Десять цифр із класом 10 чи 11 — необоротний актив, інший номер — запаси"></div>
@@ -13818,7 +14099,7 @@
             : 'номера ФЕС немає, звірте з бухгалтерією'}</small></div>
         <div class="field"><label>Старі коди (облік 3.0)</label>
           <input name="old" value="${esc(d.old || '')}" placeholder="10102, 10103" autocomplete="off"
-            title="Коди з книги 3.0, згорнуті в цю позицію: за ними її знайде пошук"></div>
+            title="Коди з книги 3.0, згорнуті в цю позицію: за ними її знайде пошук"></div>`}
         <div class="field field--span2"><label>Примітка</label>
           <input name="note" value="${esc(d.note || '')}" placeholder="паспорт, формуляр, звідки позиція"></div>
         <div class="field"><label><input type="checkbox" name="archived"${d.archived ? ' checked' : ''}>
@@ -13898,6 +14179,7 @@
                      nonrev: byFes ?? f.get('nonrev') === 'on',
                      fes, note: g('note'), old: g('old'),
                      archived: f.get('archived') === 'on' ? (was && was.archived) || today() : '' };
+    if (f.has('perRation')) fields.perRation = g('perRation') === '' ? null : +g('perRation');
     if (editing) {
       const rec = store.items.find((x) => String(x.code) === editing);
       if (rec) Object.assign(rec, fields);
@@ -14666,7 +14948,9 @@ ${r.other ? r.name : it ? it.name : r.code} — ${fmtNum(r.qty)}, `
         $('#doc-form')?.scrollIntoView({ block: 'start' });
         break;
       case 'item-new':
-        state.newItem = { code: nextCode(), name: '', unit: 'шт', group: '21.18', price: '', nonrev: false };
+        state.newItem = state.book === 'ОП'
+          ? { code: nextCode('ОП'), name: '', unit: 'шт', group: 'ОП.1', price: '', nonrev: false, perRation: '' }
+          : { code: nextCode(), name: '', unit: 'шт', group: '21.18', price: '', nonrev: false };
         go('nomen');
         break;
       case 'item-edit': {
@@ -14675,8 +14959,8 @@ ${r.other ? r.name : it ? it.name : r.code} — ${fmtNum(r.qty)}, `
         state.newItem = { code: it.code, name: it.name, unit: it.unit, group: it.group,
                           price: it.price || it.basePrice || '', nonrev: !!it.nonrev, editCode: it.code,
                           base: !it.own, fes: it.fes || '', note: it.note || '', old: it.old || '',
-                          archived: it.archived || '' };
-        go('nomen');
+                          archived: it.archived || '', perRation: it.perRation ?? '' };
+        go('nomen', { book: bookOfItem(it) });
         $('#item-form [name="name"]')?.focus();
         break;
       }
@@ -14736,20 +15020,28 @@ ${r.other ? r.name : it ? it.name : r.code} — ${fmtNum(r.qty)}, `
         render();
         break;
       case 'journals-open': journalsDialog(); break;
+      case 'op-export': opExport(); break;
+      case 'folders-save': foldersSave(); break;
+      case 'op-request': opRequestDialog(); break;
+      case 'op-fes': pickFile('.xlsx', opFes); break;
+      case 'fes-map-save': opFesSave(); break;
+      case 'op-request-make': opRequestMake(); break;
+      case 'op-import': pickFile('.xlsx', (f) => opImport(f, false)); break;
+      case 'op-legacy': pickFile('.xlsx', (f) => opImport(f, true)); break;
       case 'journals-make': journalsMake(); break;
       case 'new-dz':
         if (!leaveEditing()) break;
         go('moves', { moveKind: 'dz', formOpen: true });
         $('#doc-form')?.scrollIntoView({ block: 'start' });
         break;
-      case 'open-j47': go('j47', { j47code: state.itemCode }); break;
+      case 'open-j47': go('j47', { j47code: state.itemCode, book: bookOf(state.itemCode) }); break;
       case 'j47-book': j47Excel(true); break;
       case 'doc-back': goBack(state.docBack && state.docBack !== 'doc' ? state.docBack : 'moves'); break;
       case 'back': goBack('nomen'); break;
       case 'short': state.onlyShort = !state.onlyShort; render(); break;
       case 'reset':
         Object.assign(state, { q: '', group: '', sub: '', onlyShort: false, onlyMine: false, noScan: false, assetF: '',
-                               movesKindF: '', movesFrom: '', movesTo: '', movesLimit: 200 });
+                               movesKindF: '', movesFrom: '', movesTo: '', movesLimit: 200, movesFes: '' });
         render();
         break;
       case 'print':
@@ -14798,8 +15090,8 @@ ${r.other ? r.name : it ? it.name : r.code} — ${fmtNum(r.qty)}, `
       case 'form21-xls': form21Excel(); break;
       case 'form21-set': form21SetExcel(); break;
       case 'losses-xls': lossesExcel(); break;
-      case 'sub-nomen': go('nomen', { sub: state.subName, q: '' }); break;
-      case 'sub-j14': go('j14', { j14sub: state.subName, j14page: 1 }); break;
+      case 'sub-nomen': go('nomen', { sub: state.subName, q: '', book: state.subBook || 'ТЗ', group: '' }); break;
+      case 'sub-j14': go('j14', { j14sub: state.subName, j14page: 1, book: state.subBook || 'ТЗ' }); break;
       case 'sub-xls': subExcel(); break;
       case 'sub-filter-reset': state.subAsset = ''; state.subHolder = ''; render(); break;
       case 'first-unit': go('people', { peopleTab: 'unit', personId: null, assign: null }); break;
@@ -14812,7 +15104,7 @@ ${r.other ? r.name : it ? it.name : r.code} — ${fmtNum(r.qty)}, `
         }
         break;
       }
-      case 'sub-moves': go('moves', { sub: state.subName, q: '', movesLimit: 200 }); break;
+      case 'sub-moves': go('moves', { sub: state.subName, q: '', movesLimit: 200, book: state.subBook || 'ТЗ' }); break;
       case 'sub-mvo': go('people', { peopleTab: 'resp', personId: null, assign: { kind: 'mvo', sub: state.subName } }); break;
       case 'scan-add': {
         const t = scanTarget();
@@ -14985,7 +15277,7 @@ ${r.other ? r.name : it ? it.name : r.code} — ${fmtNum(r.qty)}, `
    *  не перезаписується. */
   function seedNormsFromBalance() {
     const scope = state.sub || rootName();
-    const todo = items.filter((i) => {
+    const todo = tzItems().filter((i) => {
       const have = state.sub ? haveRollup(scope, i.code) : balCode(i.code);
       return have > 0 && !normOwn(scope, i.code);
     });
@@ -15163,12 +15455,477 @@ ${r.other ? r.name : it ? it.name : r.code} — ${fmtNum(r.qty)}, `
         ${card('Оформлення', look)}
         ${net ? card('Робота в мережі', net) : ''}
         ${card('Дані та копії', data)}
+        ${native && !me.remote ? card('Теки', foldersBody()) : ''}
         ${card('Перевірка', check)}
         ${danger}
         ${card('Довідка', help)}
         ${card('Скорочення', gloss, ' set-card--wide')}
       </div>`,
     };
+  }
+
+  // ---------------------------------------------------------------- 2/Прод
+  /** Звіт-заявка 2/прод: дані рахує сервер з бази обох книг (api/form2); сторінка тримає останню
+   *  відповідь у state.form2 і просить нову після кожної своєї правки цього екрана. */
+  const F2_TABS = [['report', 'Звіт'], ['map', 'Відповідність'], ['notes', 'Записки'], ['parties', 'Контрагенти']];
+  const f2Year = () => state.f2year || Number(today().slice(0, 4)) - (today().slice(5, 10) < '02-01' ? 1 : 0);
+  async function form2Load(year = f2Year()) {
+    if (!native || state.form2Loading) return;
+    state.form2Loading = true;
+    try {
+      await flush();
+      const r = await fetch(`api/form2?year=${year}`);
+      if (!r.ok) throw new Error(await r.text());
+      state.form2 = { year, data: await r.json() };
+    } catch (e) {
+      toast(`Звіт не зібрано: ${e.message || e}`, true);
+    } finally {
+      state.form2Loading = false;
+      if (state.view === 'form2') render();
+    }
+  }
+  /** Екран повертає { head, body }, як усі екрани (`render()` вставляє їх і кличе `bindBody`). */
+  function renderForm2() {
+    const year = f2Year();
+    const tab = state.f2tab || 'report';
+    const rep = state.form2 && state.form2.year === year ? state.form2.data : null;
+    if (!rep && !state.form2Loading && native) setTimeout(() => form2Load(year), 0);
+    const years = [];
+    for (let y = Number(today().slice(0, 4)); y >= 2026; y--) years.push(y);
+    if (!years.includes(year)) years.push(year);
+    const yearSel = `<label class="chip is-on"><span class="chip__label">рік</span><select id="f2-year">${
+      years.map((y) => `<option${y === year ? ' selected' : ''}>${y}</option>`).join('')}</select></label>`;
+    const tabs = `<div class="seg">${F2_TABS.map(([k, l]) =>
+      `<button type="button" data-act="f2-tab" data-v="${k}"${tab === k ? ' class="is-on"' : ''}>${l}</button>`).join('')}</div>`;
+    const top = head('звіти / 2/прод', `Звіт-заявка 2/прод за ${year} рік`, yearSel + tabs);
+    if (!native) return { head: top, body: '<div class="pad">2/Прод складається в програмі на комп’ютері.</div>' };
+    if (!rep) return { head: top, body: '<div class="pad">Збираю звіт з бази…</div>' };
+    const bad = rep.checks.filter((c) => c.level === '✗').length;
+    const warn = rep.checks.length - bad;
+    const unsure = form2MapNow().filter((m) => m.row && !m.checked).length;
+    const state0 = `<div class="panel">
+        <span class="tag">${rep.submittedPrev ? `зданий звіт ${year - 1}: є` : `зданого звіту ${year - 1} немає`}</span>
+        <span class="tag">уточнити: ${unsure}</span>
+        <span class="tag${bad ? ' tag--out' : ''}">перевірки: ✗ ${bad} · ⚠ ${warn}</span>
+        <div class="panel__spacer"></div>
+        <button type="button" class="btn" data-act="f2-submitted">Прийняти зданий звіт…</button>
+        <button type="button" class="btn" data-act="f2-note">Пояснювальна</button>
+        <button type="button" class="btn btn--primary" data-act="f2-package">Скласти пакет</button>
+        <button type="button" class="btn" data-act="f2-submit" title="Запам'ятати графи 5–18 як зданий звіт: з них береться гр.8 наступного року">Звіт здано</button>
+      </div>`;
+    const body = { report: form2Report, map: form2MapTab, notes: form2Notes, parties: form2Parties }[tab](rep, year);
+    return { head: top, body: `${state0}${body}` };
+  }
+  function form2Report(rep, year) {
+    const rows = rep.rows.filter((r) => !r.header && ([5, 8, 11, 15, 18].some((c) => Math.abs(r.c[c]) > 1e-9)
+      || Math.abs(r.balance) > 1e-9));
+    const gap = (r) => +(r.c[18] - r.balance).toFixed(3);
+    const num = (key, label, get) => ({ key, label, cls: 'c-num', sort: get, cell: (r) => fmtNum(get(r)) });
+    const reg = registry({
+      id: 'f2', rows, minWidth: '1080px', search: (r) => [r.name, String(r.row), ...r.codes], placeholder: 'Рядок, назва чи код',
+      filters: [{ type: 'seg', key: 'show', options: [['', 'усі'], ['gap', 'з розбіжністю'], ['move', 'з рухом']],
+        test: (r, v) => (v === 'gap' ? Math.abs(gap(r)) > 1e-9 : Math.abs(r.c[11]) + Math.abs(r.c[15]) > 1e-9) }],
+      columns: [
+        { key: 'row', label: 'рядок', cls: 'c-code', sort: (r) => r.row, cell: (r) => String(r.row) },
+        { key: 'name', label: 'найменування', cls: 'c-name c-name--stack', sort: (r) => r.name, cell: (r) => `<b>${esc(r.name)}</b><small>${
+          esc(r.uom || 'без одиниці')}${r.codes.length ? ' · ' + esc(r.codes.join(', ')) : ''}</small>` },
+        num('c5', 'гр.5', (r) => r.c[5]), num('c8', 'гр.8', (r) => r.c[8]), num('c12', 'гр.12', (r) => r.c[12]),
+        num('c13', 'гр.13', (r) => r.c[13]), num('c14', 'гр.14', (r) => r.c[14]), num('c16', 'гр.16', (r) => r.c[16]),
+        num('c17', 'гр.17', (r) => r.c[17]), num('c18', 'гр.18', (r) => r.c[18]), num('bal', 'облік', (r) => r.balance),
+        { key: 'gap', label: 'різниця', cls: 'c-num', sort: gap, cell: (r) => (Math.abs(gap(r)) > 1e-9
+          ? `<span class="num-bad">${fmtNum(gap(r))}</span>` : '—') },
+      ],
+      row: (r) => ({ attrs: `data-act="f2-row" data-row="${r.row}"` }),
+      empty: `У ${year} році руху за прив’язаними кодами немає, зданого звіту ${year - 1} теж немає.`,
+    });
+    regRedraw.set('f2', render);
+    const open = state.f2row ? rep.rows.find((x) => x.row === state.f2row) : null;
+    const checks = rep.checks.length ? `<div class="card" style="margin-top:12px"><div class="card__head">
+        <div class="card__title">Перевірки</div></div><div class="pad">${rep.checks.map((c) =>
+          `<div class="f2-check"><span class="${c.level === '✗' ? 'num-bad' : ''}">${c.level}</span> ${esc(c.text)}</div>`).join('')}</div></div>` : '';
+    return reg.panel + (open ? form2RowCard(open) : '') + `<div class="card card--scroll">${reg.table}</div>` + checks;
+  }
+  /** Документи рядка звіту по графах, з вибором іншої графи для документа, — карткою над таблицею. */
+  function form2RowCard(r) {
+    const col = (id) => String(((store.docMeta || {})[id] || {}).col || '');
+    const list = [12, 13, 14, 16, 17].map((c) => (r.docs[c].length ? `<h4>графа ${c}</h4>${r.docs[c].map((d) => `
+      <div class="f2-check">${esc(d.type)} №${esc(d.no)} від ${fmtDate(d.date)} · ${esc(d.party || '—')} · ${fmtNum(d.qty)}
+        <span class="tag">${esc(d.rule)}</span>${typeof d.id === 'number' ? `
+        <select data-f2col="${d.id}">${[['', 'за правилом'], ...[12, 13, 14, 16, 17].map((x) => [String(x), 'гр.' + x])].map(([v, l]) =>
+          `<option value="${v}"${col(d.id) === v ? ' selected' : ''}>${l}</option>`).join('')}</select>` : ''}
+      </div>`).join('')}` : '')).join('');
+    return `<div class="card" style="margin-bottom:12px"><div class="card__head">
+        <div class="card__title">Рядок ${r.row}: ${esc(r.name)}</div><div class="panel__spacer"></div>
+        <button type="button" class="btn btn--sm" data-act="f2-row" data-row="${r.row}">Закрити</button></div>
+      <div class="pad">${list || 'Документів року немає.'}</div></div>`;
+  }
+  const f2RowName = () => {
+    const out = new Map((D.form2Rows || []).map((r) => [r[0], r[1]]));
+    for (const o of store.form2Own || []) out.set(o.row, o.name);
+    return out;
+  };
+  const f2State = (m) => (!m ? 'не прив’язано' : m.skip ? 'поза 2/прод' : m.checked ? 'перевірено' : 'уточнити');
+  function form2MapTab() {
+    const map = new Map(form2MapNow().map((m) => [m.code, m]));
+    const rowName = f2RowName();
+    const rows = items.filter((i) => !i.archived).map((i) => ({ it: i, m: map.get(i.code) || null }));
+    const reg = registry({
+      id: 'f2m', rows, minWidth: '1000px', search: (r) => [r.it.code, r.it.name, r.m && r.m.row ? String(r.m.row) : ''],
+      placeholder: 'Код, назва чи рядок',
+      filters: [{ type: 'seg', key: 'st', options: [['', 'усі'], ['не прив’язано', 'не прив’язано'], ['уточнити', 'уточнити'],
+        ['поза 2/прод', 'поза 2/прод']], test: (r, v) => f2State(r.m) === v },
+      { type: 'seg', key: 'book', options: [['', 'обидві книги'], ['ТЗ', 'ТЗ'], ['ОП', 'ОП']], test: (r, v) => bookOfItem(r.it) === v }],
+      columns: [
+        { key: 'code', label: 'код', cls: 'c-code', sort: (r) => r.it.code, cell: (r) => esc(r.it.code) },
+        { key: 'name', label: 'позиція', cls: 'c-name', sort: (r) => r.it.name, cell: (r) => `<b>${esc(r.it.name)}</b>` },
+        { key: 'row', label: 'рядок 2/Прод', cls: 'c-txt', sort: (r) => (r.m && r.m.row) || 0, cell: (r) => `<input class="inp-num"
+          data-f2bind="${esc(r.it.code)}" value="${r.m && r.m.row ? r.m.row : ''}" placeholder="№" aria-label="рядок 2/Прод">
+          <small>${esc(r.m && r.m.row ? rowName.get(r.m.row) || 'немає такого рядка' : (r.m && r.m.skip) || '')}</small>` },
+        { key: 'factor', label: '×', cls: 'c-num', cell: (r) => `<input class="inp-num" data-f2factor="${esc(r.it.code)}"
+          value="${r.m ? r.m.factor || 1 : 1}" aria-label="множник">` },
+        { key: 'st', label: 'стан', cls: 'c-tag', sort: (r) => f2State(r.m), cell: (r) => `<span class="tag">${esc(f2State(r.m))}</span>${
+          r.m && r.m.checked ? `<small>${esc(r.m.checked)}${r.m.checkedOn ? ' · ' + fmtDate(r.m.checkedOn) : ''}</small>` : ''}` },
+        { key: 'act', label: '', cls: 'c-acts', cell: (r) => `<button type="button" class="btn btn--sm" data-act="f2-check" data-code="${esc(r.it.code)}">Перевірено</button>
+          <button type="button" class="btn btn--sm" data-act="f2-skip" data-code="${esc(r.it.code)}">Поза 2/прод</button>` },
+      ],
+      empty: 'Позицій немає.',
+    });
+    regRedraw.set('f2m', render);
+    return `<div class="panel"><button type="button" class="btn" data-act="f2-map-read">Прийняти відповідність…</button></div>`
+      + reg.panel + `<div class="card card--scroll">${reg.table}</div>`;
+  }
+  function form2Set(code, patch) {
+    const cur = form2MapNow().find((m) => m.code === code) || { code, row: null, factor: 1, checked: null, checkedOn: null, skip: null };
+    store.form2Map = store.form2Map || {};
+    store.form2Map[code] = Object.assign({ row: cur.row, factor: cur.factor, checked: cur.checked, checkedOn: cur.checkedOn,
+      skip: cur.skip }, patch);
+    logChange('прив’язка 2/Прод', 'f2|' + code, JSON.stringify(store.form2Map[code]));
+    save();
+    if (state.view === 'form2') form2Load(f2Year()); else render();
+  }
+  function form2Notes(rep, year) {
+    const mine = (store.form2Notes || []).filter((n) => n.year === year);
+    const name = new Map(rep.rows.map((r) => [r.row, r.name]));
+    const props = rep.proposals.filter((p) => !mine.some((n) => n.row === p.row && n.col === p.col)).map((p) => `
+      <div class="f2-check">рядок ${p.row} «${esc(name.get(p.row) || '')}»: гр.${p.col} ${p.col === 14 ? '+' : '−'}${fmtNum(p.qty)}
+        <button type="button" class="btn btn--sm" data-act="f2-note-add" data-row="${p.row}" data-col="${p.col}" data-qty="${p.qty}">Записка</button></div>`).join('');
+    const list = mine.map((n) => `<div class="f2-check">рядок ${n.row} «${esc(name.get(n.row) || '')}» · гр.${n.col} · ${fmtNum(n.qty)}
+        <input data-f2n="${esc(n.id)}" data-k="no" value="${esc(n.no || '')}" placeholder="№" aria-label="номер записки">
+        <input type="date" data-f2n="${esc(n.id)}" data-k="date" value="${esc(n.date || '')}" aria-label="дата записки">
+        <input data-f2n="${esc(n.id)}" data-k="reason" value="${esc(n.reason || '')}" placeholder="причина" aria-label="причина" style="flex:1">
+        <button type="button" class="btn btn--sm" data-act="f2-note-del" data-id="${esc(n.id)}">Прибрати</button></div>`).join('');
+    return `<div class="card"><div class="card__head"><div class="card__title">Різниця зі зданим звітом ${year - 1}</div></div>
+        <div class="pad">${props || 'Різниці немає.'}</div></div>
+      <div class="card" style="margin-top:12px"><div class="card__head"><div class="card__title">Записки ${year}</div></div>
+        <div class="pad">${list || 'Записок немає.'}</div></div>`;
+  }
+  function form2Parties() {
+    const kinds = ['військова частина', 'постачальник', 'фонд', 'інше'];
+    const all = new Map((D.parties || []).map(([n, k]) => [n, k]));
+    for (const [n, k] of Object.entries(store.parties || {})) all.set(n, k);
+    const rows = [...all.entries()].map(([name, kind]) => ({ name, kind, guess: partyGuess(name) }));
+    const reg = registry({
+      id: 'f2p', rows, minWidth: '760px', search: (r) => [r.name], placeholder: 'Контрагент',
+      filters: [{ type: 'toggle', key: 'diff', label: 'вид ≠ пропозиції', test: (r) => r.kind !== r.guess }],
+      columns: [
+        { key: 'name', label: 'контрагент', cls: 'c-name', sort: (r) => r.name, cell: (r) => `<b>${esc(r.name)}</b>` },
+        { key: 'kind', label: 'вид', cls: 'c-txt', sort: (r) => r.kind, cell: (r) => `<select data-f2party="${esc(r.name)}"
+          aria-label="вид контрагента">${kinds.map((k) => `<option${k === r.kind ? ' selected' : ''}>${k}</option>`).join('')}</select>` },
+        { key: 'guess', label: 'пропозиція', cls: 'c-txt', cell: (r) => (r.kind === r.guess ? '—' : esc(r.guess)) },
+      ],
+      empty: 'Контрагентів ще немає: вони з’являються з першим приходом.',
+    });
+    regRedraw.set('f2p', render);
+    return `<div class="panel"><button type="button" class="btn" data-act="f2-party-all">Прийняти пропозиції</button></div>`
+      + reg.panel + `<div class="card card--scroll">${reg.table}</div>`;
+  }
+  /** Поля екрана 2/Прод і картки позиції: прив'язка, множник, записки, види контрагентів, рік. */
+  function bindForm2Fields(root) {
+    if (!root) return;
+    root.querySelectorAll('[data-f2bind]').forEach((el) => el.addEventListener('change', () => {
+      const v = el.value.trim();
+      form2Set(el.dataset.f2bind, v ? { row: Number(v), skip: null, checked: null, checkedOn: null } : { row: null, skip: null });
+    }));
+    root.querySelectorAll('[data-f2factor]').forEach((el) => el.addEventListener('change', () => {
+      const v = Number(String(el.value).replace(',', '.'));
+      if (v > 0) form2Set(el.dataset.f2factor, { factor: v });
+    }));
+    root.querySelectorAll('[data-f2n]').forEach((el) => el.addEventListener('change', () => {
+      const n = (store.form2Notes || []).find((x) => x.id === el.dataset.f2n);
+      if (!n) return;
+      n[el.dataset.k] = el.value.trim();
+      save();
+      form2Load(f2Year());
+    }));
+    root.querySelectorAll('[data-f2col]').forEach((el) => el.addEventListener('change', () => {
+      const id = el.dataset.f2col;
+      store.docMeta = store.docMeta || {};
+      const cur = Object.assign({ report: '', order: '', scan: '', col: null }, store.docMeta[id] || {});
+      cur.col = el.value ? Number(el.value) : null;
+      store.docMeta[id] = cur;
+      logChange('графа 2/прод', 'f2col|' + id, el.value ? 'гр.' + el.value : 'за правилом');
+      save();
+      form2Load(f2Year());
+    }));
+    root.querySelectorAll('[data-f2party]').forEach((el) => el.addEventListener('change', () => {
+      store.parties = store.parties || {};
+      store.parties[el.dataset.f2party] = el.value;
+      save();
+      form2Load(f2Year());
+    }));
+    const y = $('#f2-year');
+    if (y) y.addEventListener('change', () => { state.f2year = Number(y.value); state.form2 = null; render(); });
+  }
+  /** Прив'язка позиції до рядка 2/Прод у картці позиції (обидві книги). */
+  function form2ItemCard(i) {
+    const m = form2MapNow().find((x) => x.code === i.code) || null;
+    const rowName = f2RowName();
+    const said = !m ? 'не прив’язано' : m.skip ? `поза 2/прод: ${m.skip}` : m.checked
+      ? `перевірено: ${m.checked}${m.checkedOn ? ', ' + fmtDate(m.checkedOn) : ''}` : 'уточнити';
+    return `<div class="card" style="margin-bottom:12px"><div class="card__head"><div class="card__title">2/Прод</div>
+        <div class="panel__spacer"></div><span class="panel__count">${esc(said)}</span></div>
+      <div class="panel">
+        <label class="chip"><span class="chip__label">рядок</span><input class="inp-num" data-f2bind="${esc(i.code)}"
+          value="${m && m.row ? m.row : ''}" placeholder="№"></label>
+        <span class="panel__note">${esc(m && m.row ? rowName.get(m.row) || 'немає такого рядка' : '')}</span>
+        <label class="chip"><span class="chip__label">×</span><input class="inp-num" data-f2factor="${esc(i.code)}"
+          value="${m ? m.factor || 1 : 1}"></label>
+        <button type="button" class="btn btn--sm" data-act="f2-check" data-code="${esc(i.code)}">Перевірено</button>
+        <button type="button" class="btn btn--sm" data-act="f2-skip" data-code="${esc(i.code)}">Поза 2/прод</button>
+      </div></div>`;
+  }
+  async function form2Submitted(file) {
+    let j = {};
+    try {
+      await flush();
+      const r = await fetch('api/form2/submitted', { method: 'POST', body: file });
+      j = await r.json().catch(() => ({}));
+    } catch (e) { j = { problems: [String(e.message || e)] }; }
+    if (!j.ok) {
+      modalOpen('Зданий звіт не прийнято', `<div class="pad">${listHtml(j.problems || [j.error || 'помилка'])}</div>`, 'modal__box--form');
+      return;
+    }
+    toast(`Зданий звіт ${j.year}: ${cnt(j.rows, 'клітинка', 'клітинки', 'клітинок')}`);
+    if (j.unknown && j.unknown.length) {
+      modalOpen('Рядки, яких немає в переліку', `<div class="pad">${listHtml(j.unknown)}</div>`, 'modal__box--form');
+    }
+    form2Load(f2Year());
+  }
+  async function form2MapRead(file) {
+    const day = new Date(file.lastModified || Date.now()).toISOString().slice(0, 10);
+    let j = {};
+    try {
+      const r = await fetch(`api/form2/map-read?date=${day}`, { method: 'POST', body: file });
+      j = await r.json().catch(() => ({}));
+    } catch (e) { j = { problems: [String(e.message || e)] }; }
+    if (!j.map) { toast(`Відповідність не прочитано: ${(j.problems || [j.error || 'помилка']).join('; ')}`, true); return; }
+    const known = new Set(items.map((i) => i.code));
+    const unknown = Object.keys(j.map).filter((c) => !known.has(c));
+    const st = j.stats;
+    state.f2pending = { map: j.map, own: j.own };
+    modalOpen('Прийняти відповідність', `<div class="pad">
+      <p>Кодів у таблиці: ${st.rows} · перевірено: ${st.checked} · уточнити: ${st.unsure} · поза 2/прод: ${st.skip} · без рядка: ${st.unbound}</p>
+      ${j.own.length ? `<p>Власні рядки: ${j.own.map((o) => `${o.row} «${esc(o.name)}»`).join(', ')}</p>` : ''}
+      ${unknown.length ? `<p>Кодів немає в програмі (лишаться без змін): ${esc(unknown.join(', '))}</p>` : ''}
+      <div class="set-form__acts"><button type="button" class="btn btn--primary" data-act="f2-map-apply">Прийняти</button></div></div>`,
+    'modal__box--form');
+  }
+  /** Дії екрана 2/Прод (кнопки несуть свої дані в data-атрибутах). */
+  function form2Action(act, d) {
+    switch (act) {
+      case 'f2-tab': state.f2tab = d.v; return render();
+      case 'f2-row': state.f2row = state.f2row === Number(d.row) ? null : Number(d.row); return render();
+      case 'f2-check': return form2Set(d.code, { checked: me.name || 'основний ПК', checkedOn: today(), skip: null });
+      case 'f2-skip': {
+        const why = prompt('Чому код поза 2/прод (наприклад, «3/прод», «господарчі»)?', 'поза 2/прод');
+        if (why && why.trim()) form2Set(d.code, { row: null, skip: why.trim(), checked: null, checkedOn: null });
+        return null;
+      }
+      case 'f2-package': return toExcel({ kind: 'form2', year: f2Year(), file: `2прод ${f2Year()}` });
+      case 'f2-note': return toExcel({ kind: 'form2note', year: f2Year(), word: true, file: `пояснювальна ${f2Year()}` });
+      case 'f2-submit':
+        if (!confirm(`Запам'ятати звіт ${f2Year()} як зданий? Графи 5–18 стануть основою гр.8 звіту ${f2Year() + 1}.`)) return null;
+        return flush().then(() => fetch('api/form2/submit', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ year: f2Year() }) })).then((r) => r.json()).then((j) => {
+          toast(`Звіт здано: ${cnt(j.rows || 0, 'клітинка', 'клітинки', 'клітинок')}`);
+          form2Load(f2Year());
+        }).catch((e) => toast(`Не вдалося: ${e.message || e}`, true));
+      case 'f2-submitted': return pickFile('.xlsx', form2Submitted);
+      case 'f2-map-read': return pickFile('.xlsx', form2MapRead);
+      case 'f2-map-apply': {
+        const pend = state.f2pending;
+        if (!pend) return null;
+        const known = new Set(items.map((i) => i.code));
+        store.form2Map = store.form2Map || {};
+        let n = 0;
+        for (const [code, e] of Object.entries(pend.map)) {
+          if (!known.has(code)) continue;
+          store.form2Map[code] = e;
+          n += 1;
+        }
+        const have = new Set((D.form2Rows || []).map((r) => r[0]).concat((store.form2Own || []).map((o) => o.row)));
+        store.form2Own = (store.form2Own || []).concat(pend.own.filter((o) => !have.has(o.row)));
+        logChange('відповідність 2/Прод', 'f2map', cnt(n, 'код', 'коди', 'кодів'));
+        state.f2pending = null;
+        save();
+        modalClose();
+        return form2Load(f2Year());
+      }
+      case 'f2-note-add': {
+        store.form2Notes = (store.form2Notes || []).concat([{ id: 'n' + Date.now().toString(36), year: f2Year(),
+          row: Number(d.row), col: Number(d.col), qty: Number(d.qty), reason: `розбіжність звіту ${f2Year() - 1} з обліком`,
+          no: '', date: '' }]);
+        save();
+        return form2Load(f2Year());
+      }
+      case 'f2-note-del':
+        store.form2Notes = (store.form2Notes || []).filter((n) => n.id !== d.id);
+        save();
+        return form2Load(f2Year());
+      case 'f2-party-all': {
+        store.parties = store.parties || {};
+        const all = new Map((D.parties || []).map(([n, k]) => [n, k]));
+        for (const [n, k] of Object.entries(store.parties)) all.set(n, k);
+        for (const [n, k] of all) if (k === 'інше' && partyGuess(n) !== 'інше') store.parties[n] = partyGuess(n);
+        save();
+        return form2Load(f2Year());
+      }
+      default: return null;
+    }
+  }
+
+  /** Заявка на посуд, миючі й серветки на 30 днів за нормами наказу МОУ №390: середні добові видачі
+   *  вписує людина, кількості й округлення до упаковки рахує програма, лист — у Word. */
+  const OP_REQUEST_NORMS = [['одноразовий посуд', 1, 1000, 'к-т'], ['рідкий миючий засіб', 0.0016, 5, 'кг'],
+    ['серветки паперові', 3, 1000, 'шт']];
+  function opRequestDialog() {
+    const last = (store.ui && store.ui.opRequest) || { perDay: '', to: '' };
+    modalOpen('Заявка на 30 днів', `<div class="pad"><div class="form__grid">
+      <div class="field"><label>Середні добові видачі, д/д</label><input data-opr="perDay" inputmode="decimal" value="${esc(last.perDay)}"></div>
+      <div class="field"><label>Днів</label><input data-opr="days" inputmode="numeric" value="30"></div>
+      <div class="field field--span2"><label>Кому</label><input data-opr="to" value="${esc(last.to)}" placeholder="Командиру …"></div></div>
+      <div id="opr-calc" style="margin-top:10px"></div>
+      <p class="set-note">Норми наказу МОУ №390: набір посуду на добову видачу (п.13), серветки — 3 шт на особу на добу
+        (Норма №1), рідкий миючий засіб — 0,16 кг на 100 осіб на добу з одноразовим посудом (Норма №13, прим. 3).</p>
+      <div class="set-form__acts"><button type="button" class="btn btn--primary" data-act="op-request-make">Скласти лист</button></div></div>`,
+    'modal__box--form');
+    const calc = () => {
+      const pd = Number(String(($('[data-opr="perDay"]') || {}).value || '').replace(',', '.')) || 0;
+      const days = Number(($('[data-opr="days"]') || {}).value) || 30;
+      $('#opr-calc').innerHTML = OP_REQUEST_NORMS.map(([n, per, step, u]) => {
+        const raw = pd * per * days;
+        return `<div class="f2-check">${n}: ${fmtNum(+raw.toFixed(2))} → <b>${fmtNum(Math.ceil(raw / step - 1e-9) * step)}</b> ${u}</div>`;
+      }).join('');
+    };
+    document.querySelectorAll('#modal [data-opr]').forEach((el) => el.addEventListener('input', calc));
+    calc();
+  }
+  function opRequestMake() {
+    const v = (k) => String(($(`[data-opr="${k}"]`) || {}).value || '').trim();
+    const perDay = Number(v('perDay').replace(',', '.'));
+    if (!(perDay > 0)) { toast('Вкажіть середні добові видачі.', true); return; }
+    store.ui = store.ui || {};
+    store.ui.opRequest = { perDay: v('perDay'), to: v('to') };
+    save();
+    toExcel({ kind: 'op_request', perDay, days: Number(v('days')) || 30, to: v('to'), date: today(), word: true,
+      file: 'Заявка ОП, МЗ, серветки' });
+    modalClose();
+  }
+
+  /** Звірка книги ОП зі звітом ФЕС «Залишки ТМЦ» (1С): розбіжності по кодах, партії, документи в
+   *  дорозі. Позиція ФЕС (код ФЕС + ціна) зіставляється з кодом книги один раз — відповідність
+   *  лишається в базі; так само місця ФЕС → підрозділи. Книга результату лягає в теку звірок. */
+  async function opFes(file) {
+    state.fesFile = file;
+    let j = {};
+    try {
+      await flush();
+      const r = await fetch(`api/op-fes?asOf=${state.asOf}`, { method: 'POST', body: file });
+      j = await r.json().catch(() => ({}));
+    } catch (e) { j = { problems: [String(e.message || e)] }; }
+    if (!j.ok) {
+      modalOpen('Звіт ФЕС не прочитано', `<div class="pad">${listHtml(j.problems || [j.error || 'помилка'])}</div>`, 'modal__box--form');
+      return;
+    }
+    if (j.download) {
+      const a = document.createElement('a');
+      a.href = j.download; a.download = '';
+      document.body.appendChild(a); a.click(); a.remove();
+    }
+    opFesDialog(j);
+  }
+  function opFesDialog(j) {
+    const opItems = items.filter((i) => bookOfItem(i) === 'ОП' && !i.archived);
+    const places = (store.fesPlaces && typeof store.fesPlaces === 'object') ? store.fesPlaces : {};
+    const um = j.unmapped.map((u) => `<div class="f2-check">${esc(u.code)} «${esc(u.name)}» · ${fmtMoney(u.price)} грн
+        <select data-fesmap="${esc(u.code)}|${Math.round(u.price * 100)}" aria-label="код книги"><option value="">—</option>
+          <option value="-">не з книги ОП</option>${opItems.map((i) => `<option value="${esc(i.code)}">${esc(i.code)} ${esc(i.name)} · ${fmtMoney(i.price)}</option>`).join('')}</select></div>`).join('');
+    const pl = (j.places || []).map((name) => `<div class="f2-check">${esc(name)}
+        <select data-fesplace="${esc(name)}" aria-label="підрозділ"><option value="">—</option>${subs.filter((sb) => sb.active).map((sb) =>
+          `<option${places[name] === sb.name ? ' selected' : ''}>${esc(sb.name)}</option>`).join('')}</select></div>`).join('');
+    const rows = j.rows.map((r) => `<div class="tbl__row"><div class="c-code">${esc(r.code)}</div><div class="c-name"><b>${esc(r.name)}</b></div>
+        <div class="c-num">${fmtNum(r.fes, '0')}</div><div class="c-num">${fmtNum(r.book, '0')}</div>
+        <div class="c-num${Math.abs(r.diff) > 1e-9 ? ' num-bad' : ''}">${fmtNum(r.diff, '0')}</div></div>`).join('');
+    const lots = j.batches.filter((b) => b.fes == null || b.book == null || Math.abs(b.fes - b.book) > 1e-9)
+      .map((b) => `<div class="f2-check">${esc(b.code)} · ${b.date ? fmtDate(b.date) : '—'} · ${esc(b.doc)} · ФЕС ${b.fes == null ? '—' : fmtNum(b.fes, '0')}
+        · облік ${b.book == null ? 'такого приходу немає' : fmtNum(b.book, '0')}</div>`).join('');
+    modalOpen(`Звірка ОП з ФЕС на ${fmtDate(j.as_of)}`, `<div class="pad">
+      <div class="card card--scroll"><div class="tbl" style="--tbl-min:560px"><div class="tbl__head">
+        <div class="tbl__h c-code">код</div><div class="tbl__h c-name">найменування</div><div class="tbl__h c-num">ФЕС</div>
+        <div class="tbl__h c-num">облік</div><div class="tbl__h c-num">різниця</div></div>${rows
+          || '<div class="tbl__row tbl__row--plain"><div class="c-txt">Позицій книги ОП у звіті ФЕС немає: зіставте їх нижче.</div></div>'}</div></div>
+      ${lots ? `<h4>Партії з розбіжністю</h4>${lots}` : ''}
+      ${j.pending.length ? `<h4>Не дійшли до ФЕС</h4>${j.pending.map((x) => `<div class="f2-check">№${esc(x.no)} від ${fmtDate(x.date)}
+        · ${esc(x.status)} · ${cnt(x.days, 'день', 'дні', 'днів')}</div>`).join('')}` : ''}
+      ${um ? `<h4>Позиції ФЕС без відповідності</h4>${um}` : ''}
+      ${pl ? `<h4>Місця ФЕС → підрозділи</h4>${pl}` : ''}
+      <p class="set-note">Книга результату: ${esc(j.path || '')}</p>
+      <div class="set-form__acts"><button type="button" class="btn btn--primary" data-act="fes-map-save">Зберегти відповідність і звірити знову</button></div>
+    </div>`, 'modal__box--form');
+  }
+  async function opFesSave() {
+    store.fesMap = Object.assign({}, store.fesMap || {});
+    document.querySelectorAll('#modal [data-fesmap]').forEach((el) => {
+      if (el.value) store.fesMap[el.dataset.fesmap] = el.value === '-' ? '' : el.value;
+    });
+    store.fesPlaces = Object.assign({}, store.fesPlaces || {});
+    document.querySelectorAll('#modal [data-fesplace]').forEach((el) => {
+      if (el.value) store.fesPlaces[el.dataset.fesplace] = el.value; else delete store.fesPlaces[el.dataset.fesplace];
+    });
+    logChange('звірка з ФЕС', 'fesmap', 'відповідність позицій і місць ФЕС');
+    save();
+    modalClose();
+    if (state.fesFile) await opFes(state.fesFile);
+  }
+
+  /** Теки ручного шляху (книга «Облік ОП», звіти, заявки, звірки з ФЕС): порожнє поле — типова
+   *  тека в «Дані обліку». Перелік тек дає сервер — інші розділи дописують туди свої. */
+  function foldersBody() {
+    if (!state.folders) {
+      if (!state.foldersLoading) {
+        state.foldersLoading = true;
+        fetch('api/folders').then((r) => r.json()).then((list) => { state.folders = list; })
+          .catch(() => { state.folders = []; })
+          .finally(() => { state.foldersLoading = false; if (state.view === 'settings') render(); });
+      }
+      return '<p class="set-note">Читаю теки…</p>';
+    }
+    return `<div class="set-form">${state.folders.map((f) => `<div class="field"><label>${esc(f.label)}</label>
+        <input data-folder="${esc(f.key)}" value="${esc(f.set ? f.path : '')}" placeholder="${esc(f.default)}"
+          title="Повний шлях до теки; порожньо — типова тека"></div>`).join('')}
+      <div class="set-form__acts"><button type="button" class="btn" data-act="folders-save">Зберегти теки</button></div></div>`;
+  }
+  async function foldersSave() {
+    const body = {};
+    document.querySelectorAll('[data-folder]').forEach((el) => { body[el.dataset.folder] = el.value.trim(); });
+    try {
+      const r = await fetch('api/folders', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body) });
+      if (!r.ok) throw new Error(await r.text());
+      state.folders = await r.json();
+      toast('Теки збережено.');
+      render();
+    } catch (e) { toast(`Теки не збережено: ${e.message || e}`, true); }
   }
 
   /** Робота в мережі — лише на основному ПК: увімкнути, код доступу, своє ім'я, порт. */

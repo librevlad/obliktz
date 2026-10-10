@@ -30,7 +30,7 @@ from db.sqlscript import statements          # noqa: E402
 EXTRACT = os.path.join(HERE, "data", "extract.json")
 SEEDS = ["subdivisions.sql", "unit.sql", "subdivision_titles.sql", "nomen_enrich.sql", "fes_codes.sql",
          "form21_lines.sql", "form21_map.sql", "form3_lines.sql", "form3_norms.sql",
-         "form2_lines.sql", "form2_sign.sql", "destroyed.sql", "instances.sql", "persons_2025-12-25.sql",
+         "destroyed.sql", "instances.sql", "persons_2025-12-25.sql",
          "people_2025-12-25.sql", "inventories_2022-2026.sql", "people_2026.sql"]
 
 OPENING_DATE = "2022-02-24"

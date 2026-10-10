@@ -8,37 +8,41 @@
 з формулами залишків і узагальнюючою відомістю для подальшого ведення.
 
 spec: {"year": 2025, "paper": true, "electronic": true, "pdf": false, "as_of": "2026-10-01",
-       "unit": "А0000"} — рік паперових книг; електронні будуються за рік `as_of`."""
+       "unit": "А0000", "book": "ТЗ"} — рік паперових книг; електронні будуються за рік `as_of`;
+`book` — книга обліку: «ТЗ» чи «ОП» (посуд одноразового використання, миючі засоби, серветки)."""
 import datetime
 import json
 import os
 
 from .data import Data
 from .electronic import electronic_year
-from .paper import export_pdf, paper_year
+from .paper import CFG, CFG_OP, export_pdf, paper_year
 
 FOLDER = "Книги обліку"
 
 
-def _refs_path(root, year):
-    return os.path.join(root, "journal_refs_%d.json" % year)
+def _refs_path(root, year, book="ТЗ"):
+    """Посилання на сторінки книг минулого року — свої в кожної книги обліку."""
+    return os.path.join(root, ("journal_refs_%d.json" % year) if book == "ТЗ" else ("journal_refs_%s_%d.json" % (book, year)))
 
 
 def save_journals(con, spec, folder):
     """Книги в теку «вивантаження/Книги обліку/<рік>/»; -> шлях книги № 47 (решта поруч)."""
     root = os.path.join(folder, FOLDER)
     os.makedirs(root, exist_ok=True)
-    D = Data(con, str(spec.get("unit") or "").strip())
+    book = "ОП" if spec.get("book") == "ОП" else "ТЗ"
+    cfg = CFG_OP if book == "ОП" else CFG
+    D = Data(con, str(spec.get("unit") or "").strip(), book)
     made = []
     year = int(spec.get("year") or 0)
     if spec.get("paper") and year:
         refs = {}
-        p = _refs_path(root, year - 1)
+        p = _refs_path(root, year - 1, book)
         if os.path.exists(p):
             with open(p, encoding="utf-8") as f:
                 refs = json.load(f)
-        books, refs_now = paper_year(D, year, os.path.join(root, str(year)), refs)
-        with open(_refs_path(root, year), "w", encoding="utf-8") as f:
+        books, refs_now = paper_year(D, year, os.path.join(root, str(year)), refs, cfg)
+        with open(_refs_path(root, year, book), "w", encoding="utf-8") as f:
             json.dump(refs_now, f, ensure_ascii=False, indent=1)
         made += [b[0] for b in books]
         if spec.get("pdf") and books:
@@ -46,11 +50,12 @@ def save_journals(con, spec, folder):
     if spec.get("electronic"):
         as_of = datetime.date.fromisoformat(str(spec.get("as_of") or datetime.date.today().isoformat())[:10])
         refs = {}
-        p = _refs_path(root, as_of.year - 1)
+        p = _refs_path(root, as_of.year - 1, book)
         if os.path.exists(p):
             with open(p, encoding="utf-8") as f:
                 refs = json.load(f)
-        books = electronic_year(D, as_of.year, as_of, os.path.join(root, "%d (електронні)" % as_of.year), refs)
+        books = electronic_year(D, as_of.year, as_of, os.path.join(root, "%d (електронні)" % as_of.year), refs,
+                                cfg if book == "ОП" else None)
         made += [b[0] for b in books]
     if not made:
         raise ValueError("за цей рік у книгах немає ні руху, ні залишків")

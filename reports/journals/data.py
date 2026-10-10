@@ -30,8 +30,11 @@ class Data:
     """Модель руху для книг: `items` {код: {code, name, unit, price, order}}, `events` за датою,
     `places` — підрозділи в порядку дерева, `warehouses` — ті, що тримають майно (не бригада)."""
 
-    def __init__(self, con, unit_name=""):
+    def __init__(self, con, unit_name="", book="ТЗ"):
+        """`book` — книга обліку: «ТЗ» (техзасоби) чи «ОП» (посуд одноразового використання,
+        миючі засоби, серветки); у книги лише позиції своїх груп і їхній рух."""
         self.unit = unit_name
+        self.book = book
         self.head = HEAD
         rows = con.execute("""
             SELECT s.name, s.sort, s.is_active, k.code AS kind, p.name AS parent
@@ -52,7 +55,8 @@ class Data:
         for i, r in enumerate(con.execute("""
             SELECT n.id, n.code, n.name, u.code AS unit, n.app_price_kop
               FROM nomen n JOIN uom u ON u.id = n.uom_id JOIN nomen_group g ON g.id = n.group_id
-             ORDER BY g.sort, n.code""")):
+             WHERE g.book = ?
+             ORDER BY g.sort, n.code""", (book,))):
             self.items[r["code"]] = dict(code=r["code"], name=r["name"], unit=r["unit"],
                                          price=price.get(r["id"], (r["app_price_kop"] or 0) / 100.0), order=i)
         ev = []
@@ -67,6 +71,8 @@ class Data:
               LEFT JOIN counterparty cp ON cp.id = d.counterparty_id
              WHERE k.affects_stock = 1 AND (d.from_subdivision_id IS NOT NULL OR d.to_subdivision_id IS NOT NULL)
              ORDER BY d.doc_date, d.id, l.line_no"""):
+            if r["code"] not in self.items:
+                continue                                  # рух позиції іншої книги
             frm, tos = r["frm"] or "", r["tos"] or ""
             if frm and tos:
                 kind, prt = "mv", ""

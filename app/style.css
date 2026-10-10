@@ -1252,3 +1252,19 @@ details.fold > summary .fold__hint { font: 400 11px var(--sans); color: var(--mu
 }
 .modal__body { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 0 0 12px; }
 .modal__body .panel { margin: 12px 16px; }
+
+/* Книга ОП і статус ФЕС: статус документа у ФЕС під станом у реєстрі; переліки змін і помилок
+   книги «Облік ОП» у вікнах перегляду. */
+.fes-mini { display: block; margin-top: 2px; font-size: 11px; color: var(--ink-3); white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; }
+.fes-panel { margin: 0; border-top: 0; }
+.fes-panel input { min-width: 160px; }
+.op-rows { margin: 4px 0 10px; padding-left: 20px; max-height: 240px; overflow: auto; }
+.op-rows li { margin: 2px 0; }
+.op-preview h4 { margin: 12px 0 4px; font-size: 13px; }
+/* 2/Прод: номер рядка й множник прив'язки, рядки перевірок і записок. */
+.inp-num { width: 72px; }
+.f2-check { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 4px 0;
+  font-size: 12.5px; border-bottom: 1px solid var(--bd); }
+.f2-check:last-child { border-bottom: 0; }
+.f2-check input { min-width: 90px; }
