@@ -1268,3 +1268,72 @@ details.fold > summary .fold__hint { font: 400 11px var(--sans); color: var(--mu
   font-size: 12.5px; border-bottom: 1px solid var(--bd); }
 .f2-check:last-child { border-bottom: 0; }
 .f2-check input { min-width: 90px; }
+/* «Справи»: у шапці вісім елементів, а назві екрана досить півтораста пікселів, — при 1366 px шапка лишається в один рядок. */
+.head__row:has([data-act="pur-book-export"]) .head__titles { flex-basis: 150px; }
+/* Картка закупівлі: одна колонка блоків під ширину 1366. */
+.pur-card { display: flex; flex-direction: column; gap: 12px; }
+/* Проміжок між блоками дає gap; картка файлів ще має власний відступ знизу (style у filesCard) — він зайвий. */
+.pur-card > .files { margin-bottom: 0 !important; }
+/* Так само плитки: власний відступ (.tiles) разом із проміжком картки дав би 24 px над наступним блоком. */
+.pur-card > .tiles { margin-bottom: 0; }
+/* Позиції пакета: графи кількості, ціни й суми вміщають суми до мільйонів, графа дій — слова «Виправити» й «Прибрати». */
+.pur-pos { --acts: 212px; }
+.pur-pos__n { width: 44px; }
+.pur-pos__name { flex: 2 1 220px; }
+.pur-pos__qty { width: 84px; }
+.pur-pos__kop { width: 132px; }
+.pur-pos__code { width: 96px; }
+/* Шапка блока «Позиції» — один рядок (кнопки не переносяться, поки вміщаються), «розраховано X із Y» — окремим рядком під нею. */
+.pur-pos-block .card__head { gap: 8px; }
+.pur-pos-sum { padding: 9px 18px; border-bottom: 1px solid var(--bd-2); font: 400 11.5px var(--mono); color: var(--mut-2);
+  font-variant-numeric: tabular-nums; }
+/* Вікно позиції: посилання й ціни — рядками «посилання | ціна», комерційні пропозиції — «постачальник | № | від | ціна» (ціни одна під
+   одною), підписи розділів — як підписи полів. Слово про помилку й кнопки лежать внизу вікна й не ховаються під прокруткою. */
+.pur-links { display: grid; grid-template-columns: 1fr 190px; gap: 8px 18px; }
+.pur-kps { display: grid; grid-template-columns: 1fr 100px 150px 190px; gap: 8px 18px; }
+.pos-foot { position: sticky; bottom: -12px; background: var(--card); border-top: 1px solid var(--bd-2); padding: 12px 0; z-index: 1; }
+/* Поле, на яке перейшли клавішею Tab (чи яке програма взяла у фокус через помилку), не лягає під липкий низ вікна: прокрутка лишає
+   над ним місце. Низ зі словом про помилку — 96 px (кнопки 58 px і рядок слова 38 px), без слова — 58 px; запас на сотню. */
+#modal .modal__body { scroll-padding-bottom: 100px; }
+.pur-links__h { font: 600 9px var(--mono); letter-spacing: .7px; color: var(--mut-2); text-transform: uppercase; }
+/* Картка рядка коштів: вісім-дев'ять показників — плитки по чотири в ряд; рух коштів — із широкою графою дій. */
+.bud-card .tiles { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+.bud-moves { --acts: 200px; }
+.pur-block .card__head { gap: 10px; flex-wrap: wrap; }
+.pur-block .tbl { --tbl-min: auto; }
+.pur-block select { max-width: 260px; }
+.pur-step { display: grid; grid-template-columns: 170px 1fr auto; gap: 6px 12px; align-items: center; padding: 10px 18px;
+  font: 400 12px var(--sans); color: var(--ink-3); }
+.pur-step + .pur-step { border-top: 1px solid var(--bd-2); }
+.pur-step__k { font-weight: 500; color: var(--ink-2); }
+/* Файли й слова рядка пакета: плитки в ряд (не на всю ширину), у вузькому вікні переносяться; кнопки — по праву руку. */
+.pur-files { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; min-width: 0; }
+.pur-step__acts { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+.pur-sg-tbl { border-top: 1px solid var(--bd-2); }
+/* Слово в блоці «Пакет», коли рядки коштів справи різних КПКВ чи фондів: папери беруть перший рядок. */
+.pur-warn { padding: 9px 18px; border-bottom: 1px solid var(--bd-2); background: rgba(176, 120, 30, .08);
+  font: 500 12px var(--sans); color: var(--warn); }
+/* Кнопка паперу, що складається («Складається…»): в блоці «Пакет», у шапці (акт введення) і у вікні (реєстр на ФЕС). */
+.pur-step .btn.is-busy, #head .btn.is-busy, #modal .btn.is-busy { opacity: .6; cursor: progress; }
+.pur-miss ul { font: 400 12.5px/1.45 var(--sans); color: var(--ink-2); }
+.pur-miss li { margin: 2px 0; }
+/* Блок «Договори»: стовпці суми, файлів і кнопок мають одну ширину в усіх рядках (відступ за глибиною забирає місце лише в назви),
+   довга назва файла обрізається, а кнопки переносяться, а не лізуть за край картки. */
+.pd-name { flex: 1 1 0; min-width: 0; }
+.pd-sum { width: 110px; }
+.pd-files { flex: 0 0 190px; overflow: hidden; }
+.pd-files .chip { display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pd-acts { flex: 0 0 380px; flex-wrap: wrap; row-gap: 4px; }
+/* Вікно документа закупівель: частки й рядки — розділами під полями, як блоки картки; рядок — найменування, код, од., к-сть, ціна. */
+.pd-sect { padding: 14px 18px 8px; border-bottom: 1px solid var(--bd-2); }
+.pd-sect__h { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+.pd-sect__h b { font: 600 13px var(--sans); color: var(--ink); }
+.pd-sect .form__grid { padding: 0; border: 0; }
+.pd-sect .set-note { margin: 10px 0 4px; }
+.pd-line { display: grid; grid-template-columns: minmax(0, 1fr) 104px 64px 88px 120px 84px; gap: 8px; align-items: center; margin-bottom: 8px; }
+.pd-line--head { margin-bottom: 4px; }
+/* Акт введення: підписи над графами позицій — один дрібний шрифт (клас графи, потрібний для ширини, міняв би його) і ті самі жолоби, що в
+   рядках, щоб підпис стояв над своїм полем. */
+.av-card .tbl__h { padding: 0 var(--gut) 9px; font: 600 9px var(--mono); }
+/* Поле закупівель, у якому не число (чи не обрано закупівлю): рамка червона, поки це не виправлять. */
+.pur-card input.is-bad, #pur-new input.is-bad, #modal input.is-bad, #modal select.is-bad { border-color: var(--bad); background: rgba(176, 58, 46, .06); }

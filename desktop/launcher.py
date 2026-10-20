@@ -15,6 +15,7 @@
 import sys, os, re, io, json, socket, sqlite3, threading, subprocess, tempfile, shutil, time
 import contextlib
 import gc
+import ntpath
 import traceback
 from collections import OrderedDict
 from urllib.parse import quote, unquote, parse_qs
@@ -36,6 +37,10 @@ MIME = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8",
 SCAN_EXT = {".pdf", ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff", ".webp", ".heic",
             ".doc", ".docx", ".xls", ".xlsx", ".odt", ".ods", ".rtf", ".txt", ".csv",
             ".zip", ".rar", ".7z", ".p7s", ".asice", ".asics", ".sig"}
+# Відмова на тип, якого не підшивають: той самий текст для завантаження й прив'язки; відкриття — свій.
+BAD_TYPE = "тип файла не підходить. Потрібні PDF, фото, документи Office, текст, архів або підписаний файл"
+BAD_OPEN = "з програми відкриваються лише PDF, фото, документи Office, текст, архіви й підписані файли"
+OFFICE_OWNER = "~$"                     # «~$Рапорт.docx»: Word і Excel кладуть його поруч із відкритим документом — не документ
 # Лише ці типи сторінка показує сама. Решту сервер віддає як «завантажити»,
 # а відкриває їх Windows відповідною програмою: файл, що прийшов звідкись,
 # не має виконуватися всередині програми обліку.
@@ -77,6 +82,9 @@ def thumbnail(full: str, width: int) -> bytes | None:
             _THUMBS.popitem(last=False)
     return data
 MAX_SCAN = 40 * 1024 * 1024
+MAX_JSON = 1024 * 1024                  # запит сторінки (JSON) не більший за мегабайт: файлів у ньому нема
+MAX_CHECK = 8 * 1024 * 1024             # перевірка зниклих файлів: тисячі шляхів при запуску, але не потоп
+RENAME_TRIES, RENAME_PAUSE = 10, 0.05   # скільки разів і через скільки секунд повторювати перейменування, яке не дається
 BAD_FILE_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]+')
 SCANS = "скани/"
 
@@ -128,6 +136,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import state_db                                       # noqa: E402
 import network                                        # noqa: E402
+import stable_hash                                    # noqa: E402
 from db.connect import (apply_migrations, checked_version, current_version,   # noqa: E402
                         APP_SCHEMA_VERSION, SchemaTooNewError, SchemaTooOldError)
 from build import export_app_data                     # noqa: E402
@@ -143,9 +152,10 @@ _NET = {"cfg": None, "data": None}
 GATE = network.Gate()
 LAST_WRITE = {"who": "", "at": ""}
 # Що можна зробити лише на самому основному ПК: відновити базу з копії чи файла, зберегти
-# копію діалогом Windows, відкрити файл чи теку програмою цього ПК, змінити налаштування мережі.
+# копію діалогом Windows, відкрити файл чи теку програмою цього ПК, змінити налаштування мережі,
+# шукати файли в теках служби за вмістом.
 HOST_ONLY = {"/api/restore", "/api/restore-file", "/api/copy", "/api/reveal", "/api/open", "/api/network",
-             "/api/folders"}
+             "/api/folders", "/api/files-find"}
 
 
 def net_cfg() -> dict:
@@ -505,6 +515,9 @@ FOLDERS = [
     ("reports", "Звіти", os.path.join("вивантаження", "Звіти")),
     ("requests", "Заявки", "вивантаження"),
     ("fes", "Звірки з ФЕС", "вивантаження"),
+    ("purchases", "Закупівлі", "Закупівлі"),
+    ("receipts", "Прибутково-видаткові документи", "Прибутково-видаткові документи"),
+    ("fesRegisters", "Реєстри на ФЕС", "Реєстри на ФЕС"),
 ]
 
 
@@ -980,8 +993,11 @@ class Handler(BaseHTTPRequestHandler):
             n = int(self.headers.get("Content-Length", 0) or 0)
         except ValueError:
             n = 0
-        if n > 0:
-            self.rfile.read(n)
+        while n > 0:                                  # частинами: завелике тіло не лягає в пам'ять цілим
+            block = self.rfile.read(min(n, 1 << 16))
+            if not block:
+                break
+            n -= len(block)
 
     def _admit(self, method):
         """Хто зробив запит. Вікно на самому основному ПК — без перепустки; з іншого ПК —
@@ -1076,9 +1092,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send_export(self, rel):
         """Вивантаження для браузера іншого ПК: файл із теки «вивантаження» на основному ПК."""
+        if _rooted(rel):
+            return self._send(404, b"not found")
         base = os.path.realpath(os.path.join(DATA, "вивантаження"))
         full = os.path.realpath(os.path.join(base, rel))
-        if not full.startswith(base + os.sep) or not os.path.isfile(full):
+        if not _inside(base, full) or not os.path.isfile(full):
             return self._send(404, b"not found")
         with open(full, "rb") as f:
             body = f.read()
@@ -1153,18 +1171,34 @@ class Handler(BaseHTTPRequestHandler):
         if path in ASSET_CACHE:
             ext = os.path.splitext(path)[1]
             return self._send(200, ASSET_CACHE[path], MIME.get(ext, "application/octet-stream"))
+        if path.startswith("теки/"):
+            # Файл із теки служби (закупівлі, прибутково-видаткові, реєстри на ФЕС): лише в її межах і лише того типу, що
+            # підшивається (SCAN_EXT; папери програми — .xlsx, .xls, .docx — серед них). У теці може лежати що завгодно —
+            # програма, покинутий .part: їх сторінка не показує й не віддає.
+            query = parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+            key, _, rel = path[len("теки/"):].partition("/")
+            full = folder_path(key, rel)
+            if not full:
+                return self._send(404, b"not found")
+            if os.path.splitext(full)[1].lower() not in SCAN_EXT:
+                return self._send(415, BAD_OPEN.encode("utf-8"))
+            return self._send_scan(rel, (query.get("w") or [""])[0], full=full)
+        if path == "api/folder-list":
+            query = parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+            return self._folder_list((query.get("key") or [""])[0], (query.get("path") or [""])[0])
         if path.startswith(SCANS):
             query = parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
             return self._send_scan(path[len(SCANS):], (query.get("w") or [""])[0])
         self._send(404, b"not found")
 
-    def _send_scan(self, rel, w=""):
+    def _send_scan(self, rel, w="", full=None):
         """Скан первинного документа з теки даних; `w` — мініатюра фото.
 
         Шлях складається лише з того, що записано в базі, але приходить він від
         сторінки, тому перевіряється ще раз: за межі теки сканів вийти не можна.
+        `full` — файл, уже знайдений у теці служби (`folder_path`), тоді `rel` не потрібен.
         """
-        full = scan_path(rel)
+        full = full or scan_path(rel)
         if not full:
             return self._send(404, b"not found")
         ext = os.path.splitext(full)[1].lower()
@@ -1185,12 +1219,44 @@ class Handler(BaseHTTPRequestHandler):
                    {"X-Content-Type-Options": "nosniff",
                     "Content-Disposition": "attachment; filename*=UTF-8''" + quote(name)})
 
-    def _scan_file(self):
-        """Файл із теки сканів за шляхом, що прийшов від сторінки, — або None,
-        якщо шлях виводить за межі теки чи файла немає."""
-        n = int(self.headers.get("Content-Length", 0))
-        spec = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
-        return scan_path(spec.get("path"))
+    def _folder_list(self, key, rel):
+        """Що лежить у підтеці теки з налаштувань: для прив'язки файлів, покладених руками. Файли «~$…», які Word і Excel
+        кладуть поруч із відкритим документом (хто його тримає), — не документи: їх у переліку немає."""
+        root = folders().get(key)
+        if not root:
+            return self._send(404, "немає такої теки".encode("utf-8"))
+        if _rooted(rel):
+            return self._send(404, b"not found")
+        base = os.path.realpath(root)
+        here = os.path.realpath(os.path.join(base, rel or ""))
+        if here != base and not _inside(base, here):
+            return self._send(404, b"not found")
+        dirs, files = [], []
+        if os.path.isdir(here):
+            try:
+                names = sorted(os.listdir(here), key=str.lower)
+            except OSError:
+                return self._send(403, "немає доступу до теки".encode("utf-8"))
+            for name in names:
+                full = os.path.join(here, name)
+                if os.path.isdir(full):
+                    dirs.append(name)
+                elif os.path.splitext(name)[1].lower() in SCAN_EXT and not name.startswith(OFFICE_OWNER):
+                    try:
+                        st = os.stat(full)
+                    except OSError:
+                        continue                   # зник, поки йшов перелік: Провідник, синхронізація диска
+                    files.append({"name": name, "size": st.st_size,
+                                  "mtime": time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime))})
+        body = json.dumps({"ok": True, "dirs": dirs, "files": files}, ensure_ascii=False).encode("utf-8")
+        return self._send(200, body, MIME[".json"])
+
+    def _scan_file(self, spec):
+        """Файл із теки сканів за шляхом із запиту (`spec` — розібраний об'єкт), — або None, якщо шлях
+        виводить за межі теки чи файла немає. З ключем теки служби (`folder`) — файл у ній. Друге
+        значення — ключ теки служби (порожній — «Дані обліку/скани»): відмова називає ту теку, де шукали."""
+        key = str(spec.get("folder") or "")
+        return (folder_path(key, spec.get("path")) if key else scan_path(spec.get("path"))), key
 
     def _restore_backup(self):
         n = int(self.headers.get("Content-Length", 0))
@@ -1474,16 +1540,250 @@ class Handler(BaseHTTPRequestHandler):
         body = {"ok": True, "diff": plan, "backup": os.path.basename(backup), "report": model.get("report", [])}
         return self._send(200, json.dumps(body, ensure_ascii=False).encode("utf-8"), MIME[".json"])
 
+    def _pur_unit(self, con):
+        """Реквізити частини для бланків — ті, що вписано в «Люди й МВО → Частина». Усе — текст: порожнє значення (null) бланк
+        не друкує як «None»."""
+        row = con.execute("SELECT value FROM app_setting WHERE key = 'unit'").fetchone()
+        try:
+            u = json.loads(row[0]) if row and row[0] else {}
+        except ValueError:
+            u = {}
+        if not isinstance(u, dict):
+            u = {}
+        text = lambda key: str(u.get(key) or "")                 # noqa: E731
+        name = text("legalName")
+        m = re.search(r"частина\s+(\S+)", name, re.I)
+        return {"name": name, "code": m.group(1) if m else "", "edrpou": text("edrpou"), "fundCode": text("fundCode"),
+                "service": text("serviceFull"), "place": text("place"), "upperHq": text("upperHq"), "phone": text("phone")}
+
+    def _pur_export(self):
+        """Книга «Закупівлі» — у теку закупівель, цілою або ніяк: пишеться поруч і стає на місце одним кроком. Порожні бланки
+        — поруч, окремим кроком: збій бланка книги не псує. Книгу, яку програма сама записала чи прийняла (її відбиток байтів
+        або вмісту запам'ятано: purchases_book.own_book — вміст пізнає її й після «Зберегти» в Excel), перезаписує без звірки,
+        хоч би база за цей час і змінилась; іншу — лише коли в ній нема внесеного руками, чого немає в програмі (інакше 409:
+        спершу «Прийняти книгу…»). Книга, що назад не читається, — 409 «не читається» з переліком рядків (прийом її не виправить).
+        У відповіді 200 може бути `readBack`: що не так із щойно записаною книгою (вона все одно на місці)."""
+        import purchase_papers                                   # noqa: PLC0415
+        import purchases_book                                    # noqa: PLC0415
+        with STATE_LOCK:
+            try:
+                con = db()
+            except StateBroken as e:
+                return self._send(500, str(e).encode("utf-8"))
+            roots = folders()
+            path = os.path.join(roots["purchases"], "Закупівлі.xlsx")
+            if os.path.exists(path):
+                try:
+                    own, model = purchases_book.own_book(con, path)      # своя — за байтами, а після Excel — за вмістом
+                except purchases_book.BookError as e:    # назад не читається: «Прийняти книгу…» цього не виправить
+                    body = {"error": "книга «Закупівлі.xlsx» не читається: виправте рядки з переліку (або приберіть файл) "
+                                     "і вивантажте знову", "rows": e.problems[:50]}
+                    return self._send(409, json.dumps(body, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+                except OSError:                      # файл тримає Excel чи він не читається: не «внесене руками»
+                    body = {"error": "книга «Закупівлі.xlsx» зайнята або не читається: закрийте її в Excel і вивантажте знову"}
+                    return self._send(409, json.dumps(body, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+                except Exception as e:               # noqa: BLE001 — несподіване: книгу не перезаписуємо, а відповідаємо
+                    traceback.print_exc()
+                    return self._send(500, f"{type(e).__name__}: {e}".encode("utf-8"))
+                extra = []
+                if not own:
+                    try:
+                        plan = purchases_book.diff(con, model)           # читається, але база її не прийме — те саме «руками»
+                        extra = [k for name, res in plan.items() if name != "same" for k in res["new"] + res["changed"]]
+                    except purchases_book.BookError as e:
+                        extra = e.problems
+                    except Exception as e:           # noqa: BLE001 — несподіване: книгу не перезаписуємо, а відповідаємо
+                        traceback.print_exc()
+                        return self._send(500, f"{type(e).__name__}: {e}".encode("utf-8"))
+                if extra:
+                    body = {"error": "у книзі є внесене руками, чого немає в програмі: спершу «Прийняти книгу…»",
+                            "rows": extra[:50]}
+                    return self._send(409, json.dumps(body, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+            try:
+                got = purchases_book.export_book(con, path)
+            except purchase_papers.PaperConflict:
+                body = {"error": "книга «Закупівлі.xlsx» відкрита в Excel: закрийте її й вивантажте знову"}
+                return self._send(409, json.dumps(body, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+            except OSError as e:                     # теку не створити, диск повний: відповідь, а не обрив зв'язку
+                return self._send(500, str(e).encode("utf-8"))
+            except Exception as e:                   # noqa: BLE001 — несподіване
+                traceback.print_exc()
+                return self._send(500, f"{type(e).__name__}: {e}".encode("utf-8"))
+            try:
+                unit = self._pur_unit(con)
+            except Exception:                        # noqa: BLE001 — реквізитів нема: бланки без них не складаємо
+                traceback.print_exc()
+                unit = None
+        if unit is None:
+            got["blanksError"] = "не вдалося прочитати реквізити частини, бланки не складено"
+        else:
+            try:                                     # бланки — побічний продукт: книга вже на місці, що б із ними не сталось
+                purchase_papers.save_blanks(roots, unit)
+            except Exception as e:                   # noqa: BLE001 — PaperConflict, ValueError, OSError, AttributeError…
+                if not isinstance(e, (purchase_papers.PaperConflict, ValueError, OSError, AttributeError)):
+                    traceback.print_exc()
+                got["blanksError"] = (str(e) or type(e).__name__)[:200]
+        got["ok"] = True
+        if self.remote:
+            try:
+                got.update(remote_any(path))
+            except OSError as e:
+                return self._send(500, str(e).encode("utf-8"))
+        return self._send(200, json.dumps(got, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+
+    def _pur_upload_dir(self, create=True):
+        d = os.path.join(DATA, "вивантаження", ".прийом книги закупівель")
+        if create:
+            os.makedirs(d, exist_ok=True)
+        return d
+
+    def _pur_prune_uploads(self, days=1):
+        """Файли перегляду, що не дочекались «Прийняти» понад добу, — геть (за кожного нового перегляду)."""
+        old = time.time() - days * 86400
+        with contextlib.suppress(OSError):
+            for entry in os.scandir(self._pur_upload_dir(create=False)):
+                with contextlib.suppress(OSError):
+                    if entry.is_file() and entry.stat().st_mtime < old:
+                        os.remove(entry.path)
+
+    def _pur_preview(self):
+        """Перегляд відмінностей книги від бази; файл лежить до «Прийняти» під своїм sha, а поруч (<sha>.json) — відмінності,
+        які людина побачила: «Прийняти все» звіряє з ними те, що прийом зробив би тепер (`_pur_apply`). Sha — від вмісту файла
+        й показаних відмінностей разом: два вікна, що переглянули той самий файл до й після чужого запису, мають кожне своє."""
+        import hashlib                                           # noqa: PLC0415
+        import purchases_book                                    # noqa: PLC0415
+        self._pur_prune_uploads()
+        try:
+            n = int(self.headers.get("Content-Length", 0) or 0)
+        except ValueError:
+            n = 0
+        if n <= 0 or n > MAX_RESTORE:
+            self._drain()
+            return self._send(413, "файл порожній або завеликий".encode("utf-8"))
+        data = self.rfile.read(n)
+        if len(data) != n:                                       # обрив зв'язку: з половини книги нічого не читаємо й не пишемо
+            return self._send(400, "файл прийшов не повністю".encode("utf-8"))
+        try:
+            model = purchases_book.read_book(data)
+            with STATE_LOCK:
+                plan = purchases_book.diff(db(), model)        # проганяє прийом начисто й відкочує: база не змінюється
+        except purchases_book.BookError as e:
+            body = {"error": "книга не приймається", "problems": e.problems[:200]}
+            return self._send(422, json.dumps(body, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+        except Exception as e:                       # noqa: BLE001 — несподіване: відповідь, а не обрив зв'язку
+            traceback.print_exc()
+            return self._send(500, f"{type(e).__name__}: {e}".encode("utf-8"))
+        seen = _plan_text(plan)
+        sha = hashlib.sha256(data + b"\0" + seen.encode("utf-8")).hexdigest()
+        stored = []
+        try:
+            folder = self._pur_upload_dir()
+            for name, content in ((sha + ".json", seen.encode("utf-8")), (sha + ".xlsx", data)):
+                stored.append(os.path.join(folder, name))
+                with open(stored[-1], "wb") as f:
+                    f.write(content)
+        except OSError as e:                         # диск повний чи тека недоступна: відповідь, а не обрив зв'язку
+            for path in stored:                      # без пари файлів прийняти нічого: половину не лишаємо
+                with contextlib.suppress(OSError):
+                    os.remove(path)
+            return self._send(500, f"книгу не вдалося зберегти для прийому: {e}".encode("utf-8"))
+        body = {"ok": True, "sha": sha, "diff": plan}
+        return self._send(200, json.dumps(body, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+
+    def _pur_apply(self):
+        """Прийняти книгу: копія «перед прийомом книги закупівель», тоді закупівлі в базі — як у файлі. Усе або нічого.
+
+        Книга лягає на базу, якою та стала після перегляду: інше вікно могло за цей час додати закупівлю, і прийом мовчки
+        прибрав би її. Тож під тим самим замком, що й прийом, відмінності рахуються знову: не ті, що людина бачила при перегляді
+        (<sha>.json), — 409 з новими відмінностями, і нічого не змінено (ні копії, ні прийому)."""
+        import purchases_book                                    # noqa: PLC0415
+        req = self._json_body()
+        if req is None:
+            return                                 # завелике тіло: відповідь 413 уже надіслано
+        sha = re.sub(r"[^0-9a-f]", "", str(req.get("sha") or ""))
+        folder = self._pur_upload_dir(create=False)
+        path, seen_path = os.path.join(folder, sha + ".xlsx"), os.path.join(folder, sha + ".json")
+        seen = None
+        if sha and os.path.exists(path):
+            try:
+                with open(seen_path, encoding="utf-8") as f:
+                    seen = _plan_text(json.loads(f.read()))
+            except (OSError, ValueError):            # немає того, що бачили при перегляді, — звіряти нема з чим
+                seen = None
+        if seen is None:
+            return self._send(400, "оберіть книгу ще раз: перегляд застарів".encode("utf-8"))
+        stale = None
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+            model = purchases_book.read_book(data)
+            with STATE_LOCK:
+                con = db()
+                now = purchases_book.diff(con, model)            # той самий прийом начисто й відкат: чим база стала тепер
+                if _plan_text(now) != seen:
+                    stale = now
+                else:
+                    backup = named_backup(con, "перед прийомом книги закупівель")
+                    plan = purchases_book.apply(con, model)
+                    with contextlib.suppress(sqlite3.Error):     # прийняту книгу далі вважаємо своєю: вона вся в базі
+                        purchases_book.remember_sha(con, stable_hash.stable_sha_bytes(data),
+                                                    purchases_book.fingerprint(model))
+                    bump_state_version()
+                    LAST_WRITE.update(who=self.who, at=time.strftime("%H:%M"))
+        except (purchases_book.BookError, state_db.SaveError) as e:
+            problems = e.problems if isinstance(e, purchases_book.BookError) else [str(e)]
+            body = {"error": "книгу не прийнято", "problems": problems[:200]}
+            return self._send(422, json.dumps(body, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+        except Exception as e:                       # noqa: BLE001 — несподіване: відповідь, а не обрив зв'язку
+            traceback.print_exc()
+            return self._send(500, f"{type(e).__name__}: {e}".encode("utf-8"))
+        if stale is not None:
+            body = {"error": "З часу перегляду закупівлі змінились. Перегляньте книгу ще раз.", "diff": stale}
+            return self._send(409, json.dumps(body, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+        for done in (path, seen_path):
+            with contextlib.suppress(OSError):
+                os.remove(done)
+        body = {"ok": True, "diff": plan, "backup": os.path.basename(backup)}
+        return self._send(200, json.dumps(body, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+
     def _open_scan(self, reveal=False):
-        """Відкрити файл програмою Windows або показати його в теці."""
-        full = self._scan_file()
+        """Відкрити файл програмою Windows або показати його в теці. Відкривається лише те, що можна
+        підшити (SCAN_EXT): у теці служби може лежати що завгодно, а відкриття запускає файл.
+
+        «Показати в теці» показує й каталог: теку справи відкривають саму, а не за її першим файлом. Шлях — усередині кореня теки
+        (ті самі перевірки, що й для файла: угору, диск, мережеве ім'я й посилання — відмова). У теці служби (з ключем) каталог за
+        проханням `make` створюється, якщо його ще немає, — і показується; у «Дані обліку/скани» нічого не створюється. Створення
+        не залежить від OBLIK_NO_OPEN: той лише не дає Провіднику відкритися."""
+        try:
+            n = max(0, int(self.headers.get("Content-Length", 0)))
+            spec = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
+        except (ValueError, RecursionError):                      # RecursionError: тисячі вкладених дужок
+            spec = None
+        if not isinstance(spec, dict):
+            return self._send(400, "запит має бути об'єктом JSON зі шляхом до файла".encode("utf-8"))
+        full, key = self._scan_file(spec)
+        is_dir = False
+        if not full and reveal:
+            root = folders().get(key) if key else os.path.join(DATA, "скани")
+            if root:
+                try:
+                    full = dir_path(spec.get("path"), root, make=bool(key and spec.get("make")))
+                except OSError as e:
+                    return self._send(500, f"теку не створено: {e}".encode("utf-8"))
+                is_dir = bool(full)
         if not full:
-            return self._send(404, "файла немає в теці «Дані обліку/скани»".encode("utf-8"))
+            where = next((label for k, label, _ in FOLDERS if k == key), key) if key else "Дані обліку/скани"
+            return self._send(404, f"файла немає в теці «{where}»".encode("utf-8"))
+        if not reveal and os.path.splitext(full)[1].lower() not in SCAN_EXT:
+            return self._send(415, BAD_OPEN.encode("utf-8"))
         ok = False
         if not os.environ.get("OBLIK_NO_OPEN") and sys.platform.startswith("win"):
             try:
-                if reveal:
-                    subprocess.Popen(["explorer", "/select,", full])   # noqa: S603, S607
+                # Провідник ділить свій командний рядок за комами, а список аргументів лапкує лише шлях із пробілом: «Каструлі,ін»
+                # без пробіла відкрився б не там. Каталог відкриває `os.startfile` (командного рядка немає), файл Провідник
+                # виділяє командою одним рядком із лапками, які ставимо самі.
+                if reveal and not is_dir:
+                    subprocess.Popen(f'explorer /select,"{full}"')     # noqa: S603, S607
                 else:
                     os.startfile(full)                                 # noqa: S606
                 ok = True
@@ -1498,9 +1798,16 @@ class Handler(BaseHTTPRequestHandler):
         передала підпис, як-от «відомість №3 склад»), а сторінці повертається
         шлях для посилання. Фото майна й документи інвентаризації сторінка кладе
         у свою підтеку (X-Folder: «майно/10101», «інвентаризації/2026-12-25»).
-        Наявний файл не перезаписується — до імені додається «(2)»."""
+        Наявний файл (чи каталог) з таким іменем не чіпається — до імені додається «(2)». Під справжнім
+        іменем файл з'являється лише цілим; обірване завантаження (тіла менше за заявлене) не пишеться.
+        Перейменування, якому на мить заважає антивірус чи індексатор, повторюється (RENAME_TRIES разів).
+
+        З X-Folder-Key (ключ із FOLDERS) файл лягає в теку служби з налаштувань: у підтеку
+        X-Folder (до чотирьох рівнів; без неї — у саму теку) під ім'ям X-Name, якщо воно дане.
+        Відповідь повертає ще й теку та відбиток вмісту (sha): за ним файл знаходять після перекладки."""
         n = int(self.headers.get("Content-Length", 0))
         if n <= 0 or n > MAX_SCAN:
+            self._drain()
             return self._send(413, "файл порожній або завеликий (понад 40 МБ)".encode("utf-8"))
         name = unquote(self.headers.get("X-File-Name", "") or "скан")
         date = (self.headers.get("X-Doc-Date", "") or "")[:10]
@@ -1512,28 +1819,169 @@ class Handler(BaseHTTPRequestHandler):
         # непрочитаного запиту Windows обриває, і сторінка бачила «зв'язок
         # розірвано» замість пояснення.
         body = self.rfile.read(n)
+        if len(body) != n:
+            # Браузер обірвав завантаження: обрізаний файл не зберігається.
+            return self._send(400, "файл надійшов не повністю: завантаження перервано".encode("utf-8"))
         if ext not in SCAN_EXT:
-            return self._send(415, ("тип файла не підходить. Потрібні PDF, фото, документи "
-                                    "Office, текст, архів або підписаний файл").encode("utf-8"))
+            return self._send(415, BAD_TYPE.encode("utf-8"))
         year = date[:4] if re.match(r"\d{4}-\d{2}-\d{2}$", date) else time.strftime("%Y")
-        # Підтека — лише зі звичайних імен: без «..», без дисків, не глибше трьох рівнів.
+        key = unquote(self.headers.get("X-Folder-Key", "") or "").strip()
+        root = folders().get(key) if key else os.path.join(DATA, "скани")
+        if key and not root:
+            return self._send(400, f"невідома тека «{key}»".encode("utf-8"))
+        # Підтека — лише зі звичайних імен: без «..», без дисків, не глибше трьох рівнів
+        # (у теці служби — чотирьох).
         parts = [BAD_FILE_CHARS.sub("-", p).strip(" .")
                  for p in unquote(self.headers.get("X-Folder", "") or "").replace("\\", "/").split("/")]
-        parts = [p[:60] for p in parts if p][:3]
-        folder = os.path.join(DATA, "скани", *(parts or [year]))
+        parts = [p[:80] for p in parts if p][:4 if key else 3]
+        folder = os.path.join(root, *(parts or ([] if key else [year])))
         os.makedirs(folder, exist_ok=True)
-        base = BAD_FILE_CHARS.sub("-", " ".join(x for x in (date, label, stem.strip()) if x))[:120].strip(" .") or "скан"
-        target, k = os.path.join(folder, base + ext), 2
-        while os.path.exists(target):
-            target = os.path.join(folder, f"{base} ({k}){ext}")
-            k += 1
-        tmp = target + ".part"
-        with open(tmp, "wb") as f:
-            f.write(body)
-        os.replace(tmp, target)
-        rel = os.path.relpath(target, os.path.join(DATA, "скани")).replace(os.sep, "/")
-        answer = {"ok": True, "path": rel, "file": os.path.basename(target), "size": n}
+        named = BAD_FILE_CHARS.sub("-", unquote(self.headers.get("X-Name", "") or "")).strip(" .")[:150]
+        base = named or BAD_FILE_CHARS.sub("-", " ".join(x for x in (date, label, stem.strip()) if x))[:120].strip(" .") or "скан"
+        # Файл пишеться під тимчасовим іменем і стає під справжнє лише цілим: поки він пишеться, перелік і
+        # прив'язка його не бачать, а збій чи обрив лишає тимчасовий файл, який прибирається, а не обрізаний
+        # документ. Ім'я займає саме перейменування: у Windows воно не замінює ні файл, ні каталог, тож два
+        # вікна, що зберігають один документ разом, не перезапишуть одне одного — другому дістанеться «(2)».
+        part = None
+        try:
+            fd, part = tempfile.mkstemp(dir=folder, suffix=".part")
+            with os.fdopen(fd, "wb") as f:
+                f.write(body)
+            target, k, held = os.path.join(folder, base + ext), 2, 0
+            while True:
+                try:
+                    os.rename(part, target)
+                    break
+                except FileExistsError:
+                    target = os.path.join(folder, f"{base} ({k}){ext}")
+                    k += 1
+                except PermissionError:
+                    # Щойно записаний файл на мить може тримати антивірус чи індексатор Windows: ім'я тут ні до чого,
+                    # тож те саме перейменування повторюється, а не береться наступне ім'я.
+                    held += 1
+                    if held >= RENAME_TRIES:
+                        raise
+                    time.sleep(RENAME_PAUSE)
+            part = None
+        except BaseException:
+            if part:
+                with contextlib.suppress(OSError):
+                    os.remove(part)
+            raise
+        rel = os.path.relpath(target, root).replace(os.sep, "/")
+        answer = {"ok": True, "folder": key, "path": rel, "file": os.path.basename(target), "size": len(body),
+                  "sha": stable_hash.stable_sha_bytes(body)}
         self._send(200, json.dumps(answer, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+
+    def _json_body(self, limit=MAX_JSON):
+        """Тіло запиту — об'єкт JSON; усе інше (порожнє, зіпсоване, не об'єкт) дає порожній об'єкт.
+        None — тіло понад `limit`: його вичитано й відкинуто, а відповідь 413 уже надіслано."""
+        try:
+            n = int(self.headers.get("Content-Length", 0) or 0)
+        except ValueError:
+            n = 0
+        if n > limit:
+            self._drain()
+            self._send(413, "запит завеликий".encode("utf-8"))
+            return None
+        try:
+            got = json.loads(self.rfile.read(n).decode("utf-8") or "{}") if n > 0 else {}
+        except (ValueError, RecursionError):                      # RecursionError: тисячі вкладених дужок
+            return {}
+        return got if isinstance(got, dict) else {}
+
+    def _folder_link(self, req):
+        """Файл, покладений у теку служби руками: його розмір, відбиток і тип — для запису про нього.
+        Прив'язується лише те, що й завантажується (SCAN_EXT)."""
+        full = folder_path(req.get("folder"), req.get("path"))
+        if not full:
+            return self._send(404, "файла в теці немає".encode("utf-8"))
+        ext = os.path.splitext(full)[1].lower()
+        if ext not in SCAN_EXT:
+            return self._send(415, BAD_TYPE.encode("utf-8"))
+        try:
+            body = {"ok": True, "file": os.path.basename(full), "size": os.path.getsize(full),
+                    "sha": file_sha(full), "mime": MIME.get(ext, "application/octet-stream")}
+        except OSError as e:                       # файл зайнятий іншою програмою чи недоступний
+            return self._send(500, str(e).encode("utf-8"))
+        return self._send(200, json.dumps(body, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+
+    def _files_find(self, req):
+        """Зниклі файли — за відбитком у межах своєї теки (після перекладки тек). Запис знаходить файл, чий стабільний або
+        звичайний відбиток збігається з його `sha`: нові записи тримають стабільний (`stable_hash`), старі — звичайний SHA-256.
+
+        Файли за посиланням (junction) на каталог поза текою не беруться: сервер їх усе одно не віддає.
+        Знаходяться лише файли тих типів, що підшиваються (SCAN_EXT): покинутий тимчасовий .part документом не є, як і «~$…»,
+        що Office кладе поруч із відкритим документом."""
+        roots = folders()
+        asked = req.get("files")
+        want = [f for f in (asked if isinstance(asked, list) else []) if isinstance(f, dict)
+                and isinstance(f.get("folder"), str) and f["folder"] in roots
+                and isinstance(f.get("path"), str) and isinstance(f.get("sha"), str) and f["sha"]
+                and not folder_path(f["folder"], f["path"])]
+        found = []
+        for key in sorted({f["folder"] for f in want}):
+            root = roots[key]
+            if not os.path.isdir(root):
+                continue
+            base = os.path.realpath(root)
+            mine = [f for f in want if f["folder"] == key]
+            sizes = {f["size"] if isinstance(f.get("size"), int) else -1 for f in mine}
+            for dp, dirs, fs in os.walk(root):
+                # За посиланням чи з'єднанням (junction) на каталог не йдемо: на місце поза текою — бо звідти
+                # файли не віддаються, а на предка чи на саму теку — бо обхід ходив би колом.
+                dirs[:] = [d for d in dirs if not _is_link(os.path.join(dp, d))
+                           and _inside(base, os.path.realpath(os.path.join(dp, d)))]
+                for name in fs:
+                    if os.path.splitext(name)[1].lower() not in SCAN_EXT or name.startswith(OFFICE_OWNER):
+                        continue                   # лише документи: покинутий tmp….part чи «~$…» Office може збігтися за вмістом
+                    full = os.path.join(dp, name)
+                    try:
+                        if -1 not in sizes and os.path.getsize(full) not in sizes:
+                            continue
+                        if not _inside(base, os.path.realpath(full)):
+                            continue
+                        shas = stable_hash.shas(full)
+                    except OSError:
+                        continue
+                    for f in mine:
+                        if f["sha"] in shas and not any(x["folder"] == key and x["was"] == f["path"] for x in found):
+                            found.append({"folder": key, "was": f["path"],
+                                          "path": os.path.relpath(full, root).replace(os.sep, "/")})
+        return self._send(200, json.dumps({"found": found}, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+
+    def _pur_paper(self):
+        """Папір закупівлі — у теку з налаштувань; на іншому ПК — завантаженням. Відбиток у відповіді — остаточний: імена
+        Excel книга отримує ще до того, як стане під своє ім'я (purchase_papers), тож маршрут нічого не перераховує."""
+        import purchase_papers                                   # noqa: PLC0415
+        spec = self._json_body()
+        if spec is None:
+            return                                 # завелике тіло: відповідь 413 уже надіслано
+        try:
+            got = purchase_papers.save(spec, folders())
+        except purchase_papers.PaperConflict as e:
+            body = {"error": str(e), "changed": e.changed, "busy": e.busy}
+            return self._send(409, json.dumps(body, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+        except (ValueError, KeyError, TypeError, AttributeError) as e:       # AttributeError: `unit` не об'єкт тощо
+            return self._send(422, json.dumps({"error": str(e)}, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+        except OSError as e:                       # теку не створити, диск повний: відповідь, а не обрив зв'язку
+            return self._send(500, str(e).encode("utf-8"))
+        except Exception as e:                     # noqa: BLE001 — несподіване
+            traceback.print_exc()
+            return self._send(500, f"{type(e).__name__}: {e}".encode("utf-8"))
+        full = folder_path(got["folder"], got["path"])
+        if not full:
+            return self._send(500, "папір записано, але файла в теці не знайдено".encode("utf-8"))
+        if self.remote:
+            # Лише посилання на завантаження: `path` лишається відносним до теки, за ним сторінка знаходить файл
+            # (remote_any повертає ще й шлях копії на основному ПК, який запис про файл зіпсував би).
+            try:
+                got["download"] = remote_any(full)["download"]
+            except OSError as e:
+                return self._send(500, str(e).encode("utf-8"))
+        got["ok"] = True
+        got["opened"] = False if self.remote else (open_file(full) if spec.get("open", True) else False)
+        return self._send(200, json.dumps(got, ensure_ascii=False).encode("utf-8"), MIME[".json"])
 
     def _ui_key(self):
         """Налаштування вікна (оформлення, чернетки) — свої в кожної людини."""
@@ -1577,11 +2025,16 @@ class Handler(BaseHTTPRequestHandler):
         if route == "/api/scan-check":
             # Сторінка питає, чи всі підшиті файли справді лежать у теці:
             # запис у базі є, а файл могли не скопіювати разом із текою даних.
-            n = int(self.headers.get("Content-Length", 0))
-            spec = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
-            paths = [str(x) for x in (spec.get("paths") or [])][:5000]
+            spec = self._json_body(MAX_CHECK)
+            if spec is None:
+                return                             # завелике тіло: відповідь 413 уже надіслано
+            listed = spec.get("paths")
+            paths = [str(x) for x in (listed if isinstance(listed, list) else [])][:5000]
+            asked = spec.get("files")
+            files = [f for f in (asked if isinstance(asked, list) else []) if isinstance(f, dict)][:5000]
             missing = [p for p in paths if not scan_path(p)]
-            body = json.dumps({"missing": missing}, ensure_ascii=False).encode("utf-8")
+            missing_files = [f for f in files if not folder_path(f.get("folder"), f.get("path"))]
+            body = json.dumps({"missing": missing, "missingFiles": missing_files}, ensure_ascii=False).encode("utf-8")
             return self._send(200, body, MIME[".json"])
         if route == "/api/mtz-read":
             try:
@@ -1615,11 +2068,25 @@ class Handler(BaseHTTPRequestHandler):
             return self._op_preview()
         if route == "/api/op-book/apply":
             return self._op_apply()
+        if route == "/api/pur-book/export":
+            self._drain()
+            return self._pur_export()
+        if route == "/api/pur-book/preview":
+            return self._pur_preview()
+        if route == "/api/pur-book/apply":
+            return self._pur_apply()
         if route == "/api/history-read":
             try:
                 return self._read_history()
             except (OSError, ValueError) as e:
                 return self._send(400, str(e).encode("utf-8"))
+        if route in ("/api/folder-link", "/api/files-find"):
+            req = self._json_body()
+            if req is None:
+                return                             # завелике тіло: відповідь 413 уже надіслано
+            return self._folder_link(req) if route == "/api/folder-link" else self._files_find(req)
+        if route == "/api/pur-paper":
+            return self._pur_paper()
         if route != "/api/excel":
             return self._send(404, b"not found")
         try:
@@ -1734,6 +2201,12 @@ class Handler(BaseHTTPRequestHandler):
             self._send(500, f"{type(e).__name__}: {e}".encode("utf-8"))
 
 
+def _plan_text(plan):
+    """Відмінності книги «Закупівлі» від бази (`purchases_book.diff`) одним рядком JSON із відсортованими ключами: так
+    порівнюються «що людина бачила при перегляді» й «що прийом зробив би тепер»."""
+    return json.dumps(plan, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
 def remote_any(path):
     """Що віддати браузеру іншого ПК, коли файл ліг у теку з налаштувань (поза «вивантаженням»,
     звідки його віддає `api/file`): його копію у «вивантаженні»."""
@@ -1780,16 +2253,41 @@ def open_file(path):
         return False
 
 
-def scan_path(rel):
+def _rooted(rel):
+    """Шлях із диском, коренем чи мережевим ім'ям — не відносний до теки, а отже, чужий для неї."""
+    text = str(rel or "")
+    return bool(ntpath.splitdrive(text)[0]) or text[:1] in ("/", "\\")
+
+
+def _inside(root, full):
+    """`full` лежить усередині теки `root` (обидва — після realpath) і не збігається з нею.
+    Корінь диска вже кінчається роздільником, тож `root + os.sep` для нього нічого б не пропускало."""
+    prefix = root if root.endswith(os.sep) else root + os.sep
+    return full.startswith(prefix) and full != prefix
+
+
+def _is_link(path):
+    """Символьне посилання чи з'єднання (junction) на каталог."""
+    junction = getattr(os.path, "isjunction", lambda p: False)           # до Python 3.12 з'єднань не розрізняє
+    return os.path.islink(path) or junction(path)
+
+
+def scan_path(rel, root=None):
     """Повний шлях до скана або None, якщо його немає чи він веде за межі теки.
+
+    Без `root` шукає в «Дані обліку/скани», з `root` — у теці служби з налаштувань (див. `folder_path`).
 
     Ім'я файла шукається й у зведеному, і в розкладеному вигляді Unicode («ї» =
     «і» + дві крапки): тека даних могла пройти через систему, яка нормалізує
     імена по-своєму, і тоді точний шлях із бази не збігається з тим, що на диску.
     """
-    root = os.path.realpath(os.path.join(DATA, "скани"))
+    # Шлях із диском, коренем чи мережевим ім'ям — відмова ще до першого звернення до диска: навіть щоб лише
+    # перевірити, чи шлях у межах теки, Windows відкрила б мережеве ім'я (\\хост\ресурс) входом на чужу машину.
+    if _rooted(rel):
+        return None
+    root = os.path.realpath(root or os.path.join(DATA, "скани"))
     full = os.path.realpath(os.path.join(root, str(rel or "")))
-    if not full.startswith(root + os.sep):
+    if not _inside(root, full):
         return None
     if os.path.isfile(full):
         return full
@@ -1808,11 +2306,58 @@ def scan_path(rel):
     want = unicodedata.normalize("NFC", tail).lower()
     try:
         for entry in os.listdir(head):
-            if unicodedata.normalize("NFC", entry).lower() == want:
-                return os.path.join(head, entry)
+            found = os.path.join(head, entry)
+            # Підтека з таким самим іменем — не файл, віддати її не можна.
+            if unicodedata.normalize("NFC", entry).lower() == want and os.path.isfile(found):
+                # Знайдене за іншим написанням може бути посиланням за межі теки: перевірка та сама, що й для точного шляху.
+                real = os.path.realpath(found)
+                if _inside(root, real):
+                    return real
     except OSError:
         pass
     return None
+
+
+def folder_path(key, rel):
+    """Файл у теці з налаштувань (ключ FOLDERS) — лише в її межах; None, якщо ключа чи файла немає."""
+    root = folders().get(str(key or ""))
+    return scan_path(rel, root) if root else None
+
+
+def dir_path(rel, root, make=False):
+    """Повний шлях до каталогу `rel` усередині теки `root` або None: шлях виводить за межі теки (вгору, диск, мережеве ім'я,
+    посилання), каталогу немає, а створювати його не веліли. Сама тека `root` теж каталог (порожній `rel`). Перевірки ті самі,
+    що й для файла (`scan_path`): відмова шляху від кореня чи з диском — до будь-якого звернення до диска.
+
+    make — створити каталог (з усім проміжним), якщо його ще немає: після тих самих перевірок, лише всередині теки. Що Windows
+    не дає створити (ім'я, якого вона не приймає, файл на місці проміжного каталогу, недоступний диск) — OSError нагору."""
+    if _rooted(rel):
+        return None
+    text = str(rel or "")
+    try:
+        base = os.path.realpath(root)
+        full = os.path.realpath(os.path.join(base, text))
+    except (ValueError, OSError):
+        return None
+    if full != base and not _inside(base, full):
+        return None
+    if os.path.isdir(full):
+        return full
+    import unicodedata                                      # noqa: PLC0415
+    for form in ("NFC", "NFD"):                              # тека могла пройти через систему, що зводить імена по-своєму
+        alt = os.path.realpath(os.path.join(base, unicodedata.normalize(form, text)))
+        if alt != full and _inside(base, alt) and os.path.isdir(alt):
+            return alt
+    if make and not os.path.lexists(full):
+        os.makedirs(full, exist_ok=True)
+        return full
+    return None
+
+
+def file_sha(path):
+    """Відбиток вмісту файла: за ним програма знаходить файл після перекладки тек. Це стабільний відбиток (`stable_hash`):
+    для .xls він не залежить від мітки часу, яку Excel дописує, коли файл просто відкрили для правки."""
+    return stable_hash.stable_sha(path)
 
 
 def free_port():

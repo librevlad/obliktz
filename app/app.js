@@ -80,6 +80,9 @@
   const bookOf = (code) => bookOfItem(itemBy.get(String(code)));
   /** Чернетки документів — свої в кожної книги: прихід ТЗ і прихід посуду не змішуються. */
   const slotOf = (kind, book) => (book === 'ОП' ? kind + '@ОП' : kind);
+  /** Слово про книгу в підписах чернеток: ТЗ — без слова, ОП — «(посуд і миючі)», будь-яка інша книга — її назва в дужках. */
+  const BOOK_WORD = { 'ОП': 'посуд і миючі' };
+  const bookWord = (book) => (book && book !== 'ТЗ' ? ` (${BOOK_WORD[book] || book})` : '');
   // КНИГИ ОБЛІКУ: КІНЕЦЬ
 
   // 2/ПРОД: ПОЧАТОК
@@ -109,6 +112,669 @@
   const tzItems = () => items.filter((i) => bookOfItem(i) === 'ТЗ');
   /** Де документ у ФЕС. Перелік — книги ОП; той самий у документів закупівель. */
   const FES_STATUSES = ['немає витяга', 'на підписі', 'їде на ФЕС', 'проведено', 'переробка'];
+  // ЗАКУПІВЛІ: ПОЧАТОК — чисті функції закупівель (їх перевіряють окремо, у node).
+  /** Види руху рядка коштів, фонди, документи закупівлі, правила ціни, стани справи. */
+  const PUR_MOVE_KINDS = ['затверджено', 'зміна', 'профінансовано', 'повернуто'];
+  const PUR_FUNDS = ['10% ПДФО', 'Загальний фонд', 'Субвенція', 'Спецфонд (інші кошти)', 'Благодійні кошти'];
+  const PUR_DOC_KINDS = ['договір', 'ВН', 'рахунок', 'довіреність', 'оплата', 'акт введення', 'інше'];
+  const PUR_RULES = ['середня', 'КП', 'вручну'];
+  const PUR_STATES = ['розрахунки', 'подано', 'не погоджено', 'погоджено', 'договір', 'поставка', 'на ФЕС',
+    'проведено', 'видано', 'завершено', 'скасовано'];
+  /** Джерело відомості МТЗ за фондом рядка коштів (інших фондів відомість не має). */
+  const MTZ_SRC_OF_PUR = { '10% ПДФО': 'ПДФО', 'Субвенція': 'С', 'Благодійні кошти': 'БД' };
+  /** Слова 9/фс і супроводу про фонд. */
+  const PUR_PHRASE = { '10% ПДФО': 'за рахунок 10% ПДФО', 'Субвенція': 'за рахунок субвенції',
+    'Спецфонд (інші кошти)': 'за спеціальним фондом', 'Загальний фонд': 'за загальним фондом' };
+  const PUR_LIMIT_KOP = 2000000;            // 20 000 грн за одиницю: від неї — 3110/040, дешевше — 2210/030
+
+  // Гроші — цілі копійки, а рахунок — цілими числами (BigInt): сторінка, книга й папери збігаються до копійки
+  // (`line_kop` у desktop/purchases_book.py). `Math.round(x * 100)` і добуток у double на половинах розходилися б
+  // з ними: 1,005 * 100 — це 100,49999999999999, а `Math.round(-0.5)` — це -0.
+  /** n / d до цілого, найближче; половина — від нуля. Дільник d ненульовий: ділення BigInt на 0n кидає RangeError. */
+  const divRound = (n, d) => {
+    const a = n < 0n ? -n : n, b = d < 0n ? -d : d;
+    const r = (2n * a + b) / (2n * b);
+    return (n < 0n) !== (d < 0n) ? -r : r;
+  };
+  /** Ціле число копійок (чи тисячних) → BigInt; дробове відкидається, не число й нескінченність — 0. */
+  const bigKop = (x) => {
+    const n = Math.trunc(+x);
+    return Number.isFinite(n) ? BigInt(n) : 0n;
+  };
+  /** Запис числа з експонентою («1e3», «-1,5E2», «.5e1», «2E2 грн»): одиниця в кінці дозволена, як і в десяткового. */
+  const KOP_EXP = /^[+-]?(\d+\.?\d*|\.\d+)e[+-]?\d+\D*$/i;
+  /** «12 345,67», «,5», «12,5 грн», «1.005₴» чи 12345.67 → копійки; null — це не число. Десяткове число (з одиницею в
+   *  кінці чи без) округлюється до копійки точно, за цифрами тексту (половина — від нуля); запис з експонентою («1e3») —
+   *  через float. Усе інше — не число, і з нього не береться числовий початок: «1,234.56», «12 грн 50 коп», «5м2», «12.5.6»
+   *  не дають ні 1,23, ні 12, ні 5, ні 12,5 грн (хибна сума гірша за відсутню). Теж null: порожнє, текст без цифр,
+   *  нескінченність і число, що не вміщується в double. */
+  const kopParse = (v) => {
+    const s = String(v ?? '').replace(/\s/g, '').replace(',', '.');                // \s забирає й нерозривні пробіли
+    // знак, цифри з крапкою (і «.5», і «5.»), далі лише не цифри: одиниця; цифра після числа (e3, друга крапка) — не одиниця
+    const m = /^([+-]?)(\d*)(?:\.(\d+))?\D*$/.exec(s);
+    let kop = null;
+    if (m && /\d/.test(s)) {
+      const frac = m[3] || '';
+      const up = frac.length > 2 && frac[2] >= '5';                                // третя цифра від 5: від половини копійки
+      const mag = BigInt(m[2] + (frac + '00').slice(0, 2)) + (up ? 1n : 0n);      // ціла частина може бути порожньою («.5»)
+      kop = Number(m[1] === '-' ? -mag : mag);
+    } else if (KOP_EXP.test(s)) {
+      const x = parseFloat(s);
+      kop = Math.sign(x) * Math.round(Math.abs(x) * 100);
+    }
+    return Number.isFinite(kop) ? kop || 0 : null;                                  // «|| 0»: мінус нуль назовні не виходить
+  };
+  /** Копійки з тексту чи числа; що не число — нуль (поля сум перед цим питають `kopParse`). */
+  const kopOf = (v) => kopParse(v) ?? 0;
+  /** Копійки → «1234.56» для поля вводу: цілі числа, без double (його `kopParse` читає назад до копійки). */
+  const kopStr = (kop) => {
+    const n = Math.trunc(+kop || 0), a = Math.abs(n), r = a % 100;
+    return `${n < 0 ? '-' : ''}${(a - r) / 100}.${String(r).padStart(2, '0')}`;
+  };
+  /** Копійки (число чи BigInt) → гривні для слова: «9 876,50» (нерозривний пробіл між тисячами, кома); цілими числами, без double. */
+  const kopGrn = (kop) => {
+    const n = typeof kop === 'bigint' ? kop : bigKop(kop), a = n < 0n ? -n : n;
+    return `${n < 0n ? '-' : ''}${String(a / 100n).replace(/\B(?=(\d{3})+(?!\d))/g, '\u00a0')},${String(a % 100n).padStart(2, '0')}`;
+  };
+  /** Сума рядка: кількість (до трьох знаків) × ціна в копійках, одне округлення до копійки (половина — від нуля). */
+  const lineKop = (qty, priceKop) => {
+    const q = +qty || 0;
+    const qm = Math.sign(q) * Math.round(Math.abs(q) * 1000);                       // кількість у тисячних
+    return Number(divRound(bigKop(qm) * bigKop(priceKop), 1000n));
+  };
+  /** Середня додатних цін, округлена до копійки (половина — вгору): цілі сума й ділення. */
+  const avgKop = (list) => {
+    const xs = list.map((x) => +x).filter((x) => Number.isFinite(x) && x > 0).map(bigKop);
+    return xs.length ? Number(divRound(xs.reduce((s, x) => s + x, 0n), BigInt(xs.length))) : 0;
+  };
+  /** Ціна позиції за її правилом: середня трьох посилань, ціна комерційної пропозиції або вписана. */
+  function posPrice(p) {
+    const offers = p.offers || [];
+    if (p.rule === 'середня') return avgKop(offers.filter((o) => o.kind === 'посилання').map((o) => +o.priceKop || 0));
+    if (p.rule === 'КП') {
+      const kp = offers.find((o) => o.kind === 'КП' && +o.priceKop > 0);
+      return kp ? +kp.priceKop : 0;
+    }
+    return +p.priceKop || 0;
+  }
+  const posKop = (p) => lineKop(p.qty, p.priceKop);
+  const verKop = (v) => ((v && v.positions) || []).reduce((s, p) => s + posKop(p), 0);
+  const kekvFor = (priceKop) => (priceKop >= PUR_LIMIT_KOP ? { kekv: '3110', exp: '040' } : { kekv: '2210', exp: '030' });
+  /** Ціна позиції, з якою разом дорівнює цілі; rest — що лишається, коли рівно не виходить. Береться найбільша ціна, з якою сума
+   *  рядка (округлена до копійки, половина — від нуля) не перевищує решти: floor((ціна·к-сть + 500) / 1000) ≤ left, тобто
+   *  ціна·к-сть ≤ 1000·left + 499 (к-сть у тисячних). Ціна без округлення суми в розрахунку промахувалась би: на 1,00 грн при 0,7 вона
+   *  давала 1,42 і «лишилось 0,01», хоч 1,43 × 0,7 = 1,001, тобто 1,00 рівно. Ділення цілими числами: у double 7 ÷ 0,07 дає 99,999… */
+  function fitPrice(targetKop, othersKop, qty) {
+    const q = +qty || 0;
+    const diff = (+targetKop || 0) - (+othersKop || 0);
+    const left = Number.isFinite(diff) ? Math.round(diff) : 0;
+    const qm = bigKop(Math.round(q * 1000));
+    if (qm <= 0n) return { priceKop: 0, rest: left };
+    const priceKop = left > 0 ? Number((BigInt(left) * 1000n + 499n) / qm) : 0;
+    return { priceKop, rest: left - lineKop(q, priceKop) };
+  }
+  /** Остання версія або остання погоджена. */
+  function purVersion(pu, which = 'last') {
+    const vs = (pu && pu.versions) || [];
+    if (which === 'approved') return vs.filter((v) => v.answer === 'погоджено').pop() || null;
+    return vs[vs.length - 1] || null;
+  }
+  /** Ті самі пропорції на іншу суму. Рахує цілими числами: `kop * частка / разом` у double на сумах у трильйони
+   *  копійок розходиться з книгою на копійку, а `Math.round` половину мінуса округлює до нуля. Залишок округлення бере
+   *  остання частка з вагою (того ж знаку, що й сума ваг): частка без ваги лишається нулем, а не мінусом. */
+  function scaleParts(parts, kop) {
+    if (!parts.length) return [];
+    const weight = parts.map((p) => bigKop(p.kop));
+    const total = weight.reduce((s, w) => s + w, 0n);
+    if (total === 0n) return [{ line: parts[0].line, kop }];
+    const whole = bigKop(kop);
+    const sign = total > 0n ? 1n : -1n;
+    let last = parts.length - 1;
+    while (weight[last] * sign <= 0n) last--;                       // сума ваг не нуль, тож така частка є
+    let left = whole;
+    const out = parts.map((p, i) => {
+      if (i === last) return null;
+      const k = divRound(whole * weight[i], total);
+      left -= k;
+      return { line: p.line, kop: Number(k) };
+    });
+    out[last] = { line: parts[last].line, kop: Number(left) };
+    return out;
+  }
+  const purAt = (ctx, id) => ctx.purchases.find((p) => p.id === id) || null;
+  const purDocAt = (ctx, id) => ctx.purDocs.find((d) => d.id === id) || null;
+  /** Частки документа між рядками коштів: свої; без них — як у документа-основи (ВН — як договір);
+   *  без основи — цілим до єдиного рядка закупівлі; інакше — не віднесено. */
+  function docParts(doc, ctx, depth = 0) {
+    const own = (doc.parts || []).filter((p) => p && p.line);
+    if (own.length) return own.map((p) => ({ line: p.line, kop: +p.kop || 0 }));
+    const up = doc.parent && depth < 4 ? purDocAt(ctx, doc.parent) : null;
+    if (up && up.id !== doc.id) {
+      const pp = docParts(up, ctx, depth + 1);
+      if (pp.length) return scaleParts(pp, +doc.kop || 0);
+    }
+    const pu = purAt(ctx, doc.purchase);
+    const lines = pu ? (pu.funds || []).map((f) => f.line) : [];
+    return lines.length === 1 ? [{ line: lines[0], kop: +doc.kop || 0 }] : [];
+  }
+  /** Перед другим рядком коштів закупівлі. Документ, чий ланцюг основ не має часток, йде до її рядка цілим лише тому, що рядок
+   *  один (`docParts`); з другим рядком він не йшов би нікуди, і договір чи оплата випали б із «Коштів». Такий документ закупівлі із
+   *  сумою більшою за нуль дістає цю частку своєю, `parts: [{ line, kop }]`, — серед тих, чиї гроші «Кошти» беруть або під якими такі
+   *  стоять (договір, ВН, рахунок, оплата); акт введення й довіреність «Кошти» не рахують. Основи йдуть раніше за документи під
+   *  ними, і частка пишеться одразу: документ під щойно записаною основою бере частки від неї й далі (розклад договору потім
+   *  розкладе й ВН з оплатою), тож своєї не дістає. Свою дістає лише той, чий ланцюг доходить до єдиного рядка, — корінь, документ під
+   *  основою без суми чи під основою з іншої закупівлі без часток. Порівняння з тією самою закупівлею без рядків знаходить саме їх.
+   *  Записує частки й повертає змінені документи. */
+  function purFreezeParts(pu, ctx) {
+    if (!pu || (pu.funds || []).length !== 1) return [];
+    const bare = Object.assign({}, ctx, { purchases: ctx.purchases.map((p) => (p.id === pu.id ? Object.assign({}, p, { funds: [] }) : p)) });
+    const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+    const money = ['договір', 'ВН', 'рахунок', 'оплата'];
+    const depth = (d) => {                                        // скільки основ над документом; кільце в даних обмежене
+      let n = 0;
+      for (let up = purDocAt(ctx, d.parent); up && n < 8; up = purDocAt(ctx, up.parent)) n++;
+      return n;
+    };
+    const out = [];
+    const list = ctx.purDocs.filter((d) => d.purchase === pu.id && money.includes(d.kind) && +d.kop > 0);
+    for (const d of list.map((x) => [depth(x), x]).sort((a, b) => a[0] - b[0]).map((x) => x[1])) {
+      const parts = docParts(d, ctx);
+      if (parts.length && !same(parts, docParts(d, bare))) {
+        d.parts = parts;
+        out.push(d);
+      }
+    }
+    return out;
+  }
+  /** Що станеться з частками документів закупівлі, коли з неї прибирають рядок коштів `line`. Лишається рівно один рядок — документи,
+   *  уся сума яких лежить однією часткою на прибраному (так її записує `purFreezeParts`), переходять на нього: `move`, їхні частки
+   *  знімаються. Розклад на кілька рядків із часткою на прибраному програма сама не вирішить, як і одну частку на ньому, коли рядків
+   *  лишається кілька чи жодного: `stuck` — їх називають у питанні, частки лишаються. `to` — рядок, на який переходять. Нічого не змінює. */
+  function purLineDrop(pu, ctx, line) {
+    const rest = ((pu && pu.funds) || []).filter((f) => f.line !== line);
+    const own = (d) => (d.parts || []).filter((p) => p && p.line);
+    const hit = ctx.purDocs.filter((d) => pu && d.purchase === pu.id && own(d).some((p) => p.line === line));
+    if (rest.length !== 1) return { move: [], stuck: hit, to: '' };
+    return { move: hit.filter((d) => own(d).length === 1), stuck: hit.filter((d) => own(d).length > 1), to: rest[0].line };
+  }
+  /** Акт приймання, з яким пов'язано документ: за id, а поки його немає — за ключем документа. */
+  const rcptId = (link, ctx) => (link && link.doc && ctx.rcpt.has(link.doc) ? link.doc
+    : (link && ctx.rcptByKey.get(link.key)) || 0);
+  /** Вартість актів приймання за документами закупівель, що на них посилаються (у пропорції їхніх
+   *  сум), далі — за частками кожного документа між рядками коштів. Акт введення не береться: він не поставка, а папір після неї
+   *  (як і в `purRcptText`), і його частка йшла б в «нікуди». */
+  function rcptShares(ctx) {
+    if (ctx.shares) return ctx.shares;
+    const by = new Map();
+    for (const d of ctx.purDocs) {
+      if (d.kind === 'акт введення') continue;
+      for (const link of d.receipts || []) {
+        const id = rcptId(link, ctx);
+        if (!id) continue;
+        if (!by.has(id)) by.set(id, []);
+        if (!by.get(id).includes(d)) by.get(id).push(d);
+      }
+    }
+    const out = [];
+    for (const [rid, list] of by) {
+      const r = ctx.rcpt.get(rid);
+      if (!r) continue;
+      for (const s of scaleParts(list.map((d) => ({ line: d.id, kop: +d.kop || 1 })), r.kop)) {
+        const d = list.find((x) => x.id === s.line);
+        const parts = docParts(d, ctx);
+        for (const p of parts.length ? scaleParts(parts, s.kop) : [{ line: '', kop: s.kop }]) {
+          out.push({ rid, doc: d.id, purchase: d.purchase, line: p.line, kop: p.kop });
+        }
+      }
+    }
+    ctx.shares = out;
+    return out;
+  }
+  const pct = (a, b) => (b ? Math.round(a / b * 10000) / 100 : 0);
+  /** Показники рядка коштів за формулами штабу, у копійках. */
+  function budNums(line, ctx) {
+    const mv = (k) => (line.moves || []).filter((m) => m.kind === k).reduce((s, m) => s + (+m.kop || 0), 0);
+    const approved = mv('затверджено') + mv('зміна');
+    const financed = mv('профінансовано') - mv('повернуто');
+    const onLine = (d) => docParts(d, ctx).filter((p) => p.line === line.id).reduce((s, p) => s + p.kop, 0);
+    const kinds = (k) => ctx.purDocs.filter((d) => d.kind === k).reduce((s, d) => s + onLine(d), 0);
+    const committed = kinds('договір');
+    const used = kinds('оплата');
+    const delivered = rcptShares(ctx).filter((x) => x.line === line.id).reduce((s, x) => s + x.kop, 0);
+    let planned = 0;
+    for (const pu of ctx.purchases) {
+      if (pu.closed === 'скасовано') continue;
+      const cons = ctx.purDocs.filter((d) => d.purchase === pu.id && d.kind === 'договір');
+      planned += cons.length ? cons.reduce((s, d) => s + onLine(d), 0)
+        : (pu.funds || []).filter((f) => f.line === line.id).reduce((s, f) => s + (+f.kop || 0), 0);
+    }
+    return { approved, financed, committed, used, delivered, planned, unplanned: approved - planned,
+      budgetLeft: approved - committed, noContract: financed - committed, cashLeft: financed - used,
+      pctTaken: pct(committed, approved), pctFin: pct(committed, financed), pctUsed: pct(used, financed),
+      toReturn: line.fund === 'Субвенція' ? Math.max(0, financed - used) : 0 };
+  }
+  /** Суми справи: гроші, пакет (погоджена або остання версія), договори, поставлено, оплачено, економія. */
+  function purNums(pu, ctx) {
+    const docsOf = ctx.purDocs.filter((d) => d.purchase === pu.id);
+    const sum = (k) => docsOf.filter((d) => d.kind === k).reduce((s, d) => s + (+d.kop || 0), 0);
+    const v = purVersion(pu, 'approved') || purVersion(pu);
+    const pack = v ? verKop(v) : 0;
+    const contracts = sum('договір');
+    return { funds: (pu.funds || []).reduce((s, f) => s + (+f.kop || 0), 0), pack, contracts,
+      delivered: rcptShares(ctx).filter((x) => x.purchase === pu.id).reduce((s, x) => s + x.kop, 0),
+      paid: sum('оплата'), economy: contracts ? pack - contracts : 0 };
+  }
+  const purRcpts = (pu, ctx) => [...new Set(ctx.purDocs.filter((d) => d.purchase === pu.id)
+    .flatMap((d) => (d.receipts || []).map((l) => rcptId(l, ctx)).filter(Boolean)))];
+  /** Версію подано, коли в неї є вихідний № чи відповідь штабу: відповідь без № (книга, історія, форма) — теж подана. */
+  const verSent = (v) => !!(v && (v.sentNo || v.answer));
+  /** Стан справи одним словом — за найдальшим етапом. */
+  function purState(pu, ctx) {
+    if (pu.closed) return pu.closed;
+    const rids = purRcpts(pu, ctx);
+    if (rids.length) {
+      const st = rids.map((id) => (ctx.rcpt.get(id) || {}).fes || '');
+      if (st.every((s) => s === 'проведено')) {
+        const issued = rids.some((id) => {
+          const r = ctx.rcpt.get(id);
+          return r && (ctx.moves || []).some((m) => m.from === r.to && m.d >= r.d && (r.lines || []).some((l) => l.code === m.code));
+        });
+        return issued ? 'видано' : 'проведено';
+      }
+      return st.every((s) => s === 'їде на ФЕС' || s === 'проведено') ? 'на ФЕС' : 'поставка';
+    }
+    if (ctx.purDocs.some((d) => d.purchase === pu.id && d.kind === 'договір')) return 'договір';
+    const v = purVersion(pu);
+    if (!v || !verSent(v)) return 'розрахунки';
+    if (v.answer === 'погоджено') return 'погоджено';
+    return v.answer === 'не погоджено' ? 'не погоджено' : 'подано';
+  }
+  /** Чого бракує справі: очікувані документи етапів, яких немає або в запису яких немає скану. */
+  function purMissing(pu, ctx) {
+    const out = [];
+    const files = (key) => ctx.files.get(key) || [];
+    const scanned = (key) => files(key).some((f) => !f.made);
+    const add = (key, text) => {
+      if (!out.some((x) => x.key === key)) out.push({ key, text });          // один акт на два приходи чи довіреність на дві ВН — раз
+    };
+    for (const v of pu.versions || []) {
+      if (!verSent(v)) continue;
+      for (const [paper, word] of [['рапорт', 'рапорт'], ['1фс', '1ФС'], ['9фс', '9ФС'], ['супровід', 'супровід']]) {
+        if (!scanned(`purver|${v.id}|${paper}`)) add(`ver:${v.id}:${paper}`, `${word} версії ${v.label}: немає скану підписаного`);
+      }
+      if (v.answer && !files(`purver|${v.id}|відповідь`).length) add(`ver:${v.id}:відповідь`, `відповідь штабу на версію ${v.label}: немає скану`);
+    }
+    for (const f of pu.funds || []) {
+      const ln = ctx.budget.find((l) => l.id === f.line);
+      if (!ln || ln.fund !== 'Субвенція') continue;
+      for (const what of ['угода', 'рішення']) {
+        if (!files(`bud|${ln.id}|${what}`).length && !(ln.missing || {})[`bud:${ln.id}:${what}`]) {
+          add(`bud:${ln.id}:${what}`, `${what} громади (${ln.label}): немає файла`);
+        }
+      }
+    }
+    const mine = ctx.purDocs.filter((d) => d.purchase === pu.id);
+    const byId = new Map(ctx.purDocs.map((d) => [d.id, d]));
+    /** Кому в межах договору `c` (його може не бути — `null`) належить оплата: id ВН, під якою вона висить (прямо чи через рахунок) — власна
+     *  оплата цієї ВН; '' — коли вона доходить до самого договору, не минаючи жодної ВН (під його рахунком чи під ним), — спільна; null — ні те,
+     *  ні те. Кільце в даних і дуже довгий ланцюг основ ходу не зациклюють. */
+    const payOwner = (pay, c) => {
+      for (let u = byId.get(pay.parent), n = 0; u && n < 6; u = byId.get(u.parent), n++) {
+        if (u.kind === 'ВН') return u.id;
+        if (c && u.id === c.id) return '';
+      }
+      return null;
+    };
+    const payments = mine.filter((d) => d.kind === 'оплата');
+    const sumOf = (list) => list.reduce((s, d) => s + bigKop(d.kop), 0n);                 // цілі копійки, без double
+    /** Перевірки однієї ВН — під договором цієї закупівлі (`c`) чи без нього (`null`): скан, «до сплати», довіреність, реєстр на ФЕС, оплата.
+     *  Без договору довіреність береться лише під самою ВН, а спільної оплати нема: оплату гасить тільки те, що доходить до неї самої. `pool` —
+     *  що лишилось від спільної оплати договору (цілі копійки, BigInt); повертається те, що лишилось після цієї ВН. */
+    const vnItems = (vn, c, pool) => {
+      const w = `ВН №${vn.no || 'б/н'}`;
+      if (!files(`purdoc|${vn.id}`).length && !vn.missing) add(`doc:${vn.id}:файл`, `${w}: немає скану`);
+      if (!vn.payOn) add(`doc:${vn.id}:до сплати`, `${w}: немає резолюції «до сплати»`);
+      const powers = mine.filter((d) => d.kind === 'довіреність' && (d.parent === vn.id || (c && d.parent === c.id)));
+      if (!powers.length) add(`doc:${vn.id}:довіреність`, `${w}: немає довіреності`);
+      for (const pa of powers) {                                            // довіреність — запис і фото
+        if (!files(`purdoc|${pa.id}`).length && !pa.missing) add(`doc:${pa.id}:файл`, `довіреність №${pa.no || 'б/н'}: немає фото`);
+      }
+      if (!(vn.fes || {}).register) add(`doc:${vn.id}:реєстр`, `${w}: не передано на ФЕС реєстром`);
+      const own = sumOf(payments.filter((d) => payOwner(d, c) === vn.id));    // власна оплата ВН — під нею чи під її рахунком
+      const due = bigKop(vn.kop);
+      const lack = due > own ? due - own : 0n;                                // скільки їй бракує до своєї суми
+      const share = pool < lack ? pool : lack;                                // стільки й бере зі спільної оплати (за чергою ВН у переліку)
+      const paid = own + share;
+      if (paid < due) add(`doc:${vn.id}:оплата`, `${w}: оплату ${paid ? 'внесено не повністю' : 'не внесено'}`);
+      return pool - share;
+    };
+    const contracts = mine.filter((d) => d.kind === 'договір');
+    for (const c of contracts) {
+      const no = `договір №${c.no || 'б/н'}`;
+      if (!files(`purdoc|${c.id}`).length && !c.missing) add(`doc:${c.id}:файл`, `${no}: немає скану`);
+      const vns = mine.filter((d) => d.kind === 'ВН' && d.parent === c.id);
+      if (!vns.length && (c.receipts || []).length) add(`doc:${c.id}:ВН`, `${no}: немає ВН`);
+      let pool = sumOf(payments.filter((d) => payOwner(d, c) === ''));       // спільна оплата договору: одна на всі його ВН, не по цілій на кожну
+      for (const vn of vns) pool = vnItems(vn, c, pool);
+    }
+    // ВН без договору цієї закупівлі («До документа» — «—», договір з іншої закупівлі чи якого вже нема): ті самі перевірки, спільної оплати нема.
+    for (const vn of mine.filter((d) => d.kind === 'ВН' && !contracts.some((c) => c.id === d.parent))) vnItems(vn, null, 0n);
+    // Гроші договору, ВН й оплати «Кошти» беруть за частками; закупівля з кількома рядками й документ без часток (свої, основи) — ні
+    // в який рядок: такий документ видно тут, доки суму не розкладено (з одним рядком уся сума йде туди, `docParts`).
+    if ((pu.funds || []).length > 1) {
+      for (const d of mine) {
+        if (['договір', 'ВН', 'оплата'].includes(d.kind) && +d.kop > 0 && !docParts(d, ctx).length) {
+          add(`doc:${d.id}:частки`, `${d.kind} №${d.no || 'б/н'}: суму не розкладено між рядками коштів`);
+        }
+      }
+    }
+    // Закупівля без жодного рядка коштів: її договори, ВН й оплати «Кошти» не бачать ніде. Один пункт на закупівлю; сума — старшого з видів,
+    // який є (договорів, а без них ВН, а без них оплат): гроші одного договору в трьох видах не складаються втричі.
+    if (!(pu.funds || []).length) {
+      const total = ['договір', 'ВН', 'оплата'].map((kind) => sumOf(mine.filter((d) => d.kind === kind))).find((s) => s > 0n);
+      if (total) add(`pu:${pu.id}:кошти`, `у закупівлі немає рядків коштів: документи на ${kopGrn(total)} грн нікуди не враховано`);
+    }
+    for (const id of purRcpts(pu, ctx)) {
+      const r = ctx.rcpt.get(id);
+      if (!r) continue;
+      const w = `акт приймання №${r.no}`;
+      if (!r.scan) add(`rcpt:${id}:скан`, `${w}: немає скану`);
+      const av = ctx.purDocs.find((d) => d.kind === 'акт введення' && (d.receipts || []).some((l) => rcptId(l, ctx) === id));
+      if (!av) add(`rcpt:${id}:АВ`, `${w}: немає акта введення`);
+      else if (!scanned(`purdoc|${av.id}`) && !av.missing) add(`doc:${av.id}:файл`, `акт введення №${av.no || 'б/н'}: немає скану підписаного`);
+      if (r.fes !== 'проведено') add(`rcpt:${id}:ФЕС`, `${w}: ФЕС ще не провела`);
+    }
+    const marks = Object.assign({}, pu.missing || {}, ...(pu.versions || []).map((v) => v.missing || {}));
+    return out.filter((x) => !(x.key in marks));
+  }
+  /** Наступний номер акта приймання: лічильник року спільний для «БД» і «С». */
+  function nextAp(nos, year, letter) {
+    const yy = String(year).slice(2);
+    let max = 0;
+    for (const no of nos) {
+      const m = String(no).trim().match(/^АП(\d\d)-(?:БД|С)-(\d+)$/);
+      if (m && m[1] === yy) max = Math.max(max, +m[2]);
+    }
+    return `АП${yy}-${letter}-${String(max + 1).padStart(3, '0')}`;
+  }
+  /** Номер акта введення — номер його акта приймання, якщо ним ще не названо інший акт; інакше й без акта приймання з таким номером —
+   *  наступний вільний за рік: два акти з одним номером ділили б одну назву файла. */
+  function avNo(apNo, year, nos) {
+    const m = String(apNo || '').trim().match(/^АП(\d\d)-(?:БД|С)-(\d+)$/);
+    const taken = (no) => nos.some((x) => String(x).trim().toLowerCase() === no.toLowerCase());
+    if (m && !taken(`АВ${m[1]}-${m[2]}`)) return `АВ${m[1]}-${m[2]}`;
+    const yy = m ? m[1] : String(year).slice(2);
+    let max = 0;
+    for (const no of nos) {
+      const x = String(no).trim().match(/^АВ(\d\d)-(\d+)$/i);
+      if (x && x[1] === yy) max = Math.max(max, +x[2]);
+    }
+    return `АВ${yy}-${String(max + 1).padStart(3, '0')}`;
+  }
+  const apLetter = (fund) => (fund === 'Субвенція' ? 'С' : 'БД');
+  const kpkvShort = (kpkv) => String(kpkv || '').split('/').slice(0, 2).join('/');
+  const NAME_LIMIT = 80;          // довжина частини шляху: стільки лишає `launcher` у теці скану (папери — до 120, `safe_name`)
+  const NAME_EDGES = /^[ .]+|[ .]+$/g;
+  // Дата в імені, як її впізнає сервер: `\b` у Python — межа за літерою чи цифрою будь-якої писемності.
+  const ISO_IN_NAME = /(?<![\p{L}\p{N}_])(\p{Nd}{4})-(\p{Nd}{2})-(\p{Nd}{2})(?![\p{L}\p{N}_])/gu;
+  /** Ім'я файла чи теки, яке сервер не змінює: воно стале щодо обох його чисток — `purchase_papers._part` (через
+   *  `excel_export.safe_name`) і чистки частин шляху скану в `launcher`. Знаки, яких не терпить Windows (`\ / : * ? " < > |`,
+   *  `[` `]`), і знаки керування → «-»; пробіли — по одному; пробіли й крапки з країв геть; дата рррр-мм-дд → дд.мм.рррр;
+   *  не довше за NAME_LIMIT знаків, після зрізу краї чистяться знову; порожнє → «вивантаження», як у `safe_name`.
+   *  Необов'язкову частину довшого імені (контрагент, номер, назва рядка) беруть через `safePart`: порожня лишається
+   *  порожньою, а не стає словом «вивантаження» посеред назви документа. */
+  const safePart = (name) => {
+    let s = String(name || '').replace(/[\\/:*?"<>|[\]\x00-\x1f\x7f]+/g, '-').replace(/\s+/g, ' ');
+    for (let prev = null; prev !== s;) {          // дата, зріз і краї дають одне одному роботу (зріз відкриває дату чи край): до сталого
+      prev = s;
+      s = s.replace(ISO_IN_NAME, '$3.$2.$1').replace(NAME_EDGES, '');
+      s = [...s].slice(0, NAME_LIMIT).join('');
+    }
+    return s;
+  };
+  const safeFile = (name) => safePart(name) || 'вивантаження';
+  /** Тека справи відносно кореня «Закупівлі»: її власна (`folder`) або, коли її не записано (справа з рядка книги без «теки»),
+   *  «рік/тема», очищена так, як чистить сервер, — туди ляже й перший файл справи, і саме її відкриває «Відкрити теку». */
+  const purDirOf = (pu) => pu.folder || [pu.year, safePart(pu.title)].filter(Boolean).join('/');
+  /** Днів від a до b (обидві — рррр-мм-дд): додатне, коли b пізніше; те саме, що `daysBetween` нижче, але тут — для
+   *  чистих функцій, які перевіряють окремо. */
+  const dayDiff = (a, b) => Math.round((Date.parse(b) - Date.parse(a)) / 864e5);
+  /** Строки громаді: повернути залишок субвенції й звітувати — за 30 днів до строку й після нього, доки залишок не нуль
+   *  чи звіт не підшито (`reported`). Рядки інших фондів строків громаді не мають: що в них вписано, не береться. Кожен
+   *  строк — `{what: 'повернення'|'звіт', date, left (днів до строку, від'ємне після нього), kop}`. */
+  function budDue(line, nums, todayIso, reported = false) {
+    if (line.fund !== 'Субвенція') return [];
+    const out = [];
+    if (line.returnBy && nums.toReturn > 0) {
+      const left = dayDiff(todayIso, line.returnBy);
+      if (left <= 30) out.push({ what: 'повернення', date: line.returnBy, left, kop: nums.toReturn });
+    }
+    if (line.reportBy && !reported) {
+      const left = dayDiff(todayIso, line.reportBy);
+      if (left <= 30) out.push({ what: 'звіт', date: line.reportBy, left, kop: 0 });
+    }
+    return out;
+  }
+  /** «з закупівлі <тема>, договір №…, ВН №…» за приходом; прихід не з закупівлі — порожньо. По одній частині на закупівлю (у порядку
+   *  документів), договір названо раз, ВН — кожна; акт введення сюди не входить: він не поставка, а папір після неї. */
+  function purRcptText(docId, ctx) {
+    const links = ctx.purDocs.filter((d) => d.kind !== 'акт введення' && (d.receipts || []).some((l) => rcptId(l, ctx) === docId));
+    const out = [];
+    for (const pid of [...new Set(links.map((d) => d.purchase).filter(Boolean))]) {
+      const pu = purAt(ctx, pid);
+      if (!pu) continue;
+      const mine = links.filter((d) => d.purchase === pid);
+      const cons = [...new Set(mine.map((d) => (d.kind === 'договір' ? d : purDocAt(ctx, d.parent))).filter((d) => d && d.kind === 'договір'))];
+      const vns = mine.filter((d) => d.kind === 'ВН');
+      out.push([`з закупівлі ${pu.title}`, ...cons.map((d) => `договір №${d.no || 'б/н'}`), ...vns.map((d) => `ВН №${d.no || 'б/н'}`)].join(', '));
+    }
+    return out.join('; ');
+  }
+  /** Реєстр на ФЕС: за скільки днів до дати реєстру документ без статусу ще вважається свіжим. Статуси ФЕС з'явилися в програмі пізніше за
+   *  облік, тож документи від його початку жодного не мають: без межі реєстр пропонував би їх усі. Свіжі пропонуються без позначки,
+   *  старші ховає кнопка «Показати старші». */
+  const FES_REG_DAYS = 90;
+  /** Статуси, з якими документ чекає на реєстр: його пропонують позначеним. Решта («їде на ФЕС», «проведено») — документ уже в ФЕС. */
+  const FES_WAIT = ['немає витяга', 'на підписі', 'переробка'];
+  /** Де документ у переліку реєстру від дати `regDate` (назва реєстру — `label`, `fes` — статус ФЕС документа): 'wait' — явне очікування
+   *  (позначений), 'inreg' — уже внесений у реєстр цієї дати (лишається в ньому, коли файл складають знову), 'recent' — без статусу, не
+   *  старший за FES_REG_DAYS днів (без позначки), 'older' — без статусу й старший (за кнопкою), '' — не для реєстру (уже передано).
+   *  Документ без дати чи з нерозбірливою вважається свіжим: прихований, він лишився б непоміченим. */
+  function fesRegGroup(fes, docDate, regDate, label) {
+    const st = (fes && fes.status) || '';
+    if (FES_WAIT.includes(st)) return 'wait';
+    if (label && fes && fes.register === label) return 'inreg';
+    if (st) return '';
+    const age = dayDiff(docDate, regDate);
+    return Number.isFinite(age) && age > FES_REG_DAYS ? 'older' : 'recent';
+  }
+
+  /** Гроші словами для приміток звіту: «1 234,50» (звичайні пробіли між тисячами, «−» для мінуса). Копійки ріжуться цілими числами:
+   *  `(kop / 100).toFixed(2)` на великих сумах розходився б з обліком на копійку. */
+  const grnWords = (kop) => kopGrn(kop).replace(/\xa0/g, ' ').replace(/^-/, '−');
+  /** Тисячі гривень з одним знаком, цілими числами (найближче, половина — від нуля): 1 234 500 коп. → «12,3 тис», 175 000 коп. → «1,8 тис»,
+   *  600 000 коп. → «6 тис». */
+  const thous = (kop) => {
+    const t = divRound(bigKop(kop), 10000n);
+    const a = t < 0n ? -t : t;
+    return `${t < 0n ? '−' : ''}${a / 10n}${a % 10n ? `,${a % 10n}` : ''} тис`;
+  };
+  /** Контекст без актів введення: акт — не поставка, тож стан закупівлі для звіту не бере прихід, на який посилається лише він (а з
+   *  ним і суми «Поставлено» лишаються ті самі, що без акта). Без актів — сам контекст. */
+  const purDelivery = (ctx) => (ctx.purDocs.some((d) => d.kind === 'акт введення')
+    ? Object.assign({}, ctx, { purDocs: ctx.purDocs.filter((d) => d.kind !== 'акт введення'), shares: null }) : ctx);
+  /** Суми закупівлі для примітки: усієї справи (`purNums`) чи, коли справа бере кілька рядків коштів і названо рядок `line`, — її суми на цьому
+   *  рядку: договори — за частками документів, поставлено — за частками приходів, гроші («торги», «на погодженні») — частка рядка в «Грошах» справи.
+   *  Справа з одним рядком коштів — суми всієї справи, як і без рядка. */
+  function purLineNums(pu, ctx, line = '') {
+    const n = purNums(pu, ctx);
+    if (!line || (pu.funds || []).length < 2) return n;
+    const sum = (list) => list.reduce((s, x) => s + x, 0);
+    return Object.assign({}, n, {
+      contracts: sum(ctx.purDocs.filter((d) => d.purchase === pu.id && d.kind === 'договір')
+        .map((d) => docParts(d, ctx).filter((p) => p.line === line).reduce((a, p) => a + p.kop, 0))),
+      delivered: sum(rcptShares(ctx).filter((x) => x.purchase === pu.id && x.line === line).map((x) => x.kop)),
+      pack: sum((pu.funds || []).filter((f) => f.line === line).map((f) => +f.kop || 0)) });
+  }
+  /** Графа «Станом на» звіту штабу: стан закупівлі словами з сумою цього етапу (`purState` за поставками, без актів введення). Справа на кілька
+   *  рядків коштів пише в кожному рядку суми цього рядка (`line` — його id), а не всієї справи. Закрита як «завершено» без приходів у програмі —
+   *  отримане береться за договорами. */
+  function purStateNote(pu, ctx, line = '') {
+    const c = purDelivery(ctx);
+    const n = purLineNums(pu, c, line);
+    const st = purState(pu, c);
+    if (['поставка', 'на ФЕС', 'проведено', 'видано', 'завершено'].includes(st)) {
+      return `${thous(n.delivered || (st === 'завершено' ? n.contracts : 0))} ${pu.title} — отримано`;
+    }
+    if (st === 'договір') return `${thous(n.contracts)} ${pu.title} — в дорозі`;
+    if (st === 'погоджено') return `${thous(n.pack)} ${pu.title} — торги`;
+    if (st === 'подано') return `${thous(n.pack)} ${pu.title} — на погодженні`;
+    return '';
+  }
+  /** «Використання коштів»: фонд → рядки (КЕКВ/код) з показниками штабу й приміткою зі справ. Скасована закупівля в примітку не йде:
+   *  її гроші вже не розплановано на неї (як у `budNums`). */
+  function purUseRows(ctx, year) {
+    const lines = ctx.budget.filter((l) => +l.year === +year);
+    const out = [];
+    for (const fund of [...new Set(lines.map((l) => l.fund || ''))]) {
+      out.push({ group: true, text: fund || 'не вказано' });
+      for (const l of lines.filter((x) => (x.fund || '') === fund)) {
+        const n = budNums(l, ctx);
+        const notes = ctx.purchases.filter((p) => +p.year === +year && p.closed !== 'скасовано' && (p.funds || []).some((f) => f.line === l.id))
+          .map((p) => purStateNote(p, ctx, l.id)).filter(Boolean);
+        if (n.unplanned > 0) notes.push(`${notes.length ? 'економія' : 'не розплановано'} ${grnWords(n.unplanned)}`);
+        out.push(Object.assign({ group: false, label: l.label, kekv: l.kekv, exp: l.exp, note: notes.join('; ') }, n));
+      }
+    }
+    return out;
+  }
+  /** «Таблиця закупівель» служби: рядок на закупівлю × її рядок коштів. Скасованої закупівлі в ній немає: після «Перероблено в нову закупівлю»
+   *  її гроші стоять у новій, і разом вони подвоїлися б. */
+  function purTableRows(ctx, year) {
+    const out = [];
+    for (const pu of ctx.purchases.filter((p) => +p.year === +year && p.closed !== 'скасовано')) {
+      const v = purVersion(pu);
+      const status = v && v.answer ? v.answer : v && v.sentNo ? 'на погодженні' : 'не подано';
+      for (const f of pu.funds || []) {
+        const l = ctx.budget.find((x) => x.id === f.line);
+        if (!l) continue;
+        const used = ctx.purDocs.filter((d) => d.purchase === pu.id && d.kind === 'оплата')
+          .reduce((s, d) => s + docParts(d, ctx).filter((p) => p.line === l.id).reduce((a, p) => a + p.kop, 0), 0);
+        out.push({ purchase: pu.title, kpkv: l.kpkv, kekv: l.kekv, exp: l.exp, status,
+          fund: l.fund === 'Субвенція' ? ['Субвенція', l.community].filter(Boolean).join(' ') : l.fund,
+          sum: +f.kop || 0, used, left: (+f.kop || 0) - used,
+          note: [l.agreeNo ? `угода №${l.agreeNo}` : '', purStateNote(pu, ctx, l.id)].filter(Boolean).join('; ') });
+      }
+    }
+    return out;
+  }
+  /** Контрагент документа для звіту: у оплати він той, що в документа, під яким вона стоїть (свого в неї часто нема), і лише коли в
+   *  основи нікого — її власний; в інших видів — власний. */
+  const purPartyOf = (d, ctx) => (d.kind === 'оплата' && (purDocAt(ctx, d.parent) || {}).party) || d.party || '';
+  /** Факти «Зведення коштів»: рух рядків, частки договорів і оплат, поставки — з усіма розрізами. Кожен факт — одна сума в одному з п'яти
+   *  показників (`PIVOT_SUMS`); сума фактів рядка збігається з `budNums` цього рядка. Постачальник оплати — той, що в документа, під яким
+   *  вона стоїть (немає основи чи в основи нікого — свій). */
+  function purPivotFacts(ctx, year) {
+    const out = [];
+    const lines = new Map(ctx.budget.filter((l) => +l.year === +year).map((l) => [l.id, l]));
+    const cut = (l, extra) => Object.assign({ fund: l.fund || '', community: l.community || '', kpkv: l.kpkv || '', kekv: l.kekv || '',
+      exp: l.exp || '', purchase: '', party: '', month: '' }, extra);
+    const MOVE = { 'затверджено': ['approved', 1], 'зміна': ['approved', 1], 'профінансовано': ['financed', 1], 'повернуто': ['financed', -1] };
+    for (const l of lines.values()) {
+      for (const m of l.moves || []) {
+        const [k, sign] = MOVE[m.kind] || [];
+        if (k) out.push(cut(l, { month: String(m.date || '').slice(0, 7), [k]: sign * (+m.kop || 0) }));
+      }
+    }
+    for (const d of ctx.purDocs) {
+      const k = { 'договір': 'committed', 'оплата': 'used' }[d.kind];
+      if (!k) continue;
+      const pu = purAt(ctx, d.purchase);
+      const party = purPartyOf(d, ctx);
+      for (const p of docParts(d, ctx)) {
+        const l = lines.get(p.line);
+        if (l) out.push(cut(l, { purchase: pu ? pu.title : '', party, month: String(d.date || '').slice(0, 7), [k]: p.kop }));
+      }
+    }
+    for (const s of rcptShares(ctx)) {                                      // акт введення часток не має: `rcptShares` його не бере
+      const l = lines.get(s.line);
+      const r = ctx.rcpt.get(s.rid);
+      const pu = purAt(ctx, s.purchase);
+      if (l && r) out.push(cut(l, { purchase: pu ? pu.title : '', party: r.from || '', month: String(r.d || '').slice(0, 7), delivered: s.kop }));
+    }
+    return out;
+  }
+  const PIVOT_SUMS = ['approved', 'financed', 'committed', 'delivered', 'used'];
+  /** Розрізи, у яких профінансоване не можна віднести до групи: гроші дають рядки коштів (за їхніми кодами), а закупівля, постачальник чи місяць
+   *  витрати з ними не пов'язані — «Залишок коштів» і «Без договору» у такій групі були б мінусом без змісту, тож їх не рахують. */
+  const PIVOT_NO_CASH = ['purchase', 'party', 'month'];
+  /** Групування фактів за розрізами; залишок коштів і «без договору» — із сум групи (`null` у розрізах `PIVOT_NO_CASH`). */
+  function purPivot(facts, by) {
+    const groups = new Map();
+    for (const f of facts) {
+      const key = by.map((k) => f[k] || '').join('\u0000');
+      const g = groups.get(key) || Object.assign({ vals: by.map((k) => f[k] || '') }, ...PIVOT_SUMS.map((k) => ({ [k]: 0 })));
+      for (const k of PIVOT_SUMS) g[k] += +f[k] || 0;
+      groups.set(key, g);
+    }
+    const cash = !by.some((k) => PIVOT_NO_CASH.includes(k));
+    return [...groups.values()].map((g) => Object.assign(g, { cashLeft: cash ? g.financed - g.used : null, noContract: cash ? g.financed - g.committed : null }))
+      .sort((a, b) => a.vals.join('|').localeCompare(b.vals.join('|'), 'uk'));
+  }
+  /** Рядок коштів приходу — за документом закупівлі, що на нього посилається (перша частка). Акт введення прихід до рядка не зводить. */
+  function purRcptLine(docId, ctx) {
+    const s = rcptShares(ctx).find((x) => x.rid === docId && x.line);
+    return s ? ctx.budget.find((l) => l.id === s.line) || null : null;
+  }
+
+  // Слова вікон книги «Закупівлі» й пошуку файлів — за відповідями сервера; самі вікна й запити — у розділі закупівель (`purBookExport`…).
+  /** Лічильник у відмінностях аркуша без власного ключа (файли, комісії…): «+3» — у книзі на три рядки більше, «-2» — на два менше. */
+  const PUR_DIFF_COUNTER = /^[+-]\d+$/;
+  /** Скільки записів у переліку відмінностей аркуша: ключ — один запис, лічильник «+3» — три. */
+  const purDiffCount = (list) => (list || []).reduce((n, x) => n + (PUR_DIFF_COUNTER.test(String(x)) ? Math.abs(+x) : 1), 0);
+  /** Не більш як `max` рядків переліку, решта — одним рядком «… ще N». */
+  function purClip(lines, max) {
+    const all = (lines || []).map(String);
+    return all.length > max ? all.slice(0, max).concat(`… ще ${all.length - max}`) : all;
+  }
+  /** Текст вікна-попередження про книгу, яку не вивантажено: слово сервера й, під ним, рядки (до `max`). Без рядків — лише слово. */
+  function purBookSay(error, rows, max) {
+    const list = Array.isArray(rows) ? rows : [];
+    return list.length ? `${error}\n\n${purClip(list, max).join('\n')}` : String(error);
+  }
+  /** Відмінності книги від бази за аркушами для вікна «Прийняти книгу…»: аркуш, скільки нових, змінених і прибраних записів та їхні
+   *  ключі (по шість у кожному переліку). Аркуші без відмінностей, `same` і те, що не аркуш, пропущено. */
+  function purDiffRows(diff) {
+    const out = [];
+    for (const [sheet, x] of Object.entries(diff || {})) {
+      if (sheet === 'same' || !x || typeof x !== 'object') continue;
+      const groups = [['нових', 'нові', x.new], ['змінено', 'змінені', x.changed], ['прибрано', 'прибрані', x.removed]].map(([say, word, list]) => ({
+        say, word, n: purDiffCount(list), keys: purClip((list || []).filter((k) => !PUR_DIFF_COUNTER.test(String(k))), 6) }));
+      const shown = groups.filter((g) => g.n);
+      if (shown.length) {
+        out.push({ sheet, say: shown.map((g) => `${g.say} ${g.n}`).join(', '),
+          lists: shown.filter((g) => g.keys.length).map((g) => `${g.word}: ${g.keys.join('; ')}`) });
+      }
+    }
+    return out;
+  }
+  /** Слово після вивантаження книги: де вона лежить, чи склались бланки й чи читається книга назад (інакше її не приймуть). `bad` —
+   *  слово попереджає, а не лише повідомляє. З іншого ПК книгу завантажив браузер (`download`), а шлях і бланки — на основному. */
+  function purBookDone(j) {
+    const trim = (s) => String(s).replace(/[.\s]+$/, '');
+    const back = Array.isArray(j.readBack) ? j.readBack : [];
+    const parts = [`${j.download ? 'Книгу вивантажено й завантажено браузером.' : `Книгу вивантажено: ${j.path}.`} Закупівель: ${j.purchases}, документів: ${j.docs}.`,
+      j.blanksError ? `Бланки не складено: ${trim(j.blanksError)}.` : `Бланки лежать у теці «Бланки»${j.download ? ' на основному комп’ютері' : ''}.`];
+    if (back.length) parts.push(`Книга не читається назад: ${purClip(back.map(trim), 2).join('; ')}.`);
+    return { text: parts.join(' '), bad: !!(j.blanksError || back.length) };
+  }
+  /** Слово після «Знайти файли»: скільки зниклих файлів знайдено за вмістом і скільки лишилось невідомо де. */
+  function purFoundWord(found, rest) {
+    if (!found && !rest) return 'Зниклих файлів немає.';
+    if (!found) return `Зниклих файлів знайти не вдалося: ${rest}.`;
+    return rest ? `Знайдено файлів: ${found}. Не знайдено: ${rest}.` : `Знайдено й перепідшито файлів: ${found}.`;
+  }
+  // ЗАКУПІВЛІ: КІНЕЦЬ
 
   /** Вид обліку позиції: необоротний актив (субрахунки 10/11 — основні засоби
    *  й інші необоротні матеріальні активи) чи запаси (15/18). Вирішує
@@ -735,8 +1401,8 @@
   const SYNC_VIEW = ['view', 'asOf', 'q', 'group', 'sub', 'onlyShort', 'onlyMine', 'noScan', 'assetF', 'subAsset',
     'subHolder', 'subFilterFor', 'stId', 'stSub', 'mtzMonth', 'peopleTab', 'personId', 'movesKindF', 'staffForm',
     'movesFrom', 'movesTo', 'movesLimit', 'itemCode', 'reconDate', 'reconId', 'j14sub', 'j14page', 'j47code',
-    'moveKind', 'docKey', 'docBack', 'subName', 'paperId', 'paperVer', 'staffAll', 'normTerms', 'purCut', 'purFold',
-    'paperHist', 'staffOpen', 'sort', 'tf'];
+    'moveKind', 'docKey', 'docBack', 'subName', 'paperId', 'paperVer', 'staffAll', 'normTerms', 'purId', 'budId',
+    'purDocId', 'purVer', 'purYear', 'paperHist', 'staffOpen', 'sort', 'tf'];
   function syncView() {
     const v = {};
     for (const k of SYNC_VIEW) {
@@ -752,7 +1418,8 @@
     officials: 'посадові особи', locations: 'дислокація', unit: 'реквізити', subst: 'заміни',
     ownLines: 'форма 21/Прод', lineCodes: 'форма 21/Прод', docFes: 'статус ФЕС', docMeta: 'поля документів',
     form2Map: 'прив’язки 2/Прод', form2Own: 'рядки 2/Прод', form2Cells: '2/прод', form2Notes: 'записки 2/прод',
-    parties: 'контрагенти', fesMap: 'звірка з ФЕС', fesPlaces: 'звірка з ФЕС' };
+    parties: 'контрагенти', fesMap: 'звірка з ФЕС', fesPlaces: 'звірка з ФЕС', budget: 'кошти', purchases: 'закупівлі',
+    purDocs: 'документи закупівель' };
   /** «(Міша, 10:42)» — ім'я не відмінюється, тож стоїть у дужках. */
   const syncWho = (x) => { const t = [x && x.who, x && x.at].filter(Boolean).join(', '); return t ? ` (${t})` : ''; };
 
@@ -791,11 +1458,12 @@
     return true;
   }
 
-  /** У вікні нічого не вносять, а хтось записав зміни — вікно підтягує їх. */
+  /** У вікні нічого не вносять, а хтось записав зміни — вікно підтягує їх. `info.note` — власне слово для оновленого вікна (прийом
+   *  книги закупівель: сервер сам змінив базу й назвав копію), замість «дані змінено в іншому вікні». */
   function syncFresh(info) {
     try {
       sessionStorage.setItem(SYNC_PACK, JSON.stringify({ ops: [], view: syncView(), reason: 'fresh',
-        who: info.who || '', at: info.at || '' }));
+        who: info.who || '', at: info.at || '', note: info.note || '' }));
     } catch (e) {
       return;
     }
@@ -836,7 +1504,7 @@
     for (const k of SYNC_VIEW) if (v.state && k in v.state) state[k] = v.state[k];
     if (v.scroll) { scrollMemo.set(screenKey(), v.scroll); state.restoreScroll = true; }
     if (pack.reason === 'fresh') {
-      sync.note = `Оновлено: дані змінено в іншому вікні${syncWho(pack)}.`;
+      sync.note = pack.note || `Оновлено: дані змінено в іншому вікні${syncWho(pack)}.`;
     } else if (ops.length) {
       const parts = [...new Set(clashes.map((op) => SYNC_PART[op.p[0]] || 'інше'))];
       sync.note = (pack.reason === 'login' ? 'Ви знову ввійшли — внесене записано.'
@@ -901,11 +1569,14 @@
       || !!String(d.head.basis || '').trim() || !!String(d.head.note || '').trim())));
 
   function keepDrafts() {
-    if (state.editing) return;
+    if (state.editing || state.editingReport) return;          // документ чи рапорт у виправленні — не чернетка: оригінал і так в обліку
     const all = Object.assign({}, state.drafts || {});
     if (state.draft) {
-      if (hasContent(state.draft)) all[state.draft.kind] = state.draft;
-      else delete all[state.draft.kind];
+      // Відкрита чернетка — у своїй комірці (`slotOf`), а не під видом документа: чернетка приходу ОП лягала під «in» і витісняла
+      // відкладену чернетку приходу ТЗ, а після перезапуску поверталась би в комірку ТЗ.
+      const slot = slotOf(state.draft.kind, state.draft.book || 'ТЗ');
+      if (hasContent(state.draft)) all[slot] = state.draft;
+      else delete all[slot];
     }
     const keep = {};
     for (const [k, v] of Object.entries(all)) if (hasContent(v)) keep[k] = v;
@@ -919,6 +1590,20 @@
     }
   }
   let draftsSaved = '{}';
+  /** Чернетки з налаштувань вікна — у відкладені, кожна у своїй комірці за видом і книгою самої чернетки, а не за ключем запису:
+   *  попередня версія писала відкриту чернетку під її видом («in» і для ОП), тож ключу не вірять. Копії, не спільні об'єкти;
+   *  дві чернетки однієї комірки (так могло лягти в старому записі) — лишається остання, відкрита. */
+  function restoreDrafts(saved) {
+    const out = {};
+    for (const [k, v] of Object.entries(saved && typeof saved === 'object' ? saved : {})) {
+      if (!(v && v.head && Array.isArray(v.lines))) continue;
+      out[slotOf(v.kind || String(k).split('@')[0], v.book || 'ТЗ')] = JSON.parse(JSON.stringify(v));
+    }
+    return out;
+  }
+  /** Що відновлено після перезапуску: «приходу (посуд і миючі), списання» — вид у родовому відмінку й книга самої чернетки. */
+  const DRAFT_KIND_OF = { in: 'приходу', mv: 'переміщення', wr: 'списання', dz: 'рапорту про знищення' };
+  const draftsWord = (list) => list.map((v) => (DRAFT_KIND_OF[v.kind] || v.kind) + bookWord(v.book)).join(', ');
   let draftTimer = null;
   const keepDraftsSoon = () => { clearTimeout(draftTimer); draftTimer = setTimeout(keepDrafts, 500); };
 
@@ -1354,9 +2039,12 @@
     item: renderItem, doc: renderDoc, moves: renderMoves, j14: renderJ14, j47: renderJ47,
     destroyed: renderDestroyed, recon: renderRecon, subst: renderSubst,
     stocktake: renderStocktake, people: renderPeople, sub: renderSubCard, mtz: renderMtz,
-    purch: renderPurchases, val: () => renderPapers('valuation'), yats: () => renderPapers('tech_act'),
+    purch: renderPurchases, purbud: renderBudget, purdocs: renderPurDocs, val: () => renderPapers('valuation'), yats: () => renderPapers('tech_act'),
     settings: renderSettings, form2: renderForm2,
   };
+
+  /** Що скидається, коли відкривають іншу книгу: фільтри списків однієї книги до іншої не переходять (пункт меню й «Дописати»). */
+  const BOOK_FILTERS_OFF = { group: '', assetF: '', onlyShort: false, movesKindF: '' };
 
   // Пункти згруповані за тим, навіщо людина сюди заходить: облік ведуть,
   // контроль проходять, довідник людей ведуть окремо, журнали друкують. Сам
@@ -1369,6 +2057,9 @@
     stocktake: { stId: null, stSub: '' },
     people: { personId: null, assign: null },
     mtz: { mtzMonth: null },
+    purch: { purId: null, purVer: null },
+    purbud: { budId: null },
+    purdocs: { purDocId: null },
     val: { paperId: null, paperVer: 0, paperBad: null },
     yats: { paperId: null, paperVer: 0, paperBad: null },
   };
@@ -1395,7 +2086,7 @@
     { id: 'stocktake', ico: '☑', label: 'Інвентаризація', badge: () => (store.inventories || [])
       .filter((x) => x.status !== 'завершено').length || '' },
     { id: 'mtz', ico: '₴', label: 'Відомість МТЗ', badge: () => mtzTodo() || '' },
-    { id: 'purch', ico: '⊕', label: 'Закупівлі' },
+    { id: 'purch', ico: '⊕', label: 'Закупівлі', views: ['purbud', 'purdocs'] },
     { id: 'supply', ico: '∑', label: 'Штат і потреба', views: ['subst'] },
     { group: 'звіти' },
     { id: 'form2', ico: '◫', label: '2/Прод', badge: () => form2MapNow().filter((m) => m.row && !m.checked).length || '' },
@@ -1497,7 +2188,9 @@
     stocktake: () => 'Наказ, комісія, описи по МВО й акт за формами наказу Мінфіну № 572',
     destroyed: () => 'Рапорти про знищення й акти списання',
     mtz: () => `Закуплене й отримане за ${mtzSpan(mtzMonth())}, станом на ${fmtDate(mtzAsOf(mtzMonth()))}`,
-    purch: () => 'Надходження ззовні за документами; це не підтверджені оплати',
+    purch: () => (state.purId ? 'Справа закупівлі' : `Закупівлі ${purYear()} року`),
+    purbud: () => (state.budId && budById(state.budId) ? 'Рядок коштів' : `Кошти ${purYear()} року`),
+    purdocs: () => { const d = state.purDocId ? pdById(state.purDocId) : null; return d && d.kind === 'акт введення' ? avSubtitle(d) : pdSubtitle(); },
     val: () => (state.paperId ? 'Додаток 1 до Методики визначення залишкової вартості (постанова КМУ № 759)'
       : 'Відомості за Додатком 1 до Методики (постанова КМУ № 759)'),
     yats: () => (state.paperId ? 'Додаток 1 до Порядку списання військового майна' : 'Акти якісного (технічного) стану'),
@@ -1554,9 +2247,14 @@
     : state.view === 'doc' ? state.docKey : state.view === 'recon' ? (state.reconId || '')
       : state.view === 'stocktake' ? `${state.stId || ''}|${state.stSub || ''}`
         : state.view === 'people' ? `${state.peopleTab || ''}` : state.view === 'sub' ? (state.subName || '')
-          : state.view === 'val' || state.view === 'yats' ? `${state.paperId || ''}|${state.paperVer || ''}` : '');
+          : state.view === 'val' || state.view === 'yats' ? `${state.paperId || ''}|${state.paperVer || ''}`
+            : state.view === 'purch' ? `${state.purId || ''}|${state.purVer || ''}` : state.view === 'purbud' ? (state.budId || '')
+              : state.view === 'purdocs' ? (state.purDocId || '') : '');
 
+  /** Лічильник показів: що залежить від стану сторінки, але дорого будується, будують раз на показ (див. `mtzPurOf`). */
+  let renderSeq = 0;
   function render() {
+    renderSeq++;
     $('#gear').classList.toggle('is-on', state.view === 'settings');
     pickClose();
     comboClose();
@@ -2432,15 +3130,6 @@
     return { lines, kept };
   }
 
-  /** Незавершена накладна в чернетці — не губимо її мовчки. */
-  function mayReplaceMvDraft() {
-    const mine = (state.drafts || {}).mv;
-    return !(mine && hasContent(mine))
-      || confirm(`Замінити незавершену чернетку накладної?
-
-Написане в ній буде втрачено.`);
-  }
-
   function subTransfer(from, to, date, moved = { mvo: '', norms: 0 }) {
     const { lines, kept } = transferLines(from, date);
     const what = cnt(lines.length, 'позиція', 'позиції', 'позицій');
@@ -2458,10 +3147,7 @@
       return;
     }
     if (!leaveEditing()) return;
-    stashDraft();
-    if (!mayReplaceMvDraft()) return;
-    state.drafts = state.drafts || {};
-    delete state.drafts.mv;
+    if (!freeDraftSlot('mv', 'ТЗ', 'Замінити незавершену чернетку накладної?\n\nНаписане в ній буде втрачено.')) return;
     state.editing = null;
     state.moveKind = 'mv';
     state.draft = { kind: 'mv', lines: lines.concat([emptyLine()]),
@@ -2487,10 +3173,7 @@
       return;
     }
     if (!leaveEditing()) return;
-    stashDraft();
-    if (!mayReplaceMvDraft()) return;
-    state.drafts = state.drafts || {};
-    delete state.drafts.mv;
+    if (!freeDraftSlot('mv', 'ТЗ', 'Замінити незавершену чернетку накладної?\n\nНаписане в ній буде втрачено.')) return;
     state.editing = null;
     state.moveKind = 'mv';
     const sb = subBy.get(from);
@@ -3335,7 +4018,8 @@
       ['Одиниця виміру', i.unit],
       ['Ціна', fmtMoney(i.price) + ' грн', true],
       ['Дободач', i.perRation != null && i.perRation !== '' ? fmtNum(i.perRation) : '—', true],
-    ].concat(i.note ? [['Примітка', i.note]] : [])
+    ].concat(((t) => (t ? [['Надійшло', t]] : []))(itemPurText(i.code)))
+      .concat(i.note ? [['Примітка', i.note]] : [])
       .concat(i.archived ? [['В архіві', `з ${fmtDate(i.archived)}: у нових приходах не пропонується`]] : [])
       .map(([k, v, mono]) => `<div><div class="spec__k">${esc(k)}</div>
         <div class="spec__v${mono ? ' spec__v--mono' : ''}">${esc(v)}</div></div>`).join('') : [
@@ -3355,6 +4039,7 @@
         : 'не підтверджено, звірте з бухгалтерією', !!i.fes],
       ['Спосіб обліку', i.serial || i.chassis ? "пооб'єктний" : 'кількісний'],
     ].concat(i.old ? [['Старі коди (облік 3.0)', i.old, true]] : [])
+      .concat(((t) => (t ? [['Надійшло', t]] : []))(itemPurText(i.code)))
       .concat(i.note ? [['Примітка', i.note]] : [])
       .concat(i.archived ? [['В архіві', `з ${fmtDate(i.archived)}: у нових приходах не пропонується`]] : [])
       .map(([k, v, mono]) => `<div><div class="spec__k">${esc(k)}</div>
@@ -3435,7 +4120,7 @@
       const route = r.kind === 'wr' && !r.to ? r.from : `${r.from} → ${r.to}`;
       return list.map((f, i) => `<div class="file" data-vw="${i}" data-vw-key="${esc(k)}"
         title="${esc(f.file)}&#10;${esc(doc)} · ${esc(route)}">
-        ${native && IMG_EXT.test(f.path) ? `<img class="file__thumb" src="${fileUrl(f.path)}?w=320" loading="lazy" alt="">`
+        ${native && IMG_EXT.test(f.path) ? `<img class="file__thumb" src="${fileUrl(f.path, f.folder)}?w=320" loading="lazy" alt="">`
           : `<span class="file__ico">${fileIcon(f.path)}</span>`}
         <span class="file__name">${esc(f.file)}</span>
         <span class="file__meta">${esc(doc)} · ${esc(route)}</span></div>`).join('');
@@ -3460,6 +4145,7 @@
         <button type="button" class="btn btn--sm" data-act="un-new" data-code="${esc(i.code)}"
           title="Кухня, причіп, цистерна: завести одиницю з номером, потім назвати її в приході">+ Одиниця</button></div></div>`;
     }
+    const pctx = purCtx();
     const form = (x) => `<div class="tbl__row tbl__row--plain unit-form">
         <div class="c-code" style="width:110px">${esc(x.inv || '—')}</div>
         <div class="c-code" style="width:150px"><input class="rc-in rc-in--wide" data-ue="serial" value="${esc(ed.serial)}"
@@ -3489,7 +4175,8 @@
         <div class="c-code" style="width:110px">${esc(x.chassis || '—')}</div>
         <div class="c-num">${x.year || '—'}</div>
         <div class="c-num" title="Категорія стану на ${fmtDate(state.asOf)}">${cat || '—'}</div>
-        <div class="c-txt">${esc((x.id ? unitHolderAt(x.id, state.asOf, null) : '') || x.holder || 'ніде не числиться')}<small>${esc(x.note || '')}</small></div>
+        <div class="c-txt">${esc((x.id ? unitHolderAt(x.id, state.asOf, null) : '') || x.holder || 'ніде не числиться')}<small>${
+  esc([x.note, x.id ? unitPurText(x, i.code, pctx) : ''].filter(Boolean).join(' · '))}</small></div>
         <div class="c-acts" style="flex-basis:240px">${files.length
           ? `<button type="button" class="btn btn--sm" data-vw="0" data-vw-key="${esc(key)}" title="Переглянути фото й файли">📷 ${files.length}</button>` : ''}
           ${native ? `<button type="button" class="btn btn--sm" data-act="file-add" data-key="${esc(key)}"
@@ -3593,8 +4280,8 @@
   /** Кнопки-посилання на скани; підшиті в програмі мають ✕ — відв'язати. */
   function scanButtons(list) {
     return list.map((x) => (native
-      ? `<a class="btn" href="${fileUrl(x.path)}" target="_blank" rel="noopener" title="Відкрити скан">&#128206; ${esc(x.file)}</a>${
-        x.mine ? rowBtn('scan-del', '✕ Відв’язати', `data-path="${esc(x.path)}"`, { bad: true, title: 'Відв’язати скан від документа; файл лишиться в теці' }) : ''}`
+      ? `<a class="btn" href="${fileUrl(x.path, x.folder)}" target="_blank" rel="noopener" title="Відкрити скан">&#128206; ${esc(x.file)}</a>${
+        x.mine ? rowBtn('scan-del', '✕ Відв’язати', `data-path="${esc(x.path)}" data-folder="${esc(x.folder || '')}"`, { bad: true, title: 'Відв’язати скан від документа; файл лишиться в теці' }) : ''}`
       : `<span class="btn" title="Скан відкривається в програмі на комп’ютері">&#128206; ${esc(x.file)}</span>`)).join('');
   }
 
@@ -3632,7 +4319,9 @@
           headers: { 'Content-Type': 'application/octet-stream', 'X-File-Name': encodeURIComponent(f.name),
                      'X-Doc-Date': t.date || '', 'X-Doc-No': encodeURIComponent(t.no || ''),
                      'X-Doc-Label': encodeURIComponent(t.label || ''),
-                     'X-Folder': encodeURIComponent(t.folder || '') },
+                     'X-Folder': encodeURIComponent(t.folder || ''),
+                     // Файл служби (закупівлі) лягає в теку з налаштувань під іменем служби; розширення дописує сервер.
+                     ...(t.folderKey ? { 'X-Folder-Key': encodeURIComponent(t.folderKey), 'X-Name': encodeURIComponent(t.name || '') } : {}) },
         });
         const text = await r.text();
         let j = {};
@@ -3640,7 +4329,7 @@
         if (!r.ok || !j.ok) throw new Error(j.error || text || `помилка ${r.status}`);
         store.scans = store.scans || [];
         store.scans.push({ key: t.key, date: t.date, no: t.no, file: j.file, path: j.path,
-                           mime: f.type || '', size: f.size, added: today() });
+                           mime: f.type || '', size: f.size, added: today(), folder: j.folder || '', sha: j.sha || '' });
         ok++;
       } catch (e) {
         toast(`«${f.name}» не підшито: ${e.message || e}`, true);
@@ -3654,11 +4343,12 @@
     }
   }
 
-  function unlinkScan(path) {
-    const x = (store.scans || []).find((y) => y.path === path);
+  function unlinkScan(path, folder = '') {
+    const same = (y) => y.path === path && (y.folder || '') === folder;       // той самий шлях у іншій теці — інший файл
+    const x = (store.scans || []).find(same);
     if (!x) return;
-    if (!confirm(`Відв'язати файл «${x.file}»? Сам файл лишиться в теці «Дані обліку/скани».`)) return;
-    store.scans = store.scans.filter((y) => y.path !== path);
+    if (!confirm(`Відв'язати файл «${x.file}»? Сам файл лишиться в ${folder ? 'теці служби' : 'теці «Дані обліку/скани»'}.`)) return;
+    store.scans = store.scans.filter((y) => !same(y));
     logChange('файл відв’язано', x.key, x.file);
     save(true, true);
     render();
@@ -3995,7 +4685,7 @@
       <div class="card" style="margin-bottom:12px">
         <div class="card__head"><div class="card__title">Реквізити</div></div>
         <div style="padding:18px"><div class="spec">${spec}</div></div></div>
-      ${fesCard(r0)}
+      ${fesCard(r0)}${purRcptCard(r0)}
       ${filesCard(fileKey, 'Скани й файли документа', 'скан, фото, лист, електронний документ')}
       <div class="card"><div class="card__head"><div class="card__title">Найменування в документі</div></div>
         <div class="card--scroll"><div class="tbl" style="--tbl-min:900px">
@@ -4124,6 +4814,7 @@
         // Своя кнопка нового документа, а не спільна: вона ховається, поки
         // форма відкрита, — інакше в шапці стояли дві однакові.
         searchBox('Пошук: номер, код, найменування, підрозділ, зав. №, примітка') + actionsExcel
+        + '<button class="btn" data-act="pd-fes-register">Реєстр на ФЕС…</button>'
         + (formOpen() ? '' : '<button class="btn btn--primary" data-act="doc-new">+ Новий документ</button>')),
       body: `
       ${flashBlock()}
@@ -4736,17 +5427,17 @@
   /** Коли форма закрита: рядок про незавершені документи, щоб чернетка не
    *  загубилася, і кнопка почати новий. */
   function draftsBar() {
-    const open = Object.entries(state.drafts || {}).filter(([, v]) => hasContent(v));
-    if (state.draft && hasContent(state.draft) && !open.some(([k]) => k === state.draft.kind)) {
-      open.push([state.draft.kind, state.draft]);
-    }
+    // Ключ відкладеної чернетки — її комірка («in@ОП»), а не вид документа: вид і книга — з самої чернетки.
+    const open = Object.values(state.drafts || {}).filter((v) => hasContent(v));
+    const cell = (v) => slotOf(v.kind, v.book || 'ТЗ');
+    if (state.draft && hasContent(state.draft) && !open.some((v) => cell(v) === cell(state.draft))) open.push(state.draft);
     if (!open.length) return '';
-    const what = open.map(([k, v]) => `${KIND_NAME[k] || 'Рапорт'}${v.head.no ? ' ' + numNo(v.head.no) : ''}`
+    const what = open.map((v) => `${KIND_NAME[v.kind] || 'Рапорт'}${bookWord(v.book)}${v.head.no ? ' ' + numNo(v.head.no) : ''}`
       + (v.head.date ? ` від ${fmtDate(v.head.date)}` : '')).join('; ');
     return `<div class="flash flash--warn" style="margin-bottom:12px">
       <span>${statusTag('draft')} <b>${cnt(open.length, 'незавершений документ', 'незавершені документи',
         'незавершених документів')}</b> у формі: ${esc(what)}.</span>
-      <span><button class="btn btn--sm btn--primary" data-act="doc-new" data-v="${esc(open[0][0])}">Дописати</button></span>
+      <span><button class="btn btn--sm btn--primary" data-act="doc-new" data-v="${esc(open[0].kind)}" data-book="${esc(open[0].book || 'ТЗ')}">Дописати</button></span>
     </div>`;
   }
 
@@ -5944,7 +6635,10 @@
     from: r[2] || '', to: r[3] || '', note: r[4] || '' });
   const baseLocation = (r) => ({ id: r[0], from: r[1] || '', place: r[2] || '', note: r[3] || '' });
   /** Реквізити частини для бланків: назва юридичної особи, ЄДРПОУ, повна назва
-   *  служби й скільки днів дійсна накладна. Початкові — з бази, правлять їх у
+   *  служби й скільки днів дійсна накладна; для паперів закупівель — відомчий код
+   *  розпорядника коштів, вищий штаб і телефон служби (у базі їх немає: порожні,
+   *  доки не вписані). Місця складання тут немає: його дає дислокація за датами
+   *  (`locationAt`), друге джерело правди не заводять. Початкові — з бази, правлять їх у
    *  «Люди й МВО → Частина»: переїхала частина чи змінилася назва служби —
    *  міняють тут, а не в самому бланку Excel. */
   const UNIT_FIELDS = [
@@ -5955,6 +6649,9 @@
       'повна назва, як у документах'],
     ['validDays', 'Накладна дійсна, днів', '1', 'скільки днів після дати операції'],
     ['opening', 'Початок обліку', '', 'документів із ранішою датою програма не приймає', 'date'],
+    ['fundCode', 'Відомчий код розпорядника коштів', '', 'для форм 1/фс і 9/фс'],
+    ['upperHq', 'Вищий штаб', 'А0000', 'кому йде супровід через СЕДО'],
+    ['phone', 'Телефон служби', '(000)-000-00-00', 'виконавець у 9/фс'],
   ];
   /** Умовне найменування частини («А0000») — з найменування юридичної особи в
    *  реквізитах; без нього — порожньо, і тексти обходяться без числа. */
@@ -5967,6 +6664,9 @@
       serviceFull: D.meta.serviceFull || D.meta.service || '',
       validDays: D.meta.validDays || 1,
       opening: D.meta.opening || '',
+      fundCode: '',
+      upperHq: '',
+      phone: '',
     };
     const mine = store.unit || {};
     const out = {};
@@ -6143,7 +6843,7 @@
     const viaVmtz = vmtz && mvoAt(vmtz.name, date);
     return viaVmtz || (sb.parent ? mvoFor(sb.parent, date, depth + 1) : null);
   }
-  /** Скільки разів людина згадана в призначеннях та інвентаризаціях. */
+  /** Скільки разів людина згадана в призначеннях, інвентаризаціях, довіреностях закупівель («кому») і закупівлях (відповідальний). */
   function personUses(id) {
     // Інвентаризації з бази теж: людина, що підписала торішній опис, має
     // лишитися в довіднику, інакше база видалення відхиляла мовчки.
@@ -6151,8 +6851,10 @@
       || Object.values(x.sign || {}).includes(id) || Object.values(x.mvo || {}).includes(id)
       || Object.values(x.cmdr || {}).includes(id)
       || Object.values(x.plan || {}).some((p) => p && p.who === id)).length;
+    // Закупівлі теж: база знімає посилання на видалену людину мовчки («ON DELETE SET NULL»), і довіреність лишилася б без «кому».
+    const pur = (store.purDocs || []).filter((d) => d.person === id).length + (store.purchases || []).filter((p) => p.person === id).length;
     return store.mvo.filter((r) => r.person === id).length + store.cmdrs.filter((r) => r.person === id).length
-      + store.officials.filter((r) => r.person === id).length + inv;
+      + store.officials.filter((r) => r.person === id).length + inv + pur;
   }
   const peopleSorted = () => store.people.slice().sort((a, b) =>
     upper(a.surname).localeCompare(upper(b.surname), 'uk') || String(a.name).localeCompare(String(b.name), 'uk'));
@@ -6350,7 +7052,7 @@
     if (!p) return;
     const n = personUses(p.id);
     if (n) {
-      alert(`Не можна видалити «${pFull(p)}»: згадано в ${cnt(n, 'призначенні', 'призначеннях', 'призначеннях')} чи інвентаризаціях. `
+      alert(`Не можна видалити «${pFull(p)}»: згадано в ${cnt(n, 'записі', 'записах', 'записах')} (призначення, інвентаризації, довіреності, закупівлі). `
         + 'Напишіть у примітці «не служить».');
       return;
     }
@@ -6746,7 +7448,11 @@
    *    інвентаризація. Файл лежить у «Дані обліку/скани», у стані — посилання. */
   const IMG_EXT = /\.(jpe?g|png|gif|bmp|webp)$/i;
   const PDF_EXT = /\.pdf$/i;
-  const fileUrl = (path) => 'скани/' + String(path).split('/').map(encodeURIComponent).join('/');
+  /** Теки служби, куди програма кладе файли закупівель (ключі — ті самі, що в `FOLDERS` сервера), і як їх називають. */
+  const SERVICE_FOLDERS = { purchases: 'Закупівлі', receipts: 'Прибутково-видаткові документи', fesRegisters: 'Реєстри на ФЕС' };
+  /** Посилання на файл: у «Дані обліку/скани» або (з ключем теки) в одній із тек служби — `теки/<ключ>/<шлях>`. */
+  const fileUrl = (path, folder = '') => (folder ? 'теки/' + encodeURIComponent(folder) + '/' : 'скани/')
+    + String(path).split('/').map(encodeURIComponent).join('/');
   const fmtSize = (n) => (!n ? '' : n < 1024 ? n + ' Б' : n < 1048576 ? Math.round(n / 1024) + ' КБ'
     : (n / 1048576).toFixed(1).replace('.', ',') + ' МБ');
   const fileIcon = (path) => (PDF_EXT.test(path) ? 'PDF' : /\.(docx?|odt|rtf)$/i.test(path) ? 'DOC'
@@ -6760,14 +7466,16 @@
     const rp = /^dz\|(\d+)$/.exec(key);
     if (rp) {
       return (docScans.get(+rp[1]) || []).concat((store.scans || []).filter((x) => x.key === key)
-        .map((x) => ({ file: x.file, path: x.path, mime: x.mime, size: x.size, mine: true, added: x.added })));
+        .map((x) => ({ file: x.file, path: x.path, mime: x.mime, size: x.size, mine: true, added: x.added, folder: x.folder || '',
+          made: !!x.made, sha: x.sha || '' })));
     }
     const m = DOC_FILE_KEY.exec(key);
     const legacy = m ? m[2] + '|' + m[3] : null;
     const base = m ? idsOfDoc(key).flatMap((id) => docScans.get(id) || []).concat(scans.get(legacy) || [])
       : (scans.get(key) || []);
     return base.concat((store.scans || []).filter((x) => x.key === key || (legacy && x.key === legacy))
-      .map((x) => ({ file: x.file, path: x.path, mime: x.mime, size: x.size, mine: true, added: x.added })));
+      .map((x) => ({ file: x.file, path: x.path, mime: x.mime, size: x.size, mine: true, added: x.added, folder: x.folder || '',
+        made: !!x.made, sha: x.sha || '' })));
   };
 
   /** Куди й під яким ім'ям покласти файл, підшитий до ключа. */
@@ -6792,6 +7500,11 @@
       const r = allDestroyed().find((x) => reportKey(x) === key);
       return r ? { key, date: r.reportDate || r.date, no: r.report || '', label: `рапорт ${r.sub}`, folder: 'рапорти' } : null;
     }
+    // Папери закупівель лягають у теки служби (Закупівлі, Прибутково-видаткові документи, Реєстри на ФЕС) під іменами служби.
+    if (kind === 'bud' || kind === 'purver' || kind === 'purdoc' || kind === 'fesreg') {
+      const w = purFolderFor(key);
+      return w ? Object.assign({ key, date: today(), no: '' }, { folderKey: w.folder, folder: w.dir, name: w.name }) : null;
+    }
     // Документ: «вид|дата|номер|від|кому».
     return DOC_FILE_KEY.test(key) ? { key, date: a, no: b } : null;
   }
@@ -6800,12 +7513,12 @@
   function filesCard(key, title, hint) {
     const list = filesOf(key);
     const items = list.map((f, i) => `<div class="file" data-vw="${i}" data-vw-key="${esc(key)}" title="${esc(f.file)}${f.note ? '&#10;' + esc(f.note) : ''}">
-        ${native && IMG_EXT.test(f.path) ? `<img class="file__thumb" src="${fileUrl(f.path)}?w=320" loading="lazy" alt="">`
+        ${native && IMG_EXT.test(f.path) ? `<img class="file__thumb" src="${fileUrl(f.path, f.folder)}?w=320" loading="lazy" alt="">`
           : `<span class="file__ico">${fileIcon(f.path)}</span>`}
         <span class="file__name">${esc(f.file)}</span>
         <span class="file__meta">${esc([f.kind, fmtSize(f.size), f.added ? fmtDate(f.added) : ''].filter(Boolean).join(' · '))}</span>
         ${f.mine ? `<button type="button" class="ico-btn ico-btn--bad file__del" data-act="scan-del" data-path="${esc(f.path)}"
-          title="Відв’язати файл">✕</button>` : ''}
+          data-folder="${esc(f.folder || '')}" title="Відв’язати файл">✕</button>` : ''}
       </div>`).join('');
     return `<div class="card files" style="margin-bottom:12px">
       <div class="card__head"><div class="card__title">${esc(title)}</div><div class="panel__spacer"></div>
@@ -6831,7 +7544,7 @@
     if (!v || !list.length) { if (el) el.remove(); state.viewer = null; return; }
     v.idx = Math.max(0, Math.min(v.idx, list.length - 1));
     const f = list[v.idx];
-    const url = fileUrl(f.path);
+    const url = fileUrl(f.path, f.folder);
     if (!el) {
       el = document.createElement('div');
       el.id = 'viewer';
@@ -6868,10 +7581,10 @@
   async function fileOpen(f, reveal = false) {
     if (!f) return;
     // З іншого ПК файл відкриває браузер: програми Windows основного ПК тут ні до чого.
-    if (me.remote) { window.open(fileUrl(f.path), '_blank'); return; }
+    if (me.remote) { window.open(fileUrl(f.path, f.folder), '_blank'); return; }
     try {
       const r = await fetch(reveal ? 'api/reveal' : 'api/open', { method: 'POST',
-        headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: f.path }) });
+        headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: f.path, folder: f.folder || '' }) });
       if (!r.ok) throw new Error((await r.text()) || `помилка ${r.status}`);
     } catch (e) {
       toast(`Не вдалося відкрити «${f.file}»: ${e.message || e}`, true);
@@ -7998,6 +8711,9 @@
       case 'loc-add': return locationAdd();
       case 'loc-del': return locationDelete(d.id);
       case 'file-add': {
+        const why = purFileRefusal(d.key);
+        if (why) { toast(why, true); return null; }
+        purPinFolder(purOfFileKey(d.key));                       // перший файл справи без «теки» записує її теку
         const t = fileTarget(d.key);
         if (t) attachScan(t);
         return null;
@@ -8020,14 +8736,18 @@
   const fmtStamp = (s) => (s ? fmtDate(String(s).slice(0, 10)) + String(s).slice(10) : '');
   async function checkFiles() {
     if (!native) return;
-    const paths = new Set();
+    const paths = new Set(), kept = new Map();
     for (const list of [...scans.values(), ...docScans.values()]) for (const f of list) if (f.path) paths.add(f.path);
-    for (const f of (store.scans || [])) if (f.path) paths.add(f.path);
+    for (const f of (store.scans || [])) {
+      if (!f.path) continue;
+      // Файл у теці служби шукається в ній, а не в «скани»: інакше кожен папір закупівлі був би «не знайдений».
+      if (f.folder) kept.set(`${f.folder}|${f.path}`, { folder: f.folder, path: f.path }); else paths.add(f.path);
+    }
     try {
       const r = await fetch('api/scan-check', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ paths: [...paths] }) });
+        body: JSON.stringify({ paths: [...paths], files: [...kept.values()] }) });
       const j = await r.json();
-      missingFiles = j.missing || [];
+      missingFiles = (j.missing || []).concat((j.missingFiles || []).map((f) => `${SERVICE_FOLDERS[f.folder] || f.folder}: ${f.path}`));
       if (missingFiles.length) render();
     } catch (e) { missingFiles = null; }
     try {
@@ -8040,7 +8760,8 @@
     const rows = (missingFiles || []).map((p) => `<div class="tbl__row tbl__row--plain">
         <div class="c-txt">${esc(p)}</div></div>`).join('');
     modalOpen('Підшиті файли, яких немає в теці',
-      `<div class="panel"><div class="panel__note">Покладіть файли назад у «Дані обліку/скани» з тими самими іменами або підшийте наново.</div></div>
+      `<div class="panel"><div class="panel__note">Покладіть файли назад у «Дані обліку/скани» чи в названу перед шляхом теку служби
+        з тими самими іменами або підшийте наново.</div></div>
       <div class="tbl" style="--tbl-min:640px">${rows}</div>`);
   }
 
@@ -8150,6 +8871,21 @@
     add('warn', bare.length, `${plural(bare.length, 'надходження', 'надходження', 'надходжень')} без джерела для відомості МТЗ`,
       () => { tfOf('mtz').st = 'bare'; go('mtz', { mtzMonth: null }); },
       [...new Set(bare.map((x) => numNo(x.no)))].slice(0, 5).join(', '), `Вказати джерело · ${bare.length}`);
+    // Субвенції: повернути залишок і звітувати громаді — єдині нагадування про закупівлі на Зведенні. Показники рахує
+    // контекст закупівель, тож його будують лише коли є що перевіряти.
+    const owed = purBudget().filter((l) => l.fund === 'Субвенція' && (l.returnBy || l.reportBy));
+    const pctx = owed.length ? purCtx() : null;
+    for (const l of owed) {
+      const reported = filesOf(`bud|${l.id}|звіт`).length > 0;
+      for (const due of budDue(l, budNums(l, pctx), t, reported)) {
+        const what = due.what === 'повернення' ? `повернути залишок субвенції ${grnOf(due.kop)} грн (${l.label})`
+          : `звіт громаді (${l.label})`;
+        out.push({ lvl: due.left < 0 ? 'bad' : due.left <= 7 ? 'warn' : 'info', n: Math.abs(due.left) || '!',
+          text: due.left < 0 ? `${plural(-due.left, 'день', 'дні', 'днів')} після строку: ${what}, ${fmtDate(due.date)}`
+            : due.left ? `${plural(due.left, 'день', 'дні', 'днів')} до строку: ${what}, ${fmtDate(due.date)}` : `сьогодні строк: ${what}`,
+          fn: () => go('purbud', { budId: l.id, purYear: l.year }), hint: '', act: 'Відкрити рядок' });
+      }
+    }
     const y = t.slice(0, 4);
     if (t >= `${y}-10-15` && !allInv().some((x) => x.date.startsWith(y) && x.kind === 'щорічна')) {
       add('info', 1, `щорічна інвентаризація ${y} року ще не заведена`, () => go('stocktake', { stId: null }),
@@ -8160,7 +8896,7 @@
       () => go('moves', { noScan: true, onlyMine: true, movesLimit: 200 }), '',
       `Підшити скани · ${mineNoScan.size}`);
     add('bad', (missingFiles || []).length, `${plural((missingFiles || []).length, 'підшитий файл', 'підшиті файли',
-      'підшитих файлів')} не знайдено в теці «скани»`, () => showMissingFiles(),
+      'підшитих файлів')} не знайдено в теках`, () => showMissingFiles(),
       (missingFiles || []).slice(0, 2).join('; '), 'Показати перелік');
     const off = invMismatch();
     add('info', off.length, `${plural(off.length, 'позиція', 'позиції', 'позицій')}: інвентарні номери не там, де майно`,
@@ -8677,17 +9413,13 @@
       }
     }
     lines.forEach((ln) => { ln.qty = String(ln.qty); });
-    stashDraft();
-    state.drafts = state.drafts || {};
     const book = bookOf(r0.code);
-    if (state.drafts[slotOf(kind, book)] && hasContent(state.drafts[slotOf(kind, book)])
-      && !confirm(`Замінити незавершену чернетку «${KIND_NAME[kind]}»?\n\nНаписане в ній буде втрачено.`)) return;
+    if (!freeDraftSlot(kind, book, `Замінити незавершену чернетку «${KIND_NAME[kind]}»?\n\nНаписане в ній буде втрачено.`)) return;
     const head = mode === 'return'
       ? { type: r0.t || 'Накладна', no: '', date: today(), from: r0.to, to: r0.from,
           basis: `повернення за документом ${numNo(r0.no)} від ${fmtDate(r0.d)}`, report: '', reportDate: '', act: '', note: '' }
       : { type: r0.t || '', no: '', date: today(), from: r0.from, to: r0.to || '', basis: basisOf(r0.note),
           report: '', reportDate: '', act: '', note: '' };
-    delete state.drafts[slotOf(kind, book)];
     state.editing = null;
     state.moveKind = kind;
     state.book = book;
@@ -8758,15 +9490,11 @@
     const { short, over } = reconDiffs(r);
     const src = kind === 'in' ? over : short;
     if (!src.length) return;
-    stashDraft();
-    state.drafts = state.drafts || {};
-    if (state.drafts[kind] && hasContent(state.drafts[kind])
-      && !confirm('Замінити незавершену чернетку?\n\nНаписане в ній буде втрачено.')) return;
+    if (!freeDraftSlot(kind, 'ТЗ', 'Замінити незавершену чернетку?\n\nНаписане в ній буде втрачено.')) return;
     const basis = `відомість звірки №${r.no || '—'} від ${fmtDate(r.date)}`;
     const head = { type: '', no: '', date: r.to, from: kind === 'in' ? `лишки за звіркою (${r.sub})` : r.sub,
       to: kind === 'in' ? r.sub : '', basis, report: '', reportDate: '', act: '',
       note: kind === 'in' ? 'лишки, виявлені під час звірки' : 'нестача, виявлена під час звірки' };
-    delete state.drafts[kind];
     state.moveKind = kind;
     state.draft = { kind, head, lines: src.map((x) => {
       const ln = { code: x.code, qty: String(x.qty), note: '', lot: '', unit: '',
@@ -9033,7 +9761,12 @@
   const mtzCarry = (r) => /перен[ео]с(ення)?\s+(початкових\s+)?залишк/i.test(`${r.t || ''}|${r.from || ''}`)
     || /^(початков\S*\s+залишк\S*|залишк\S*\s+на\s+початок.*)$/i.test(String(r.from || '').trim());
 
-  /** Надходження ззовні за рік (до дати включно): рядок приходу — рядок відомості. */
+  /** Реквізити приходу з рядка коштів його закупівлі: розділ закупівель підставляє свою функцію (вона дає `id → {src, kpkv, kekv}` чи
+   *  `null`). Поки закупівель немає, не дає нічого, і відомість така, якою була. */
+  let mtzPurOf = () => () => null;
+
+  /** Надходження ззовні за рік (до дати включно): рядок приходу — рядок відомості. Джерело, КПКВ і КЕКВ — указані руками, а де їх нема —
+   *  з рядка коштів закупівлі, з якої прийшов прихід; кожне поле окремо. */
   function mtzRows(year, until = `${year}-12-31`) {
     const saved = mtzStore().rows;
     const by = new Map();
@@ -9044,13 +9777,16 @@
       if (x) { x.q = round3(x.q + r.q); continue; }
       by.set(key, { key, doc: keyOfRow(r), d: r.d, no: r.no, from: r.from, t: r.t, id: r.id, code: r.code, q: r.q, price: r.price });
     }
+    const purOf = mtzPurOf();
     return [...by.values()].sort((a, b) => a.d.localeCompare(b.d) || a.id - b.id
       || String(a.code).localeCompare(String(b.code), 'uk', { numeric: true })).map((x) => {
       const a = saved[x.key] || {};
       const it = itemBy.get(x.code) || {};
-      const auto = !a.src && mtzOutside(x);
-      return Object.assign(x, { sum: round2(x.q * x.price), src: a.src || (auto ? '-' : ''), auto,
-        kpkv: a.kpkv || '', kekv: a.kekv || '', group: a.group || MTZ_GROUP,
+      // Указане руками — першим; далі — рядок коштів закупівлі, з якої прийшов прихід.
+      const p = purOf(x.id) || {};
+      const auto = !a.src && !p.src && mtzOutside(x);
+      return Object.assign(x, { sum: round2(x.q * x.price), src: a.src || p.src || (auto ? '-' : ''), auto,
+        kpkv: a.kpkv || p.kpkv || '', kekv: a.kekv || p.kekv || '', group: a.group || MTZ_GROUP,
         name: a.name || cleanName(it.name || x.code), unit: a.unit || mtzUnitOf(it.unit), uom: it.unit || '',
         note: a.note || '', their: a.no || '', theirName: a.tname || '', diff: a.diff || '',
         parts: Array.isArray(a.parts) && a.parts.length > 1 });
@@ -9474,39 +10210,33 @@
   }
 
   // ================================================================ ЗАКУПІВЛІ
-  /** Надходження ззовні за довільний період із бюджетними реквізитами: що надійшло, на яку
-   *  суму, за якими КПКВ і КЕКВ, за рахунок чого. Рядок — позиція документа надходження,
-   *  той самий запис store.mtz.rows («id документа|код»), що й у відомості МТЗ: КПКВ і КЕКВ
-   *  спільні. Тут до них додаються джерело фінансування (`fund`; для «Інше» — уточнення
-   *  `fundNote`), код видатків (`exp`), примітка (`pnote`) і частки (`parts`) — коли позицію
-   *  віднесено до кількох джерел: сума часток дорівнює сумі позиції. Це вартість за
-   *  документами надходження, а не підтверджені оплати. */
-  const PUR_FUNDS = ['Субвенція', '10% ПДФО', 'Забезпечення', 'Благодійна допомога', 'Інше'];
-  const PUR_OTHER = 'Інше';
-  // Старе позначення «ПДФО» відомості МТЗ не каже, який це ПДФО: так і показуємо, доки не уточнять.
-  const PUR_PDFO = 'ПДФО — вид не уточнено';
-  const PUR_FUND_OF_SRC = { 'С': 'Субвенція', 'БД': 'Благодійна допомога', 'ПДФО': PUR_PDFO };
-  const PUR_NONE = '∅';                                  // значення фільтра «не вказано»
-  const PUR_CUTS = [['fund', 'джерело'], ['kekv', 'КЕКВ'], ['kpkv', 'КПКВ'], ['exp', 'код видатків'], ['all', 'усе разом']];
-  const PUR_CUT_FIELDS = { fund: ['fund'], kekv: ['kekv'], kpkv: ['kpkv'], exp: ['exp'], all: ['fund', 'kpkv', 'kekv', 'exp'] };
-  const PUR_FIELD_NAME = { fund: 'Джерело', kpkv: 'КПКВ', kekv: 'КЕКВ', exp: 'Код видатків' };
-  const purKop = (x) => Math.round((+x || 0) * 100);
-  /** Сума рядка надходження в копійках: кількість у тисячних × ціна в копійках, округлення до копійки. */
-  const purLineKop = (q, price) => Math.round(Math.round((+q || 0) * 1000) * Math.round((+price || 0) * 100) / 1000);
+  /** Закупівлі: справи (розділ стану purchases) з рядками коштів (budget) і документами (purDocs); чисті функції —
+   *  між маркерами «ЗАКУПІВЛІ» угорі, тут — екрани й файли в теках служби.
+   *
+   *  Спершу — надходження ззовні з бюджетними реквізитами, основа звіту «Що надійшло»: рядок — позиція документа
+   *  надходження, той самий запис store.mtz.rows («id документа|код»), що й у відомості МТЗ: КПКВ і КЕКВ спільні.
+   *  До них додаються джерело фінансування (`fund`), код видатків (`exp`) і частки (`parts`) — коли позицію віднесено
+   *  до кількох джерел: сума часток дорівнює сумі позиції. Це вартість за документами надходження, а не підтверджені
+   *  оплати. */
+  // Джерело позиції — назвою фонду, як у рядках коштів: позначення відомості МТЗ («С», «БД», «ПДФО») — за `MTZ_SRC_OF_PUR` навпаки, а
+  // назви, які писали старі версії, — їхнім фондом. Тож у графі «Джерело» одне джерело не стоїть двома назвами. Позначення, якого жоден
+  // фонд не має, лишається як є, з «вид не уточнено».
+  const PUR_FUND_OF_SRC = Object.fromEntries(Object.entries(MTZ_SRC_OF_PUR).map(([fund, src]) => [src, fund]));
+  const PUR_FUND_OLD = { 'Благодійна допомога': 'Благодійні кошти', 'ПДФО — вид не уточнено': '10% ПДФО' };
+  const purFundName = (fund) => PUR_FUND_OLD[fund] || fund || '';
+  /** Гривні → копійки точно (за цифрами числа, не `x * 100` у double: 16,275 · 100 — це 1627,4999…). */
+  const purKop = (x) => kopOf(x);
+  /** Сума рядка надходження в копійках: ціна округлюється до копійки, далі — кількість у тисячних × ціна (`lineKop`), як у моделі закупівель. */
+  const purLineKop = (q, price) => lineKop(q, kopOf(price));
   const purCarry = mtzCarry;                             // перенос залишків — не надходження, як і у відомості МТЗ
-  const purFundOf = (a) => (a && (a.fund || PUR_FUND_OF_SRC[a.src])) || '';
-
-  /** Довідник джерел: початкові значення, додані в програмі й ті, що вже стоять у рядках. */
-  function purFunds() {
-    const m = mtzStore();
-    const own = Array.isArray(m.funds) ? m.funds.map((s) => String(s || '').trim()).filter(Boolean) : [];
-    const used = [];
-    for (const a of Object.values(m.rows)) {
-      if (a.fund) used.push(a.fund);
-      for (const p of Array.isArray(a.parts) ? a.parts : []) if (p && p.fund) used.push(p.fund);
-    }
-    return [...new Set(PUR_FUNDS.slice(0, 2).concat([PUR_PDFO], PUR_FUNDS.slice(2), own, used))];
+  /** Джерело позиції: вписане (старі версії) чи з позначення відомості МТЗ; «не входить» і порожнє — без джерела. */
+  function purFundOf(a) {
+    if (!a) return '';
+    if (a.fund) return purFundName(a.fund);
+    const src = String(a.src || '').trim();
+    return !src || src === '-' ? '' : PUR_FUND_OF_SRC[src] || `${src} (вид не уточнено)`;
   }
+
   /** Частки позиції: дійсні, коли їх дві й більше і разом вони дають суму позиції до копійки. */
   function purParts(a, sum) {
     const list = a && Array.isArray(a.parts) ? a.parts.filter((p) => p && typeof p === 'object') : [];
@@ -9542,7 +10272,7 @@
       const parts = purParts(a, total);
       if (parts) {
         parts.forEach((p, i) => out.push(Object.assign({}, base, { rid: `${x.key}#${i}`, part: i + 1, of: parts.length,
-          sum: purKop(p.sum) / 100, fund: p.fund || '', fundNote: p.fundNote || '', kpkv: p.kpkv || '', kekv: p.kekv || '',
+          sum: purKop(p.sum) / 100, fund: purFundName(p.fund), fundNote: p.fundNote || '', kpkv: p.kpkv || '', kekv: p.kekv || '',
           exp: p.exp || '' })));
       } else {
         out.push(Object.assign(base, { rid: x.key, part: 0, of: 0, sum: total, fund: purFundOf(a), fundNote: a.fundNote || '',
@@ -9552,364 +10282,3190 @@
     return out;
   }
 
-  /** Реквізит позиції. Джерело веде за собою позначення відомості МТЗ: субвенція — «С», благодійна
-   *  допомога — «БД», ПДФО — «ПДФО»; решта джерел у відомість МТЗ не входить. КПКВ, КЕКВ і код
-   *  видатків пишуться як уведено: нулі попереду й розділювачі — частина коду. */
-  function purSet(key, field, v) {
-    const val = String(v ?? '').trim();
-    if (field !== 'fund') return mtzSet(key, field, val);
-    const fund = val === PUR_PDFO ? '' : val;
-    mtzSet(key, 'fund', fund);
-    if (fund !== PUR_OTHER) mtzSet(key, 'fundNote', '');
-    return mtzSet(key, 'src', !val ? '' : val === PUR_PDFO ? 'ПДФО' : MTZ_SRC_OF_FUND[val] || '-');
-  }
-  /** Реквізит частки; перша частка — ще й реквізити самої позиції: їх бере відомість МТЗ. */
-  function purSetPart(key, i, field, v) {
-    const a = mtzStore().rows[key];
-    const p = a && Array.isArray(a.parts) ? a.parts[i] : null;
-    if (!p) return;
-    const val = String(v ?? '').trim();
-    if (val) p[field] = val; else delete p[field];
-    if (field === 'fund' && val !== PUR_OTHER) delete p.fundNote;
-    if (i === 0) purSet(key, field, val);
-  }
-  /** Зміна в рядку реєстру. Джерело й КПКВ у папері зазвичай одні на весь прихід: позиції того
-   *  самого документа, де їх ще немає, беруть те саме — і далі правляться кожна окремо. */
-  function purEdit(rid, field, v) {
-    const [key, part] = String(rid).split('#');
-    if (part != null) return purSetPart(key, +part, field, v);
-    purSet(key, field, v);
-    const val = String(v ?? '').trim();
-    if (val && (field === 'fund' || field === 'kpkv')) {
-      const id = key.split('|')[0];
-      for (const x of purRows()) if (String(x.id) === id && x.key !== key && !x.part && !x.badParts && !x[field]) purSet(x.key, field, val);
-    }
-    return null;
-  }
-  /** Частки позиції цілком: одна частка — це звичайні реквізити позиції, без поділу. */
-  function purSaveParts(key, parts, note) {
-    const clean = parts.map((p) => {
-      const o = { sum: purKop(p.sum) / 100 };
-      for (const f of ['fund', 'fundNote', 'kpkv', 'kekv', 'exp']) { const s = String(p[f] ?? '').trim(); if (s) o[f] = s; }
-      if (o.fund !== PUR_OTHER) delete o.fundNote;
-      return o;
-    });
-    const first = clean[0] || {};
-    // Джерело, якого не міняли, не чіпаємо: інакше зникла б позначка «не входить» відомості МТЗ.
-    if ((first.fund || '') !== purFundOf(mtzStore().rows[key])) purSet(key, 'fund', first.fund || '');
-    for (const f of ['kpkv', 'kekv', 'exp']) purSet(key, f, first[f] || '');
-    mtzSet(key, 'fundNote', first.fund === PUR_OTHER ? first.fundNote || '' : '');
-    mtzSet(key, 'pnote', note);
-    const rows = mtzStore().rows;
-    if (clean.length > 1) rows[key] = Object.assign({}, rows[key] || {}, { parts: clean });
-    else if (rows[key]) { delete rows[key].parts; if (!Object.keys(rows[key]).length) delete rows[key]; }
-  }
-
-  /** Підсумок відбору: сума, позицій і документів. Кількість різного майна не складається. */
+  /** Рядок «Разом» звіту «Що надійшло»: сума (копійки складаються цілими, у гривні — раз), документів і позицій (частки однієї позиції —
+   *  одна позиція). Кількість різного майна не складається. */
   function purTotal(rows) {
     return { sum: rows.reduce((s, x) => s + purKop(x.sum), 0) / 100, docs: new Set(rows.map((x) => x.id)).size,
       items: new Set(rows.map((x) => x.key)).size };
   }
-  /** Групи відбору за полями (джерело, КЕКВ, КПКВ, код видатків або всі разом). */
-  function purGroups(rows, fields) {
-    const by = new Map();
-    for (const x of rows) {
-      const vals = fields.map((f) => x[f] || '');
-      const k = vals.join('\u0001');
-      const g = by.get(k) || { vals, kop: 0, docs: new Set(), items: new Set() };
-      g.kop += purKop(x.sum); g.docs.add(x.id); g.items.add(x.key);
-      by.set(k, g);
+
+  // ---------------------------------------------------------------- справи закупівель
+  /** Розділи закупівель у стані: рядки коштів, справи, документи (кожен запис — з id). */
+  const purBudget = () => (Array.isArray(store.budget) ? store.budget : (store.budget = []));
+  const purList = () => (Array.isArray(store.purchases) ? store.purchases : (store.purchases = []));
+  const purDocsList = () => (Array.isArray(store.purDocs) ? store.purDocs : (store.purDocs = []));
+  const purYear = () => +state.purYear || +today().slice(0, 4);
+  const purById = (id) => purList().find((p) => p.id === id) || null;
+  const budById = (id) => purBudget().find((l) => l.id === id) || null;
+  const pdById = (id) => purDocsList().find((d) => d.id === id) || null;
+  const grnOf = (kop) => fmtMoney((+kop || 0) / 100);
+  const budKey = (l) => `${l.year} · ${l.label}`;
+
+  /** Поле суми в гривнях → копійки. Порожнє — нуль. Текст, що не число, нулем не пишеться: поле позначається (is-bad),
+   *  `say` каже про це (на сторінці — плашка в куті, у вікні — рядок у самому вікні: плашка лежить під ним), а результат —
+   *  null, і той, хто питає, зміни не записує. `signed` — чи може сума бути від'ємною (сума з рядка коштів — ні).
+   *  Так само читається кожне поле суми закупівель. */
+  function moneyIn(el, say = (text) => toast(text, true), signed = false) {
+    const text = String(el.value ?? '').trim();
+    const kop = text ? kopParse(text) : 0;
+    const why = kop == null ? `Сума «${text}» — не число.`
+      : !Number.isSafeInteger(kop) ? `Сума «${text}» завелика.`
+        : kop < 0 && !signed ? `Сума «${text}» не може бути від’ємною.` : '';
+    el.classList.toggle('is-bad', !!why);
+    if (why) say(why);
+    return why ? null : kop;
+  }
+  /** Поле кількості → число з не більш як трьома знаками після коми (у базі кількість — тисячні). Кома й крапка — обидві
+   *  десяткові, пробіли між цифрами не заважають. Порожнє, не число («1,2,3», «два»), нуль і менше, четвертий знак, завелике —
+   *  поле позначається (is-bad), `say` каже чому, а результат — null: той, хто питає, зміни не записує (тиха «нульова»
+   *  кількість зробила б позицію без суми). */
+  function qtyIn(el, say = (text) => toast(text, true)) {
+    const text = String(el.value ?? '').trim();
+    const m = /^([+-]?)(\d*)(?:[.,](\d*))?$/.exec(text.replace(/\s/g, ''));
+    const frac = m ? (m[3] || '').replace(/0+$/, '') : '';                      // «2,5000» — це 2,5
+    let milli = 0n;
+    let why = '';
+    if (!text) why = 'Кількість не вказано.';
+    else if (!m || !/\d/.test(m[2] + (m[3] || ''))) why = `Кількість «${text}» — не число.`;
+    else if (frac.length > 3) why = `Кількість «${text}» — не більш як три знаки після коми.`;
+    else {
+      milli = BigInt(m[2] || '0') * 1000n + BigInt((frac + '000').slice(0, 3));
+      if (m[1] === '-' || milli === 0n) why = `Кількість «${text}» має бути більшою за нуль.`;
+      else if (milli > 10n ** 12n) why = `Кількість «${text}» завелика.`;
     }
-    // Не вказане — наприкінці: спершу те, що вже віднесено.
-    const ord = (v) => (v ? '0' + v : '1');
-    return [...by.values()].map((g) => ({ vals: g.vals, sum: g.kop / 100, docs: g.docs.size, items: g.items.size }))
-      .sort((a, b) => a.vals.map(ord).join('\u0001').localeCompare(b.vals.map(ord).join('\u0001'), 'uk', { numeric: true }));
-  }
-  /** Чого бракує рядку до повних бюджетних реквізитів. */
-  function purIssues(x) {
-    const out = [];
-    if (x.badParts) out.push('частки не дають суми позиції');
-    if (!x.fund) out.push('немає джерела');
-    if (x.fund === PUR_OTHER && !x.fundNote) out.push('джерело «Інше» без уточнення');
-    if (!x.kpkv) out.push('немає КПКВ');
-    if (!x.kekv) out.push('немає КЕКВ');
-    return out;
-  }
-  const purPeriodText = (from, to) => (from && to ? `з ${fmtDate(from)} по ${fmtDate(to)}` : from ? `з ${fmtDate(from)}`
-    : to ? `по ${fmtDate(to)}` : 'за весь час');
-
-  /** Книга Excel із того самого відбору, що на екрані: деталізація й підсумки за розрізами. */
-  function purSheets(rows, period, filters = '') {
-    const t = purTotal(rows);
-    const top = [unitInfo().legalName, unitInfo().serviceFull].filter(Boolean);
-    const lines = ['Вартість за документами надходження; це не підтверджені оплати.'].concat(filters ? [`Відбір: ${filters}`] : []);
-    const detail = rows.map((x, i) => [i + 1, x.d, `${x.t} №${x.no}`.trim(), x.from, x.code,
-      x.name + (x.part ? ` (частка ${x.part} з ${x.of})` : ''), x.uom, x.part > 1 ? '' : x.q, x.part > 1 ? '' : x.price, x.sum,
-      x.kekv, x.kpkv, x.exp, x.fund + (x.fundNote ? `: ${x.fundNote}` : ''), x.note]);
-    const sheets = [{
-      name: 'Закупівлі', orientation: 'landscape', top, title: 'Надходження технічних засобів і майна',
-      subtitle: purPeriodText(period.from, period.to), lines,
-      head: [['№', 'Дата', 'Документ', 'Постачальник', 'Код', 'Найменування', 'Од.', 'Кількість', 'Ціна, грн', 'Сума, грн',
-        'КЕКВ', 'КПКВ', 'Код видатків', 'Джерело', 'Примітка']],
-      widths: [5, 11, 20, 24, 8, 40, 6, 10, 12, 14, 8, 13, 13, 22, 20], rows: detail, num: [7], money: [8, 9],
-      total: ['', '', '', '', '', `Разом: документів ${t.docs}, позицій ${t.items}`, '', '', '', t.sum, '', '', '', '', ''],
-    }];
-    const cut = (name, fields) => {
-      const groups = purGroups(rows, fields);
-      sheets.push({ name, orientation: 'portrait', top, title: `Надходження: ${name.toLowerCase()}`,
-        subtitle: purPeriodText(period.from, period.to), lines,
-        head: [fields.map((f) => PUR_FIELD_NAME[f]).concat(['Документів', 'Позицій', 'Сума, грн'])],
-        widths: fields.map((f) => (f === 'fund' ? 30 : 16)).concat([12, 10, 16]),
-        rows: groups.map((g) => g.vals.map((v) => v || 'не вказано').concat([g.docs, g.items, g.sum])),
-        num: [fields.length, fields.length + 1], money: [fields.length + 2],
-        total: ['Разом'].concat(Array(fields.length - 1).fill(''), [t.docs, t.items, t.sum]) });
-    };
-    cut('Підсумок', PUR_CUT_FIELDS.all);
-    cut('За джерелом', ['fund']);
-    cut('За КЕКВ', ['kekv']);
-    cut('За КПКВ', ['kpkv']);
-    cut('За кодом видатків', ['exp']);
-    return sheets;
+    el.classList.toggle('is-bad', !!why);
+    if (why) say(why);
+    return why ? null : Number(milli) / 1000;                                  // тисячні ділить double до найближчого числа з десяткового запису
   }
 
-  function purSpec(rows) {
-    const funds = purFunds();
-    const opts = (list, v) => '<option value="">—</option>' + list.concat(v && !list.includes(v) ? [v] : [])
-      .map((o) => `<option${o === v ? ' selected' : ''}>${esc(o)}</option>`).join('');
-    const uniq = (f) => [...new Set(rows.map((x) => x[f]).filter(Boolean))]
-      .sort((a, b) => String(a).localeCompare(String(b), 'uk', { numeric: true }));
-    const sel = (key, label) => ({ type: 'select', key, label, all: 'усі',
-      options: uniq(key).map((v) => [v, v]).concat([[PUR_NONE, 'не вказано']]),
-      test: (x, v) => (v === PUR_NONE ? !x[key] : x[key] === v) });
-    const inp = (x, f, label, list, w) => `<input class="rc-in rc-in--wide" style="width:${w}px;text-align:left" list="${list}"
-      data-pur="${f}" data-rid="${esc(x.rid)}" value="${esc(x[f])}" aria-label="${label}" autocomplete="off">`;
+  function budBlank(year) {
+    return { id: uid(), year, label: '', fund: '', kpkv: '', kekv: '', exp: '', community: '', purpose: '', agreeNo: '',
+      agreeDate: '', decisionNo: '', decisionDate: '', returnBy: '', reportBy: '', missing: {}, note: '', moves: [] };
+  }
+  /** Підписанти версії — з «Люди й МВО» на дату; правляться у вікні складання (ТВО тощо). */
+  function verBlank(label, date) {
+    const at = (role) => sgOf(officialAt(role, date), date);
+    return { id: uid(), label, reason: '', signedOn: '', sentNo: '', sentOn: '', answer: '', answerNo: '', answerOn: '',
+      answerNote: '', handedOn: '', missing: {}, positions: [],
+      signers: { cmdr: at('командир'), fes: at('начальник ФЕС'), chief: at('начальник служби'),
+        exec: Object.assign(at('начальник служби'), { phone: unitInfo().phone || '' }) } };
+  }
+  function purBlank(year, title) {
+    return { id: uid(), year, title, what: '', person: '', parent: '', source: '', closed: '',
+      folder: `${year}/${safeFile(title)}`, missing: {}, note: '', funds: [], versions: [verBlank('1.0', today())] };
+  }
+  function posBlank() {
+    return { id: uid(), name: '', specs: '', uom: 'шт', qty: 1, rule: 'середня', priceKop: 0, kekv: '', exp: '', dk: '',
+      line: '', code: '', note: '', offers: [1, 2, 3].map(() => offerBlank('посилання')) };
+  }
+  function offerBlank(kind) {
+    return { id: uid(), kind, seller: '', url: '', priceKop: 0, checked: '', no: '', date: '', note: '' };
+  }
+  function docBlank(kind, purchase) {
+    return { id: uid(), kind, no: '', date: today(), purchase: purchase || '', parent: '', party: '', person: '', kop: 0,
+      vatKop: 0, deliverBy: '', validTo: '', usedOn: '', returnedOn: '', payOn: '', procedure: '',
+      state: kind === 'акт введення' ? 'чернетка' : '', fes: { status: '', date: '', register: '', ref: '' }, extra: {},
+      missing: '', note: '', lines: [], parts: [], receipts: [] };
+  }
+
+  /** Ключі записів про файли закупівель у `store.scans`: рядок коштів, версія справи, документ закупівлі, реєстр на ФЕС. */
+  const PUR_FILE_KEY = /^(bud|purver|purdoc|fesreg)\|/;
+
+  /** Контекст чистих функцій: розділи стану, акти приймання обліку, переміщення, файли закупівель. Новий на кожен показ:
+   *  `rcptShares` пам'ятає результат у `ctx.shares`, і давній контекст показував би застарілі числа. */
+  function purCtx() {
+    const rcpt = new Map();
+    for (const r of docs) {
+      if (r.kind !== 'in' || !r.id) continue;
+      let x = rcpt.get(r.id);
+      if (!x) {
+        x = { id: r.id, key: keyOfRow(r), d: r.d, no: r.no, from: r.from, to: r.to, kop: 0,
+          fes: (fesOf(r.id) || {}).status || '', lines: [], scan: filesOf(keyOfRow(r)).length > 0 };
+        rcpt.set(r.id, x);
+      }
+      x.kop += lineKop(r.q, kopOf(r.price));
+      x.lines.push({ code: r.code, q: r.q, price: r.price });
+    }
+    const rcptByKey = new Map([...rcpt.values()].map((x) => [x.key, x.id]));
+    const files = new Map();
+    for (const f of store.scans || []) {
+      if (!PUR_FILE_KEY.test(f.key)) continue;
+      if (!files.has(f.key)) files.set(f.key, []);
+      files.get(f.key).push({ made: !!f.made, sha: f.sha || '' });
+    }
+    const moves = docs.filter((r) => r.kind === 'mv').map((r) => ({ code: r.code, from: r.from, to: r.to, d: r.d, q: r.q }));
+    return { budget: purBudget(), purchases: purList(), purDocs: purDocsList(), today: today(), rcpt, rcptByKey, moves,
+      files };
+  }
+
+  /** Куди лягає файл закупівлі: ключ теки, підтека, ім'я (таблиця «Файли» плану). Порожня частина імені (немає контрагента,
+   *  номера, дати чи назви рядка) пропускається: `safeFile('')` — «вивантаження», а його в назві документа бути не має. */
+  function purFolderFor(key) {
+    const [kind, id, what] = String(key).split('|');
+    const dd = (iso) => (iso ? fmtDate(iso) : '');
+    const join = (...xs) => xs.filter(Boolean).join(' ');
+    if (kind === 'bud') {
+      const l = budById(id);
+      if (!l) return null;
+      const label = safePart(l.label);
+      return { folder: 'purchases', dir: [l.year, 'Кошти', label].filter(Boolean).join('/'), name: join(safePart(what), label) };
+    }
+    if (kind === 'purver') {
+      const pu = purList().find((p) => (p.versions || []).some((v) => v.id === id));
+      const v = pu && pu.versions.find((x) => x.id === id);
+      if (!v) return null;
+      const names = { 'розрахунки': 'Розрахунки до рапорту', 'рапорт': 'Рапорт', '1фс': '1фс', '9фс': '9фс',
+        'супровід': 'Супровід', 'відповідь': v.answer === 'не погоджено' ? 'Не погоджено' : 'Погодження',
+        'кп': 'Комерційна пропозиція' };
+      const label = safePart(v.label);
+      return { folder: 'purchases', dir: !label || label === '1.0' ? purDirOf(pu) : `${purDirOf(pu)}/${label}`,
+        name: names[what] || safePart(what) };
+    }
+    if (kind === 'purdoc') {
+      const d = pdById(id);
+      if (!d) return null;
+      const year = String(d.date || today()).slice(0, 4);
+      const no = safePart(d.no);
+      const party = safePart(d.party);
+      const from = d.date ? `від ${dd(d.date)}` : '';
+      if (d.kind === 'договір') {
+        const pu = purById(d.purchase);
+        return { folder: 'purchases', dir: pu ? purDirOf(pu) : `${year}/Договори`,
+          name: join('Договір', `№${no || 'б-н'}`, from, party && `(${party})`) };
+      }
+      if (d.kind === 'акт введення') {
+        return { folder: 'receipts', dir: `${year}/Введення в експлуатацію`, name: join('Акт введення в експлуатацію', no) };
+      }
+      const word = { 'ВН': 'ВН', 'рахунок': 'Рахунок', 'довіреність': 'Довіреність', 'оплата': 'Оплата' }[d.kind] || 'Документ';
+      return { folder: 'receipts', dir: `${year}/Отримання`, name: join(word, `№${no || 'б-н'}`, from, party && `(${party})`) };
+    }
+    if (kind === 'fesreg') {
+      const label = String(id || '');
+      const year = /\d{4}$/.test(label) ? label.slice(-4) : today().slice(0, 4);
+      return { folder: 'fesRegisters', dir: year, name: join('Реєстр документів на ФЕС', safePart(label.split(' ').pop())) };
+    }
+    return null;
+  }
+  /** Підшити файл закупівлі в теку служби під іменем служби. */
+  function purAttach(key, files) {
+    const where = purFolderFor(key);
+    if (!where) return null;
+    return attachScan({ key, date: today(), no: '', folderKey: where.folder, folder: where.dir, name: where.name }, files);
+  }
+
+  const purSeg = (cur) => `<div class="seg"><button type="button" data-nav="purch"${cur === 'purch' ? ' class="is-on"' : ''}>Справи</button>
+      <button type="button" data-nav="purbud"${cur === 'purbud' ? ' class="is-on"' : ''}>Кошти</button>
+      <button type="button" data-nav="purdocs"${cur === 'purdocs' ? ' class="is-on"' : ''}>Документи</button></div>`;
+  const PUR_TAG = { 'розрахунки': 'tag--mv', 'подано': 'tag--stock', 'не погоджено': 'tag--out', 'погоджено': 'tag--in',
+    'договір': 'tag--in', 'поставка': 'tag--stock', 'на ФЕС': 'tag--stock', 'проведено': 'tag--in', 'видано': 'tag--in',
+    'завершено': 'tag--ser', 'скасовано': 'tag--ser' };
+  const purYears = () => [...new Set([purYear(), +today().slice(0, 4)].concat(purList().map((p) => +p.year),
+    purBudget().map((l) => +l.year)))].filter(Boolean).sort((a, b) => a - b);
+  const purYearSel = () => `<select class="btn" data-pur-year title="Рік" aria-label="Рік">${purYears().map((y) =>
+    `<option${y === purYear() ? ' selected' : ''}>${y}</option>`).join('')}</select>`;
+
+  function purSpec(ctx) {
+    const rows = purList().filter((p) => +p.year === purYear()).map((pu) => {
+      const n = purNums(pu, ctx);
+      return { pu, st: purState(pu, ctx), n, miss: purMissing(pu, ctx).length,
+        lines: (pu.funds || []).map((f) => budById(f.line)).filter(Boolean),
+        parties: [...new Set(ctx.purDocs.filter((d) => d.purchase === pu.id && d.party).map((d) => d.party))] };
+    });
+    const uniq = (f) => [...new Set(rows.flatMap(f).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'uk'));
     return {
-      id: 'pur', rows, minWidth: '1040px', limit: REG_LIMIT, acts: '92px',
-      placeholder: 'Пошук: назва, код, документ, постачальник',
-      search: (x) => [x.code, x.name, x.no, x.from, x.fund, x.fundNote, x.kpkv, x.kekv, x.exp, x.note],
+      id: 'pur', rows, minWidth: '1040px', limit: REG_LIMIT,
+      placeholder: 'Пошук: тема, що купуємо, постачальник',
+      search: (x) => [x.pu.title, x.pu.what, ...x.parties, ...x.lines.map((l) => l.label)],
       filters: [
-        { type: 'period', key: 'd', label: 'надійшло', get: (x) => x.d },
-        sel('fund', 'джерело'), sel('kpkv', 'КПКВ'), sel('kekv', 'КЕКВ'), sel('exp', 'код видатків'),
-        { type: 'toggle', key: 'bare', label: 'без джерела чи кодів', title: 'Позиції, де не вказано джерело, КПКВ або КЕКВ',
-          test: (x) => !x.fund || !x.kpkv || !x.kekv },
+        { type: 'seg', key: 'st', options: [['', 'усі']].concat(PUR_STATES.map((s) => [s, s])), test: (x, v) => x.st === v },
+        { type: 'select', key: 'fund', label: 'джерело', all: 'усі', options: uniq((x) => x.lines.map((l) => l.fund)).map((v) => [v, v]),
+          test: (x, v) => x.lines.some((l) => l.fund === v) },
+        { type: 'select', key: 'com', label: 'громада', all: 'усі', options: uniq((x) => x.lines.map((l) => l.community)).map((v) => [v, v]),
+          test: (x, v) => x.lines.some((l) => l.community === v) },
+        { type: 'select', key: 'party', label: 'постачальник', all: 'усі', options: uniq((x) => x.parties).map((v) => [v, v]),
+          test: (x, v) => x.parties.includes(v) },
+        { type: 'toggle', key: 'miss', label: 'є чого бракує', title: 'Справи з переліком «Чого бракує»', test: (x) => x.miss > 0 },
       ],
       columns: [
-        { key: 'doc', label: 'документ', cls: 'c-name c-name--stack', style: 'flex:0 1 140px', first: 1, sort: (x) => `${x.d}|${x.no}`,
-          cellTitle: (x) => `${x.t} ${numNo(x.no)} від ${fmtDate(x.d)}, ${x.from || '—'}`,
-          cell: (x) => `<b class="lnk" data-open="${esc(x.doc)}">${esc(numNo(x.no))}</b><small>${fmtDate(x.d)}</small>
-            <small style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(x.from || '—')}</small>` },
-        { key: 'name', label: 'найменування', cls: 'c-name c-name--stack', style: 'flex:2 1 210px', first: 1, sort: (x) => x.name,
-          cellTitle: (x) => [x.name, ...purIssues(x)].join('; '),
-          cell: (x) => `<b>${esc(x.name)}</b><small>${esc([x.code, x.uom, x.part ? `частка ${x.part} з ${x.of}` : '',
-            x.badParts ? 'частки не дають суми позиції' : '', x.fund === PUR_OTHER ? x.fundNote : '', x.note].filter(Boolean).join(' · '))}</small>` },
-        { key: 'q', label: 'к-сть', cls: 'c-num', style: 'width:56px', sort: (x) => x.q, cell: (x) => (x.part > 1 ? '' : fmtNum(x.q)) },
-        { key: 'sum', label: 'сума, грн', cls: 'c-num', style: 'width:104px', sort: (x) => x.sum, title: 'Сума й ціна за одиницю',
-          cell: (x) => `${fmtMoney(x.sum)}<small>${x.part ? `із ${fmtMoney(x.total)}` : `по ${fmtMoney(x.price)}`}</small>` },
-        { key: 'fund', label: 'джерело', cls: 'c-txt', style: 'flex:0 0 150px', first: 1, sort: (x) => x.fund || '~',
-          cell: (x) => `<select data-pur="fund" data-rid="${esc(x.rid)}" aria-label="джерело фінансування" style="width:100%">${opts(funds, x.fund)}</select>` },
-        { key: 'kpkv', label: 'КПКВ', cls: 'c-txt', style: 'flex:0 0 100px', first: 1, sort: (x) => x.kpkv || '~',
-          cell: (x) => inp(x, 'kpkv', 'КПКВ', 'pur-kpkv', 88) },
-        { key: 'kekv', label: 'КЕКВ', cls: 'c-txt', style: 'flex:0 0 62px', first: 1, sort: (x) => x.kekv || '~',
-          cell: (x) => inp(x, 'kekv', 'КЕКВ', 'pur-kekv', 50) },
-        { key: 'exp', label: 'код видатків', cls: 'c-txt', style: 'flex:0 0 96px', first: 1, sort: (x) => x.exp || '~',
-          cell: (x) => inp(x, 'exp', 'код видатків', 'pur-exp', 84) },
-        { key: 'acts', label: '', cls: 'c-acts', cell: (x) => rowBtn('pur-edit', '✎ Докладно',
-          `data-key="${esc(x.key)}"`, { title: 'Уточнення джерела, примітка, поділ суми на частки' }) },
+        { key: 'title', label: 'закупівля', cls: 'c-name c-name--stack', style: 'flex:2 1 220px', first: 1, sort: (x) => x.pu.title,
+          cellTitle: (x) => x.pu.what || x.pu.title,
+          cell: (x) => `<b>${esc(x.pu.title)}</b><small>${esc([x.pu.what, x.lines.map((l) => l.label).join(', ')].filter(Boolean).join(' · '))}</small>` },
+        { key: 'pack', label: 'пакет, грн', cls: 'c-num', style: 'width:110px', sort: (x) => x.n.pack, cell: (x) => grnOf(x.n.pack) },
+        { key: 'con', label: 'договори', cls: 'c-num', style: 'width:110px', sort: (x) => x.n.contracts, cell: (x) => grnOf(x.n.contracts) },
+        { key: 'got', label: 'поставлено', cls: 'c-num', style: 'width:110px', sort: (x) => x.n.delivered, cell: (x) => grnOf(x.n.delivered) },
+        { key: 'paid', label: 'оплачено', cls: 'c-num', style: 'width:110px', sort: (x) => x.n.paid, cell: (x) => grnOf(x.n.paid) },
+        { key: 'st', label: 'стан', cls: 'c-tag', style: 'width:110px', first: 1, sort: (x) => PUR_STATES.indexOf(x.st),
+          cell: (x) => `<span class="tag ${PUR_TAG[x.st] || ''}">${esc(x.st)}</span>` },
+        { key: 'miss', label: 'бракує', cls: 'c-num', style: 'width:70px', sort: (x) => x.miss,
+          cell: (x) => (x.miss ? `<span class="num-warn">${x.miss}</span>` : '—') },
       ],
-      row: (x) => ({ cls: x.badParts || !x.fund ? 'is-due' : '' }),
-      total: (shown) => ({ name: '<b>Разом за відбором</b>', sum: fmtMoney(purTotal(shown).sum) }),
-      count: (shown) => { const t = purTotal(shown);
-        return `${cnt(t.items, 'позиція', 'позиції', 'позицій')} у ${cnt(t.docs, 'документі', 'документах', 'документах')} на ${fmtMoney(t.sum)} грн`; },
-      empty: 'Надходжень ззовні ще немає.',
-      emptyFiltered: 'За цим періодом і фільтрами надходжень немає.',
+      row: (x) => ({ attrs: `data-act="pur-open" data-id="${esc(x.pu.id)}"` }),
+      total: (shown) => ({ title: '<b>Разом</b>', pack: grnOf(shown.reduce((s, x) => s + x.n.pack, 0)),
+        con: grnOf(shown.reduce((s, x) => s + x.n.contracts, 0)), got: grnOf(shown.reduce((s, x) => s + x.n.delivered, 0)),
+        paid: grnOf(shown.reduce((s, x) => s + x.n.paid, 0)) }),
+      count: (shown, all) => (shown.length === all.length ? String(all.length) : `${shown.length} із ${all.length}`),
+      empty: 'Закупівель ще немає.', emptyFiltered: 'За цими фільтрами закупівель немає.',
     };
-  }
-  /** Перший показ — поточний рік; далі період тримає те, що вибрала людина. */
-  function purInit() {
-    if (state.purInit) return;
-    state.purInit = true;
-    const f = tfOf('pur');
-    if (!f.dFrom && !f.dTo) f.dFrom = `${today().slice(0, 4)}-01-01`;
-  }
-  /** Слова про відбір — у шапку книги Excel: за чим саме відібрано рядки. */
-  function purFilterText() {
-    const f = tfOf('pur');
-    const v = (k, label) => (f[k] ? `${label} — ${f[k] === PUR_NONE ? 'не вказано' : f[k]}` : '');
-    return [v('fund', 'джерело'), v('kpkv', 'КПКВ'), v('kekv', 'КЕКВ'), v('exp', 'код видатків'),
-      f.bare ? 'без джерела чи кодів' : '', (f.q || '').trim() ? `пошук «${f.q.trim()}»` : ''].filter(Boolean).join('; ');
   }
 
   function renderPurchases() {
-    purInit();
-    const rows = purRows();
-    const reg = registry(purSpec(rows));
-    const cutKey = PUR_CUT_FIELDS[state.purCut] ? state.purCut : 'fund';
-    const fields = PUR_CUT_FIELDS[cutKey];
-    const groups = purGroups(reg.shown, fields);
-    const used = (f, base = []) => [...new Set(base.concat(rows.map((x) => x[f]).filter(Boolean)))];
-    const cutTable = `<div class="tbl" style="--tbl-min:auto"><div class="tbl__head">${fields.map((f) =>
-      `<div class="tbl__h c-txt" style="flex:1 1 120px">${esc(PUR_FIELD_NAME[f].toLowerCase())}</div>`).join('')}
-        <div class="tbl__h c-num" style="width:90px">документів</div><div class="tbl__h c-num" style="width:80px">позицій</div>
-        <div class="tbl__h c-num" style="width:130px">сума, грн</div></div>${groups.map((g) => `<div class="tbl__row tbl__row--plain">${
-      g.vals.map((v) => `<div class="c-txt${v ? '' : ' num-warn'}" style="flex:1 1 120px">${esc(v || 'не вказано')}</div>`).join('')}
-        <div class="c-num" style="width:90px">${g.docs}</div><div class="c-num" style="width:80px">${g.items}</div>
-        <div class="c-num" style="width:130px">${fmtMoney(g.sum)}</div></div>`).join('')}</div>`;
-    const t = purTotal(reg.shown);
+    const ctx = purCtx();
+    const pu = state.purId ? purById(state.purId) : null;
+    if (pu) return renderPurCard(pu, ctx);
+    const reg = registry(purSpec(ctx));
     return {
       fill: true,
-      head: head('контроль / закупівлі', 'Закупівлі', '<button class="btn btn--primary" data-act="pur-xls">В Excel</button>'),
-      body: `${flashBlock()}${reg.panel}
-        <details class="fold card" style="margin-bottom:12px" data-pur-fold${state.purFold ? ' open' : ''}>
-          <summary class="card__head"><div class="card__title">Підсумки відбору</div>
-            <span class="fold__hint">${fmtMoney(t.sum)} грн · за джерелом, КЕКВ, КПКВ, кодом видатків</span></summary>
-          ${state.purFold ? `<div class="panel"><div class="seg">${PUR_CUTS.map(([k, label]) =>
-      `<button type="button" data-act="pur-cut" data-v="${k}"${k === cutKey ? ' class="is-on"' : ''}>${esc(label)}</button>`).join('')}</div></div>
-          ${reg.shown.length ? cutTable : ''}` : ''}</details>
-        <div class="card card--scroll card--fill">${reg.table}</div>
-        <datalist id="pur-kpkv">${used('kpkv', MTZ_KPKV).map((k) => `<option value="${esc(k)}">`).join('')}</datalist>
-        <datalist id="pur-kekv">${used('kekv', MTZ_KEKV).map((k) => `<option value="${esc(k)}">`).join('')}</datalist>
-        <datalist id="pur-exp">${used('exp').map((k) => `<option value="${esc(k)}">`).join('')}</datalist>`,
+      head: head(`закупівлі / ${purYear()}`, 'Закупівлі', `${purSeg('purch')}${purYearSel()}
+        ${native && !me.remote ? '<button class="btn" data-act="pur-files-find">Знайти файли</button>' : ''}
+        ${native ? `<button class="btn" data-act="pur-book-export">Вивантажити книгу</button>
+        <button class="btn" data-act="pur-book-import">Прийняти книгу…</button>` : ''}
+        <button class="btn" data-act="pur-xls">В Excel</button>
+        <button class="btn btn--primary" data-act="pur-new">+ Закупівля</button>`),
+      body: `${flashBlock()}${reg.panel}<div class="card card--scroll card--fill">${reg.table}</div>`,
     };
+  }
+
+  /** Блоки картки закупівлі по порядку: кожна задача дописує свої. */
+  const PUR_BLOCKS = [];
+  function renderPurCard(pu, ctx) {
+    const n = purNums(pu, ctx);
+    const st = purState(pu, ctx);
+    const tile = (label, kop, hint = '') => `<div class="tile"><div class="tile__label">${esc(label)}</div>
+      <div class="tile__value">${grnOf(kop)} <small>грн</small></div>${hint ? `<div class="tile__hint">${esc(hint)}</div>` : ''}</div>`;
+    return {
+      head: head(`закупівлі / ${pu.year}`, pu.title, `<button class="btn" data-act="pur-close">← До переліку</button>
+        <span class="tag ${PUR_TAG[st] || ''}">${esc(st)}</span>
+        ${native && !me.remote ? `<button class="btn" data-act="pur-folder" data-id="${esc(pu.id)}">Відкрити теку</button>` : ''}
+        <button class="btn" data-act="pur-edit" data-id="${esc(pu.id)}">Виправити</button>`),
+      body: `${flashBlock()}<div class="pur-card">${purLinks(pu)}
+        <div class="tiles">${tile('Пакет', n.pack, (purVersion(pu, 'approved') ? 'погоджена версія' : 'остання версія'))}
+          ${tile('Договори', n.contracts, n.economy > 0 ? `економія ${grnOf(n.economy)}` : '')}
+          ${tile('Поставлено', n.delivered)}${tile('Оплачено', n.paid)}</div>
+        ${PUR_BLOCKS.map((f) => f(pu, ctx)).join('')}${purMissBlock(pu, ctx)}</div>`,
+    };
+  }
+
+  /** Рядок під шапкою картки: відповідальний і зв'язки з іншими закупівлями (економія, переробка). */
+  function purLinks(pu) {
+    const ref = (p, word) => `${word} <a class="lnk" data-act="pur-open" data-id="${esc(p.id)}">${esc(p.title)}</a>`;
+    const who = pu.person ? personBy(pu.person) : null;
+    const parent = pu.parent ? purById(pu.parent) : null;
+    const source = pu.source ? purById(pu.source) : null;
+    const parts = [who ? `відповідальний ${esc(pSign(who))}` : '', parent ? ref(parent, 'з економії закупівлі') : '',
+      source ? ref(source, 'перероблено з') : '',
+      ...purList().filter((p) => p.parent === pu.id).map((p) => ref(p, 'економію взяла')),
+      ...purList().filter((p) => p.source === pu.id).map((p) => ref(p, 'перероблено в'))].filter(Boolean);
+    return parts.length ? `<div class="set-note" style="padding:0 4px">${parts.join(' · ')}</div>` : '';
+  }
+
+  /** Блок «Гроші»: з яких рядків коштів і скільки. */
+  PUR_BLOCKS.push((pu, ctx) => {
+    const rows = (pu.funds || []).map((f, i) => {
+      const l = budById(f.line);
+      const left = l ? budNums(l, ctx).unplanned : 0;
+      return `<div class="tbl__row tbl__row--plain"><div class="c-name c-name--stack"><b>${esc(l ? `${l.label} · ${l.fund}` : 'рядка немає')}</b>
+          <small>${l ? `не розплановано ${grnOf(left)}` : ''}</small></div>
+        <div class="c-num" style="width:150px"><input class="rc-in" style="width:100%" data-pur-fund="${i}" value="${esc(kopStr(f.kop))}"
+          inputmode="decimal" autocomplete="off" aria-label="сума з рядка"></div>
+        <div class="c-acts">${rowBtn('pur-fund-del', '✕ Прибрати', `data-i="${i}"`, { bad: true, title: 'Прибрати рядок із закупівлі' })}</div></div>`;
+    }).join('');
+    const free = purBudget().filter((l) => l.year === pu.year && !(pu.funds || []).some((f) => f.line === l.id));
+    return `<div class="card pur-block"><div class="card__head"><div class="card__title">Гроші</div>
+        <span class="panel__count">${grnOf((pu.funds || []).reduce((s, f) => s + (+f.kop || 0), 0))} грн</span>
+        ${free.length ? `<select data-pur-fund-add aria-label="рядок коштів"><option value="">+ Рядок коштів…</option>${free.map((l) =>
+    `<option value="${esc(l.id)}">${esc(l.label)}</option>`).join('')}</select>` : ''}</div>
+      <div class="tbl" style="--tbl-min:auto">${rows || `<div class="tbl__row tbl__row--plain"><div class="c-txt">Рядків коштів ще не вказано.${
+  free.length ? '' : ' Їх заводять на вкладці «Кошти».'}</div></div>`}</div></div>`;
+  });
+
+  function purNew() {
+    const options = (year) => '<option value="">—</option>' + purBudget().filter((l) => l.year === year).map((l) =>
+      `<option value="${esc(l.id)}">${esc(l.label)}</option>`).join('');
+    const el = modalOpen('Нова закупівля', `<form id="pur-new" class="pad"><div class="form__grid">
+        <div class="field"><label>Рік</label><input name="year" type="number" value="${purYear()}" min="2000" max="2100"></div>
+        <div class="field field--span"><label>Тема (назва теки)</label><input name="title" autocomplete="off" required></div>
+        <div class="field field--span"><label>Що купуємо</label><input name="what" autocomplete="off"></div>
+        <div class="field"><label>Рядок коштів</label><select name="line">${options(purYear())}</select></div>
+        <div class="field"><label>Сума з рядка, грн</label><input name="sum" inputmode="decimal" autocomplete="off"></div></div>
+      <div class="pad" data-pur-msg hidden style="color:var(--bad)"></div>
+      <div style="padding-top:12px"><button class="btn btn--primary" type="submit">Завести</button>
+        <button class="btn" type="button" data-md="close">Скасувати</button></div></form>`);
+    const form = el.querySelector('form');
+    const msg = el.querySelector('[data-pur-msg]');
+    const fail = (text) => { msg.hidden = false; msg.textContent = text; };
+    // Рядки коштів — того року, що вказано у вікні.
+    form.elements.year.addEventListener('change', () => { form.elements.line.innerHTML = options(+form.elements.year.value || purYear()); });
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      msg.hidden = true;
+      const f = new FormData(form);
+      const year = +f.get('year') || purYear();
+      const title = String(f.get('title') || '').trim().replace(/\s+/g, ' ');
+      if (!title) { fail('Тему закупівлі не вказано.'); return; }
+      // Тека — це й назва; закупівлю могли перейменувати, лишивши теку: тоді збігається тека, а не тема, і так про це й сказано.
+      const why = purTwinWhy(year, title);
+      if (why) { fail(why); return; }
+      const pu = purBlank(year, title);
+      pu.what = String(f.get('what') || '').trim();
+      const line = String(f.get('line') || '');
+      const typed = form.elements.sum.value.trim();
+      if (typed && !line) { fail('Оберіть рядок коштів, з якого ця сума.'); return; }
+      if (line) {
+        const sum = moneyIn(form.elements.sum, fail);
+        if (sum == null) return;
+        // Вписане — те й лягає (і «0» теж); порожнє поле бере все, що в рядку ще не розплановано.
+        pu.funds.push({ line, kop: typed ? sum : Math.max(0, budNums(budById(line), purCtx()).unplanned) });
+      }
+      purList().push(pu);
+      state.purYear = year;
+      logChange('закупівлю заведено', `pur|${pu.id}`, `${year} · ${title}`);
+      modalClose();
+      save();
+      go('purch', { purId: pu.id, purVer: pu.versions[0].id });
+    });
   }
 
   function bindPurchases() {
-    if (state.view !== 'purch') return;
+    if (!['purch', 'purbud', 'purdocs'].includes(state.view)) return;
     const sc = $('#scroll');
-    sc.querySelectorAll('[data-pur]').forEach((el) => el.addEventListener('change', () => {
-      purEdit(el.dataset.rid, el.dataset.pur, el.value);
-      save();
-      // Табуляція вже перевела фокус у наступне поле: після перемальовування повертаємо його туди ж.
-      const at = document.activeElement;
-      const back = at && at.dataset && at.dataset.pur ? [at.dataset.pur, at.dataset.rid] : null;
-      render();
-      if (back) {
-        const again = [...$('#scroll').querySelectorAll(`[data-pur="${back[0]}"]`)].find((x) => x.dataset.rid === back[1]);
-        if (again) again.focus();
-      }
-    }));
-    // Підсумки малюються лише розгорнутими: згорнута картка не тримає в сторінці прихованої таблиці.
-    sc.querySelector('[data-pur-fold]')?.addEventListener('toggle', (e) => {
-      if (!!state.purFold === e.target.open) return;
-      state.purFold = e.target.open;
+    $('#head').querySelector('[data-pur-year]')?.addEventListener('change', (e) => {
+      state.purYear = +e.target.value;
+      // Рік — частина екрана в історії вікна, а перемикач запису в ній не робить: без цього «назад» із картки вертало б на
+      // попередній рік. Поточний запис оновлюється тут, до малювання.
+      try { history.replaceState(navSnap(), ''); } catch (err) { /* без історії теж працює */ }
       render();
     });
+    const pu = state.view === 'purch' && state.purId ? purById(state.purId) : null;
+    if (pu) {
+      sc.querySelectorAll('[data-pur-fund]').forEach((el) => el.addEventListener('change', () => {
+        const f = pu.funds[+el.dataset.purFund];
+        const kop = f ? moneyIn(el, undefined, false) : null;
+        if (kop == null) return;
+        f.kop = kop;
+        logChange('гроші закупівлі', `pur|${pu.id}`, `${pu.title}, ${(budById(f.line) || {}).label || 'рядок коштів'}: ${grnOf(f.kop)}`);
+        save();
+        render();
+      }));
+      sc.querySelector('[data-pur-fund-add]')?.addEventListener('change', (e) => {
+        const line = budById(e.target.value);
+        if (!line) return;
+        // Сума документів, що йшла до єдиного рядка, лишається на ньому й з другим рядком (`purFreezeParts`).
+        for (const d of purFreezeParts(pu, purCtx())) {
+          const p = d.parts[0];
+          logChange('частки документа записано', `purdoc|${d.id}`, `${pdLabel(d)}: ${(budById(p.line) || {}).label || 'рядок коштів'} ${grnOf(p.kop)}`);
+        }
+        pu.funds.push({ line: line.id, kop: Math.max(0, budNums(line, purCtx()).unplanned) });
+        logChange('рядок коштів додано до закупівлі', `pur|${pu.id}`, `${pu.title}: ${line.label}`);
+        save();
+        render();
+      });
+    }
+    PUR_BINDS.forEach((f) => f(sc, pu));
+  }
+  /** Прив'язки блоків картки й вкладок: кожна задача дописує свої. */
+  const PUR_BINDS = [];
+
+  /** «✕ Прибрати» в «Гроші»: питання називає рядок і суму, документи, що перейдуть на рядок, який лишається, і ті, де частки на
+   *  прибраному лишаться (`purLineDrop`); «так» прибирає рядок і знімає частки документів, що переходять. */
+  function purFundDel(pu, i) {
+    const f = pu && pu.funds[+i];
+    if (!f) return null;
+    const label = (budById(f.line) || {}).label || 'рядок коштів';
+    const drop = purLineDrop(pu, purCtx(), f.line);
+    const to = (budById(drop.to) || {}).label || 'рядок коштів';
+    const names = (list) => list.map(pdLabel).join(', ');
+    const ask = [`Прибрати із закупівлі «${pu.title}» рядок коштів «${label}» на ${grnOf(f.kop)} грн?`,
+      drop.move.length ? `На рядок «${to}» перейдуть: ${names(drop.move)}.` : '',
+      drop.stuck.length ? `Частки на рядку «${label}» лишаються в: ${names(drop.stuck)}; перерозкладіть їх.` : ''];
+    if (!confirm(ask.filter(Boolean).join('\n\n'))) return null;
+    pu.funds.splice(+i, 1);
+    for (const d of drop.move) {
+      d.parts = [];
+      logChange('частки документа знято', `purdoc|${d.id}`, `${pdLabel(d)}: ${label} → ${to}`);
+    }
+    logChange('рядок коштів прибрано із закупівлі', `pur|${pu.id}`, `${pu.title}: ${label}`);
+    save();
+    return render();
   }
 
-  /** Реквізити позиції цілком: джерело з уточненням, коди, примітка й поділ суми на частки. */
-  function purDialog(key) {
-    const rows = purRows().filter((x) => x.key === key);
-    if (!rows.length) return;
-    const x = rows[0];
-    const a = mtzStore().rows[key] || {};
-    // Частки, що вже не дають суми позиції (документ виправили), показуємо як є: людина їх і поправить.
-    let parts = Array.isArray(a.parts) && a.parts.length > 1
-      ? a.parts.map((p) => ({ sum: purKop(p.sum) / 100, fund: p.fund || '', fundNote: p.fundNote || '', kpkv: p.kpkv || '', kekv: p.kekv || '', exp: p.exp || '' }))
-      : [{ sum: x.total, fund: x.fund, fundNote: x.fundNote, kpkv: x.kpkv, kekv: x.kekv, exp: x.exp }];
-    const el = modalOpen(`${numNo(x.no)} від ${fmtDate(x.d)} · ${x.code}`, `<form id="pur-form">
-      <div class="panel"><div class="panel__note"><b>${esc(x.name)}</b> — ${fmtNum(x.q)} ${esc(x.uom)} на ${fmtMoney(x.total)} грн</div></div>
-      <div data-pur-parts></div>
-      <div class="pad" style="padding-top:10px">
-        <button class="btn btn--sm" type="button" data-pur-add title="Позицію оплачено з кількох джерел або за кількома кодами">+ Частка</button>
-        <button class="btn btn--sm" type="button" data-pur-fund-new>Нове джерело…</button>
-        <span class="panel__count" data-pur-sum></span></div>
-      <div class="form__grid" style="padding-top:10px"><div class="field field--span"><label>Примітка</label>
-        <input name="note" value="${esc(x.note)}" autocomplete="off"></div></div>
-      <div class="pad" data-pur-msg hidden style="padding-top:10px;color:var(--bad)"></div>
-      <div class="pad" style="padding-top:14px">
-        <button class="btn btn--primary" type="submit">Зберегти</button>
-        <button class="btn" type="button" data-md="close">Скасувати</button></div></form>`);
-    const box = el.querySelector('[data-pur-parts]');
-    const read = () => [...box.querySelectorAll('[data-part]')].map((row) => {
-      const g = (n) => row.querySelector(`[name="${n}"]`);
-      return { sum: parseFloat(String(g('sum').value).replace(',', '.')) || 0, fund: g('fund').value, fundNote: g('fundNote') ? g('fundNote').value : '',
-        kpkv: g('kpkv').value, kekv: g('kekv').value, exp: g('exp').value };
-    });
-    const sumLine = () => {
-      const got = parts.reduce((s, p) => s + purKop(p.sum), 0);
-      const out = el.querySelector('[data-pur-sum]');
-      out.textContent = parts.length > 1 ? `частки разом ${fmtMoney(got / 100)} із ${fmtMoney(x.total)} грн` : '';
-      out.className = 'panel__count' + (parts.length > 1 && got !== purKop(x.total) ? ' num-bad' : '');
-    };
-    const draw = () => {
-      const funds = purFunds();
-      const many = parts.length > 1;
-      box.innerHTML = parts.map((p, i) => `<div class="form__grid" data-part="${i}" style="padding-top:8px">
-        ${many ? `<div class="field"><label>Частка ${i + 1}, грн</label>
-          <input name="sum" type="number" step="0.01" min="0" value="${esc(p.sum)}"></div>` : `<input name="sum" type="hidden" value="${esc(p.sum)}">`}
-        <div class="field"><label>Джерело</label><select name="fund"><option value="">—</option>${
-          funds.concat(p.fund && !funds.includes(p.fund) ? [p.fund] : []).map((o) => `<option${o === p.fund ? ' selected' : ''}>${esc(o)}</option>`).join('')}</select></div>
-        ${p.fund === PUR_OTHER ? `<div class="field"><label>Уточнення джерела</label>
-          <input name="fundNote" value="${esc(p.fundNote)}" autocomplete="off"></div>` : ''}
-        <div class="field"><label>КПКВ</label><input name="kpkv" list="pur-kpkv" value="${esc(p.kpkv)}" autocomplete="off"></div>
-        <div class="field"><label>КЕКВ</label><input name="kekv" list="pur-kekv" value="${esc(p.kekv)}" autocomplete="off"></div>
-        <div class="field"><label>Код видатків</label><input name="exp" list="pur-exp" value="${esc(p.exp)}" autocomplete="off"></div>
-        ${many ? `<div class="field" style="align-self:end"><button class="btn btn--sm" type="button" data-pur-del="${i}">✕ Прибрати частку</button></div>` : ''}
-      </div>`).join('');
-      sumLine();
-    };
-    draw();
-    box.addEventListener('change', (e) => { parts = read(); if (e.target.name === 'fund') draw(); else sumLine(); });
-    box.addEventListener('input', (e) => { if (e.target.name === 'sum') { parts = read(); sumLine(); } });
-    box.addEventListener('click', (e) => {
-      const b = e.target.closest('[data-pur-del]');
-      if (!b) return;
-      parts = read();
-      parts.splice(+b.dataset.purDel, 1);
-      // Лишилась одна частка — це знову вся позиція.
-      if (parts.length === 1) parts[0].sum = x.total;
-      draw();
-    });
-    el.querySelector('[data-pur-add]').addEventListener('click', () => {
-      parts = read();
-      const rest = (purKop(x.total) - parts.reduce((s, p) => s + purKop(p.sum), 0)) / 100;
-      parts.push({ sum: Math.max(rest, 0), fund: '', fundNote: '', kpkv: '', kekv: '', exp: '' });
-      draw();
-    });
-    el.querySelector('[data-pur-fund-new]').addEventListener('click', () => {
-      const name = String(prompt('Назва джерела фінансування') || '').trim().replace(/\s+/g, ' ');
-      if (!name) return;
-      const m = mtzStore();
-      if (!purFunds().includes(name)) m.funds = (Array.isArray(m.funds) ? m.funds : []).concat([name]);
-      parts = read();
-      draw();
-    });
-    el.querySelector('form').addEventListener('submit', (e) => {
-      e.preventDefault();
-      parts = read();
-      const bad = [];
-      if (parts.length > 1) {
-        parts.forEach((p, i) => { if (!(purKop(p.sum) > 0)) bad.push(`Частка ${i + 1}: не вказано суму.`); });
-        const got = parts.reduce((s, p) => s + purKop(p.sum), 0);
-        if (!bad.length && got !== purKop(x.total)) bad.push(`Сума часток ${fmtMoney(got / 100)} грн не дорівнює сумі позиції ${fmtMoney(x.total)} грн.`);
-      }
-      parts.forEach((p, i) => { if (p.fund === PUR_OTHER && !String(p.fundNote || '').trim()) {
-        bad.push(`${parts.length > 1 ? `Частка ${i + 1}: д` : 'Д'}ля джерела «Інше» потрібне уточнення.`); } });
-      const msg = el.querySelector('[data-pur-msg]');
-      if (bad.length) { msg.hidden = false; msg.innerHTML = bad.map(esc).join('<br>'); return; }
-      purSaveParts(key, parts, String(new FormData(e.target).get('note') || '').trim());
-      modalClose();
-      render();
-      saveThen('Реквізити позиції збережено.');
-    });
-  }
-
-  /** Те саме, що на екрані, — у книгу Excel: відбір з урахуванням пошуку, без обмеження видимих рядків. */
-  function purExcel() {
-    const shown = regRows(purSpec(purRows()));
-    if (!shown.length) { toast('За цим періодом і фільтрами надходжень немає.', true); return; }
-    const f = tfOf('pur');
-    const period = { from: f.dFrom || '', to: f.dTo || '' };
-    toExcel({ file: `Закупівлі ${purPeriodText(period.from, period.to)}`, sheets: purSheets(shown, period, purFilterText()) });
-  }
-
+  /** Дії справ закупівель. Наступні задачі дописують свої `case` перед `default:`: статична перевірка
+   *  tests/test_app_js.py шукає саме `case '…'` (дія без нього — «кнопка без обробника»), а маршрут
+   *  `startsWith('pur-')` пускає сюди лише дії `pur-…` (дії інших префіксів — у своїх функціях). */
   function purAction(act, d) {
+    const pu = state.purId ? purById(state.purId) : null;
     switch (act) {
-      case 'pur-xls': return purExcel();
-      case 'pur-edit': return purDialog(d.key);
-      case 'pur-cut': state.purCut = d.v; state.purFold = true; return render();
+      case 'pur-new': return purNew();
+      case 'pur-open': return go('purch', { purId: d.id, purVer: null });
+      case 'pur-close': return go('purch', { purId: null, purVer: null });
+      case 'pur-folder': return purOpenFolder(purById(d.id));
+      case 'pur-edit': return purEditDialog(purById(d.id));
+      case 'pur-fund-del': return purFundDel(pu, d.i);
+      case 'pur-ver': state.purVer = d.id; return renderKeepingScroll();      // версія з картки; прокрутка лишається на місці
+      case 'pur-pos-new': { const v = pu && purVerOf(pu); return v && !purVerSent(v) ? posDialog(pu, v, null) : null; }
+      case 'pur-pos': {
+        const v = pu && purVerOf(pu);
+        const p = v && !purVerSent(v) ? (v.positions || [])[+d.i] : null;
+        return p ? posDialog(pu, v, p) : null;
+      }
+      case 'pur-pos-del': return purPosDel(pu, d.i);
+      case 'pur-fit': { const v = pu && purVerOf(pu); return v && !purVerSent(v) && (v.positions || []).length ? purFitDialog(pu, v) : null; }
+      case 'pur-ver-new': return pu ? purVerNew(pu) : null;
+      case 'pur-economy': return pu ? purEconomy(pu) : null;
+      case 'pur-rework': return pu ? purRework(pu) : null;
+      case 'pur-paper': return purPaper(pu, pu && purVerOf(pu), d.paper, d.key);
+      case 'pur-sent': return purSentDialog(pu, pu && purVerOf(pu));
+      case 'pur-receive': return purReceive(pdById(d.id));
+      case 'pur-av-new': return purAvNew(d.doc);
+      case 'pur-link': return purLinkDialog(d.doc ? +d.doc : 0, d.doc ? null : pu);
+      case 'pur-rcpt': return openDoc(d.key);
+      case 'pur-xls': return purXls();
+      case 'pur-book-export': return purBookExport();
+      case 'pur-book-import': return purBookImport();
+      case 'pur-files-find': return purFilesFind();
+      case 'pur-folder-pick': return purFolderPick(d.key);
       default: return null;
     }
   }
+
+  /** Тека справи записується в неї при першій же дії з файлами (підшити скан, скласти папір, «Відкрити теку»). Справа з рядка
+   *  книги без «теки» показується з текою «рік/тема» (`purDirOf`), але не пише її: після перейменування файли розійшлися б по
+   *  двох теках. Лише з дії, ніколи під час показу. */
+  function purPinFolder(pu) {
+    if (!pu || pu.folder) return false;
+    const dir = purDirOf(pu);
+    if (!dir) return false;
+    pu.folder = dir;
+    save();
+    return true;
+  }
+  /** Справа, чия тека береться для файла з ключем: папір версії `purver|…` чи договір `purdoc|…` (інші документи лежать у теках
+   *  служби за роком і не залежать від теки справи). */
+  function purOfFileKey(key) {
+    const [kind, id] = String(key).split('|');
+    if (kind === 'purver') return purList().find((p) => (p.versions || []).some((v) => v.id === id)) || null;
+    if (kind === 'purdoc') {
+      const d = pdById(id);
+      return d && d.kind === 'договір' ? purById(d.purchase) : null;
+    }
+    return null;
+  }
+  /** Чому файл до цього запису закупівлі зараз не підшивають («» — можна). Лист штабу називається за відповіддю («Погодження» чи
+   *  «Не погоджено»): поки відповіді нема, лист про відмову отримав би ім'я «Погодження». Кнопки без відповіді нема, а це — те
+   *  саме для дії, до якої дійшли іншим шляхом (екран, не перемальований після зміни відповіді в іншому вікні). */
+  function purFileRefusal(key) {
+    const [kind, id, what] = String(key).split('|');
+    if (kind !== 'purver' || what !== 'відповідь') return '';
+    const pu = purOfFileKey(key);
+    const v = pu && (pu.versions || []).find((x) => x.id === id);
+    return v && !v.answer ? 'Спершу внесіть відповідь штабу: лист називається за нею.' : '';
+  }
+  /** «Відкрити теку»: Провідник показує саму теку справи (`api/reveal` приймає й каталог); якої ще немає — сервер
+   *  створює її (`make`), тож відкривається й тека нової справи, у якій нічого немає. */
+  async function purOpenFolder(pu) {
+    const dir = pu ? purDirOf(pu) : '';
+    if (!dir) return;
+    purPinFolder(pu);
+    try {
+      const r = await fetch('api/reveal', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ folder: 'purchases', path: dir, make: true }) });
+      if (!r.ok) throw new Error((await r.text()) || `помилка ${r.status}`);
+    } catch (e) {
+      toast(`Не вдалося відкрити теку: ${e.message || e}`, true);
+    }
+  }
+
+  // ------------------------------------------------ книга «Закупівлі» туди й назад, пошук файлів, файли з теки
+  /** Відповідь сервера як `{ status, ok, j }`: `j` — завжди об'єкт, а текст помилки (400, 413, 500 приходять простим текстом) — його `error`. */
+  async function purReply(r) {
+    const text = await r.text();
+    let j;
+    try { j = JSON.parse(text); } catch (e) { j = null; }
+    return { status: r.status, ok: r.ok, j: j && typeof j === 'object' && !Array.isArray(j) ? j : { error: text } };
+  }
+  const purPost = async (url, body) => purReply(await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body) }));
+
+  /** Вивантаження, перегляд і прийом книги, як і пошук файлів, йдуть по одному: друге натискання, поки перше не повернулось, нічого не робить. */
+  let purBookBusy = false;
+  /** «Вивантажити книгу»: «Закупівлі.xlsx» і порожні бланки лягають у теку «Закупівлі». Книгу з внесеним руками сервер не перезаписує (409):
+   *  вікно називає рядки й відсилає до «Прийняти книгу…»; книга, відкрита в Excel (теж 409), — лише слово сервера. */
+  async function purBookExport() {
+    if (purBookBusy) return;
+    purBookBusy = true;
+    try {
+      await flush();                                                   // книга — з бази: щойно внесене спершу лягає в неї
+      const { status, ok, j } = await purPost('api/pur-book/export', {});
+      if (status === 409) { alert(purBookSay(j.error || 'Книгу не вивантажено.', j.rows, 12)); return; }
+      if (!ok || !j.ok) { toast(j.error || `помилка ${status}`, true); return; }
+      if (j.download) {                                                // з іншого ПК книга віддається завантаженням
+        const a = document.createElement('a');
+        a.href = j.download;
+        a.download = 'Закупівлі.xlsx';
+        document.body.appendChild(a);                                  // не всі браузери завантажують за кліком по елементу поза сторінкою
+        a.click();
+        a.remove();
+      }
+      const done = purBookDone(j);
+      toast(done.text, done.bad);
+    } catch (e) {
+      toast(`Не вдалося вивантажити книгу: ${e.message || e}`, true);
+    } finally {
+      purBookBusy = false;
+    }
+  }
+  /** «Прийняти книгу…»: вибір файла → перелік відмінностей від бази за аркушами → «Прийняти все» (усе або нічого, з копією бази). Обраний
+   *  файл лишається тут: коли закупівлі в базі змінились після перегляду, «Прийняти все» переглядає той самий файл ще раз (`look`). */
+  function purBookImport() {
+    if (purBookBusy) return;
+    pickFile('.xlsx', (file) => {                                     // вікно вибору відкривається в самому кліку: далі нічого не чекаємо
+      const look = () => purBookPreview(file, look);
+      return look();
+    });
+  }
+  /** Перегляд книги: сервер рахує відмінності від бази й пам'ятає, що показано (`sha`). `again` — перегляд того самого файла наново. */
+  async function purBookPreview(file, again = null) {
+    if (purBookBusy) return;
+    purBookBusy = true;
+    try {
+      await flush();
+      const { status, ok, j } = await purReply(await fetch('api/pur-book/preview', { method: 'POST', body: file }));
+      if (status === 422) { purBookRefused('Книга не приймається', j.error || 'Книга не приймається.', j.problems); return; }
+      if (!ok || !j.ok) { toast(j.error || `помилка ${status}`, true); return; }
+      const same = !!(j.diff && j.diff.same);
+      const sheet = (x) => `<p data-sheet="${esc(x.sheet)}"><b>${esc(x.sheet)}</b>: ${esc(x.say)}${
+        x.lists.map((l) => `<br><small>${esc(l)}</small>`).join('')}</p>`;
+      const el = modalOpen('Прийняти книгу «Закупівлі»', `<div class="pad op-preview" id="pur-book-diff">
+        <p class="set-note">${esc(file.name)}</p>
+        ${same ? '<p>Відмінностей немає.</p>' : purDiffRows(j.diff).map(sheet).join('')}
+        <div class="set-form__acts" style="padding-top:12px">${same ? '<button class="btn" type="button" data-md="close">Закрити</button>'
+    : `<button class="btn" type="button" data-md="close">Скасувати</button>
+          <button class="btn btn--primary" type="button" data-pur-apply>Прийняти все</button>`}</div></div>`, 'modal__box--form');
+      el.querySelector('[data-pur-apply]')?.addEventListener('click', (e) => purBookApply(j.sha, e.currentTarget, again));
+    } catch (e) {
+      toast(`Книгу не прочитано: ${e.message || e}`, true);
+    } finally {
+      purBookBusy = false;
+    }
+  }
+  /** Вікно з переліком того, чому книгу не прийнято: аркуш і рядок у кожному рядку, не більш як тридцять, решта — «… ще N». Слово
+   *  сервера («книга не приймається») повторювало б заголовок, тож там, де є перелік, його замінює прохання виправити; без переліку
+   *  (перегляд застарів, збій) слово сервера — єдине, що є. */
+  function purBookRefused(title, error, problems) {
+    const list = purClip(Array.isArray(problems) ? problems : [], 30);
+    const lead = list.length ? 'Виправте в книзі рядки з переліку й оберіть її ще раз.' : String(error).replace(/^./, (c) => c.toUpperCase());
+    modalOpen(title, `<div class="pad" id="pur-book-problems"><p>${esc(lead)}</p>${list.length ? listHtml(list) : ''}
+      <div class="set-form__acts" style="padding-top:12px"><button class="btn" type="button" data-md="close">Закрити</button></div></div>`, 'modal__box--form');
+  }
+  /** «Прийняти все»: одне питання, тоді копія бази й прийом на сервері. Прийнято — вікно оновлюється, як після прийому книги ОП, і каже
+   *  ім'я копії; відмова (книга з помилкою, перегляд застарів) лишає базу такою, як була. Закупівлі в базі змінились після перегляду —
+   *  сервер нічого не міняє й відповідає 409 з новими відмінностями: слово сервера стає плашкою, а той самий файл переглядається
+   *  наново (`again`), і вікно показує свіжі відмінності. Інші відмови — як завжди. */
+  async function purBookApply(sha, button, again = null) {
+    if (purBookBusy) return;
+    if (!confirm('Прийняти книгу? Закупівлі в програмі стануть такими, як у файлі; перед цим програма збереже копію бази.')) return;
+    purBookBusy = true;
+    button.disabled = true;
+    let applied = false;
+    let stale = false;
+    try {
+      if (await flush() !== true) { toast('Внесене в цьому вікні ще не записано: книгу не прийнято.', true); return; }
+      const { status, ok, j } = await purPost('api/pur-book/apply', { sha });
+      if (status === 409 && j.diff && again) {
+        stale = true;
+        toast(j.error || 'Закупівлі змінились після перегляду.', true);
+        return;
+      }
+      if (!ok || !j.ok) { purBookRefused('Книгу не прийнято', j.error || `помилка ${status}`, j.problems); return; }
+      applied = true;
+      purReload(`Книгу прийнято. Копія бази: ${j.backup}.`);
+    } catch (e) {
+      toast(`Не вдалося прийняти книгу: ${e.message || e}`, true);
+    } finally {
+      purBookBusy = false;
+      if (!applied) button.disabled = false;                          // прийнято — вікно оновлюється, повторне натискання не потрібне
+      if (stale) await again();                                        // уже не зайнято: перегляд наново відкриває своє вікно
+    }
+  }
+  /** Базу змінив сервер, тож вікно береться за свіжі дані (як після прийому книги ОП): екран, рік і прокрутка лишаються, а слово
+   *  про копію бази показується вже в оновленому вікні — до оновлення воно зникло б разом із ним. */
+  function purReload(note) {
+    syncFresh({ note });
+    if (!sync.leaving) { sync.leaving = true; location.reload(); }     // сховища вікна нема: оновлюємось без слова
+  }
+
+  /** «Знайти файли»: файли закупівель (рядок коштів, версія, документ, реєстр на ФЕС), яких немає на місці — теку чи файл перенесли
+   *  Провідником, — шукаються за вмістом у своїй теці служби. Знайдений файл перепідшивається на новий шлях, решта запису лишається.
+   *  Запис без відбитка вмісту не знайти: він лишається серед не знайдених. Лише на основному ПК (теки видно тільки йому). */
+  async function purFilesFind() {
+    if (purBookBusy) return;
+    purBookBusy = true;
+    try {
+      const mine = (store.scans || []).filter((f) => PUR_FILE_KEY.test(f.key) && f.folder && f.path);
+      if (!mine.length) { toast(purFoundWord(0, 0)); return; }          // файлів закупівель ще немає (чиста програма): питати сервер нема про що
+      // Зниклі — за тією самою перевіркою, що й «Потребує уваги»: сервер дивиться в теки служби, сторінка диска не бачить.
+      const seen = await purPost('api/scan-check', { paths: [], files: mine.map((f) => ({ folder: f.folder, path: f.path })) });
+      if (!seen.ok) { toast(seen.j.error || `помилка ${seen.status}`, true); return; }
+      const gone = new Set((seen.j.missingFiles || []).map((f) => `${f.folder}|${f.path}`));
+      const lost = mine.filter((f) => gone.has(`${f.folder}|${f.path}`));
+      const asked = lost.filter((f) => f.sha).map((f) => ({ folder: f.folder, path: f.path, sha: f.sha, size: f.size }));
+      let found = 0;
+      if (asked.length) {
+        const got = await purPost('api/files-find', { files: asked });
+        if (!got.ok) { toast(got.j.error || `помилка ${got.status}`, true); return; }
+        for (const x of got.j.found || []) {
+          for (const f of lost) {
+            if (f.folder !== x.folder || f.path !== x.was) continue;
+            logChange('файл знайдено за вмістом', f.key, `${f.file}: ${x.was} → ${x.path}`);
+            f.path = x.path;
+            f.folder = x.folder;                                       // тека — та, де сервер знайшов файл (шукає в теці запису)
+            found++;
+          }
+        }
+      }
+      if (found) {
+        save(true);
+        render();
+        checkFiles();                                                  // «Потребує уваги» не називає вже знайдене
+      }
+      toast(purFoundWord(found, lost.length - found));
+    } catch (e) {
+      toast(`Не вдалося знайти файли: ${e.message || e}`, true);
+    } finally {
+      purBookBusy = false;
+    }
+  }
+  /** «Підшити з теки…»: файл, який людина вже поклала Провідником у теку запису (папір версії — у теку версії), підшивається на місці,
+   *  без копії: записуються його тека служби, шлях, розмір і відбиток. У переліку — файли теки, яких ще ніде не підшито, найновіші
+   *  вгорі. Тека справи без «теки» закріплюється, щойно відкривається вікно (`purPinFolder`), ще до вибору файла: перелік і підшитий
+   *  файл — з тієї самої теки. */
+  async function purFolderPick(key) {
+    purPinFolder(purOfFileKey(key));
+    const where = purFolderFor(key);
+    if (!where) { toast('Запису вже немає в справі: файл не підшито.', true); return; }
+    let listed;
+    try {
+      listed = await purReply(await fetch(`api/folder-list?key=${encodeURIComponent(where.folder)}&path=${encodeURIComponent(where.dir)}`));
+    } catch (e) {
+      toast(`Теку не прочитано: ${e.message || e}`, true);
+      return;
+    }
+    const { ok, j } = listed;
+    if (!ok || !j.ok) { toast(j.error || 'Теку не прочитано.', true); return; }
+    const pathOf = (name) => [where.dir, name].filter(Boolean).join('/');
+    const taken = new Set((store.scans || []).filter((f) => f.folder === where.folder).map((f) => f.path));
+    const free = (j.files || []).filter((f) => !taken.has(pathOf(f.name)))
+      .sort((a, b) => String(b.mtime || '').localeCompare(String(a.mtime || '')) || a.name.localeCompare(b.name, 'uk'));
+    const rows = free.map((f) => `<div class="tbl__row tbl__row--plain"><div class="c-txt" title="${esc(f.name)}">${esc(f.name)}</div>
+      <div class="c-num" style="width:76px">${esc(fmtSize(f.size))}</div><div class="c-date" style="width:132px">${esc(fmtStamp(f.mtime))}</div>
+      <div class="c-acts" style="flex-basis:96px"><button class="btn btn--sm" type="button" data-pick-file="${esc(f.name)}" aria-label="Підшити файл ${esc(f.name)}">Підшити</button></div></div>`).join('');
+    const el = modalOpen('Підшити з теки', `<div class="pad" id="pur-folder-pick">
+      <p class="set-note" style="padding-bottom:6px">Тека «${esc(SERVICE_FOLDERS[where.folder] || where.folder)}»: ${esc(where.dir || '.')}</p>
+      ${free.length ? `<div class="tbl" style="--tbl-min:auto">${rows}</div>` : '<p>У теці немає файлів, яких ще не підшито.</p>'}</div>`, 'modal__box--form');
+    el.querySelectorAll('[data-pick-file]').forEach((b) => b.addEventListener('click', async () => {
+      b.disabled = true;
+      const path = pathOf(b.dataset.pickFile);
+      try {
+        const got = await purPost('api/folder-link', { folder: where.folder, path });
+        if (!got.ok || !got.j.ok) { toast(got.j.error || 'Файл не підшито.', true); return; }
+        store.scans = store.scans || [];
+        if (!store.scans.some((f) => f.folder === where.folder && f.path === path)) {          // двічі натиснули: запис один
+          store.scans.push({ key, date: today(), no: '', file: got.j.file, path, mime: got.j.mime, size: got.j.size, added: today(),
+            folder: where.folder, sha: got.j.sha });
+          logChange('файл підшито з теки', key, got.j.file);
+        }
+        modalClose();
+        save(true);
+        toast(`Підшито файл: ${got.j.file}.`);
+        render();
+      } catch (e) {
+        toast(`Файл не підшито: ${e.message || e}`, true);
+      } finally {
+        b.disabled = false;
+      }
+    }));
+  }
+  function purEditDialog(pu) {
+    if (!pu) return;
+    const el = modalOpen(`Закупівля · ${pu.title}`, `<form id="pur-edit" class="pad"><div class="form__grid">
+        <div class="field field--span"><label>Тема</label><input name="title" value="${esc(pu.title)}" required></div>
+        <div class="field field--span"><label>Що купуємо</label><input name="what" value="${esc(pu.what)}"></div>
+        <div class="field"><label>Відповідальний</label><select name="person">${personOptions(pu.person, today(), '—')}</select></div>
+        <div class="field"><label>Позначка</label><select name="closed">${['', 'завершено', 'скасовано'].map((v) =>
+    `<option value="${v}"${pu.closed === v ? ' selected' : ''}>${v || '—'}</option>`).join('')}</select></div>
+        <div class="field field--span"><label>Примітка</label><input name="note" value="${esc(pu.note)}"></div></div>
+      <div class="pad" data-pur-msg hidden style="color:var(--bad)"></div>
+      <div style="padding-top:12px"><button class="btn btn--primary" type="submit">Зберегти</button>
+        <button class="btn" type="button" data-md="close">Скасувати</button>
+        ${!purDocsList().some((x) => x.purchase === pu.id) ? '<button class="btn btn--danger" type="button" data-pur-del>Видалити закупівлю</button>' : ''}</div></form>`);
+    const msg = el.querySelector('[data-pur-msg]');
+    el.querySelector('form').addEventListener('submit', (e) => {
+      e.preventDefault();
+      msg.hidden = true;
+      const f = new FormData(e.target);
+      const title = String(f.get('title') || '').trim().replace(/\s+/g, ' ');
+      if (!title) { msg.hidden = false; msg.textContent = 'Тему закупівлі не вказано.'; return; }
+      const why = purTwinWhy(pu.year, title, pu);
+      if (why) { msg.hidden = false; msg.textContent = why; return; }
+      Object.assign(pu, { title, what: String(f.get('what') || '').trim(),
+        closed: String(f.get('closed') || ''), person: String(f.get('person') || ''), note: String(f.get('note') || '').trim() });
+      logChange('закупівлю виправлено', `pur|${pu.id}`, pu.title);
+      modalClose();
+      saveThen('Закупівлю збережено.');
+      render();
+    });
+    el.querySelector('[data-pur-del]')?.addEventListener('click', () => {
+      if (!confirm(`Видалити закупівлю «${pu.title}»?\n\nФайли в теці лишаться.`)) return;
+      store.purchases = purList().filter((p) => p.id !== pu.id);
+      // Записи про її файли йдуть разом із нею (версії — `purver|<id>|…`, документи — `purdoc|<id>`); самі файли лишаються в
+      // теці: програма файлів не видаляє.
+      const keys = new Set([...(pu.versions || []).map((v) => `purver|${v.id}`),
+        ...purDocsList().filter((d) => d.purchase === pu.id).map((d) => `purdoc|${d.id}`)]);
+      store.scans = (store.scans || []).filter((f) => !keys.has(String(f.key).split('|').slice(0, 2).join('|')));
+      logChange('закупівлю видалено', `pur|${pu.id}`, pu.title);
+      modalClose();
+      save(true, true);
+      go('purch', { purId: null, purVer: null });
+    });
+  }
+
+  // ---------------------------------------------------------------- позиції й версії
+  /** Версію подано, коли в неї є № супроводу чи відповідь штабу (як у `purState`): подану не правлять. */
+  const purVerSent = verSent;
+  /** Перемалювати екран, лишивши прокрутку сторінки там, де вона була. Екран вважається новим, коли міняється версія
+   *  (`screenKey`), і без цього сторінка стрибала б угору, а перемикач версій і «Нова версія» лежать у блоці посередині картки. */
+  function renderKeepingScroll() {
+    const sc = $('#scroll');
+    const top = sc ? sc.scrollTop : 0;
+    render();
+    if (sc) sc.scrollTop = top;
+  }
+  /** Версія, яку показує картка: вибрана або остання. */
+  function purVerOf(pu) {
+    return (pu.versions || []).find((v) => v.id === state.purVer) || purVersion(pu);
+  }
+  const purVerSeg = (pu, v) => `<div class="seg pur-vers">${(pu.versions || []).map((x) =>
+    `<button type="button" data-act="pur-ver" data-id="${esc(x.id)}"${x.id === v.id ? ' class="is-on"' : ''}>${esc(x.label)}${
+      x.answer ? ` · ${esc(x.answer)}` : x.sentNo ? ' · подано' : ''}</button>`).join('')}</div>`;
+  /** Мітка наступної версії: «2.0», «3.0»…, перша, якої в справі ще немає (мітка в справі одна). */
+  function purNextLabel(pu) {
+    const have = new Set((pu.versions || []).map((v) => v.label));
+    let n = (pu.versions || []).length + 1;
+    while (have.has(`${n}.0`)) n++;
+    return `${n}.0`;
+  }
+  /** Копія позицій версії з новими id: id позицій і пропозицій у базі не повторюються між версіями. */
+  const purCopyPositions = (ver) => JSON.parse(JSON.stringify((ver && ver.positions) || [])).map((p) => Object.assign(p, {
+    id: uid(), offers: (p.offers || []).map((o) => Object.assign(o, { id: uid() })) }));
+  /** Чому закупівлю цього року з такою темою не заводять (і не перейменовують): така тема чи така тека (Windows не розрізняє
+   *  регістру: «Плити/кухня» і «Плити-кухня» — одна тека) вже є в іншої. Порожній рядок — можна. `own` — справа, яку правлять:
+   *  вона не двійник собі, а поки в неї є своя тека, її назва теки від теми не залежить — тоді рахується лише тема. Справа без
+   *  теки (рядок книги) має «рік/тема», тож нова тема міняє й теку. Єдине місце, де порівнюють теми й теки справ. */
+  function purTwinWhy(year, title, own = null) {
+    const same = (a, b) => String(a || '').toLowerCase() === String(b || '').toLowerCase();
+    const folder = own && own.folder ? '' : `${year}/${safeFile(title)}`;
+    const twin = purList().find((p) => p !== own && +p.year === +year && (same(p.title, title) || (folder && same(purDirOf(p), folder))));
+    if (!twin) return '';
+    return same(twin.title, title) ? `Закупівля «${title}» за ${year} рік уже є.`
+      : `Тека «${purDirOf(twin)}» уже належить закупівлі «${twin.title}».`;
+  }
+  /** КЕКВ і код видатків позиції — ті, що пропонує ціна. Пара, запропонована за колишньою ціною (чи порожня) і не виправлена,
+   *  йде за новою ціною; вписана руками лишається. `prev` — позиція до правки, `typed` — що стоїть у полях. */
+  function purKekvAfter(prev, typed, priceKop) {
+    const was = kekvFor(prev.priceKop);
+    const now = kekvFor(priceKop);
+    const untouched = typed.kekv === prev.kekv && typed.exp === prev.exp;
+    const followed = (!prev.kekv && !prev.exp) || (prev.kekv === was.kekv && prev.exp === was.exp);
+    if (untouched && followed) return now;
+    return { kekv: typed.kekv || now.kekv, exp: typed.exp || now.exp };
+  }
+
+  /** Пропозиції, з яких береться ціна позиції за її правилом: посилання з ціною («середня»), перша КП з ціною («КП»), жодної
+   *  («вручну»). Так само, як `posPrice`: лічильник «N ц.» під ціною каже про них, а не про все, що записано в позиції. */
+  function posOffersUsed(p) {
+    const priced = (p.offers || []).filter((o) => +o.priceKop > 0);
+    if (p.rule === 'середня') return priced.filter((o) => o.kind === 'посилання');
+    if (p.rule === 'КП') return priced.filter((o) => o.kind === 'КП').slice(0, 1);
+    return [];
+  }
+
+  /** Блок «Позиції»: версії, кнопки (один рядок), «розраховано X із Y» окремим рядком над таблицею, таблиця з підписами стовпців. */
+  PUR_BLOCKS.push((pu, ctx) => {
+    const v = purVerOf(pu);
+    if (!v) {                                                    // справа з книги без версій: перша версія — тут
+      return `<div class="card pur-block"><div class="card__head"><div class="card__title">Позиції</div>
+          <div class="panel__spacer"></div><button class="btn btn--sm" data-act="pur-ver-new">Нова версія</button></div>
+        <div class="tbl"><div class="tbl__row tbl__row--plain"><div class="c-txt">Версій пакета ще немає.</div></div></div></div>`;
+    }
+    const ro = purVerSent(v);
+    const total = verKop(v);
+    const target = (pu.funds || []).reduce((s, f) => s + (+f.kop || 0), 0);
+    const rows = (v.positions || []).map((p, i) => {
+      const used = posOffersUsed(p);
+      return `<div class="tbl__row tbl__row--plain" data-pos="${esc(p.id)}">
+        <div class="c-num pur-pos__n">${i + 1}</div>
+        <div class="c-name c-name--stack pur-pos__name"><b>${esc(p.name || '—')}</b><small>${esc([p.uom, p.dk, p.code && `код ${p.code}`].filter(Boolean).join(' · '))}</small></div>
+        <div class="c-num pur-pos__qty">${fmtNum(p.qty)}</div>
+        <div class="c-num pur-pos__kop">${grnOf(p.priceKop)}<small>${esc(p.rule)}${used.length ? ` · ${used.length} ц.` : ''}</small></div>
+        <div class="c-num pur-pos__kop">${grnOf(posKop(p))}</div>
+        <div class="c-code pur-pos__code">${esc([p.kekv, p.exp].filter(Boolean).join('/'))}</div>
+        <div class="c-acts">${ro ? '' : rowBtn('pur-pos', '✎ Виправити', `data-i="${i}"`, { title: 'Позиція й ціни' })
+          + rowBtn('pur-pos-del', '✕ Прибрати', `data-i="${i}"`, { bad: true, title: 'Прибрати позицію' })}</div></div>`;
+    }).join('');
+    const head = `<div class="tbl__head"><div class="tbl__h c-num pur-pos__n">№</div><div class="tbl__h c-name pur-pos__name">найменування</div>
+      <div class="tbl__h c-num pur-pos__qty">кількість</div><div class="tbl__h c-num pur-pos__kop">ціна, грн</div>
+      <div class="tbl__h c-num pur-pos__kop">сума, грн</div><div class="tbl__h c-code pur-pos__code">КЕКВ / код</div><div class="tbl__h c-acts"></div></div>`;
+    const rest = !target || total === target ? ''
+      : total > target ? ` · <span class="num-bad">перевищено на ${grnOf(total - target)}</span>`
+        : ` · <span class="num-warn">лишилось ${grnOf(target - total)}</span>`;
+    return `<div class="card pur-block pur-pos-block"><div class="card__head"><div class="card__title">Позиції</div>${purVerSeg(pu, v)}
+        <div class="panel__spacer"></div>
+        ${ro ? '' : `<button class="btn btn--sm" data-act="pur-pos-new">+ Позиція</button>${
+          (v.positions || []).length ? '<button class="btn btn--sm" data-act="pur-fit">Підігнати до суми</button>' : ''}`}
+        <button class="btn btn--sm" data-act="pur-ver-new" title="Копія позицій останньої версії в підтеку ${esc(purNextLabel(pu))}">Нова версія</button>
+        ${purNums(pu, ctx).economy > 0 ? '<button class="btn btn--sm" data-act="pur-economy">+ Закупівля з економії</button>' : ''}
+        <button class="btn btn--sm" data-act="pur-rework">Перероблено в нову закупівлю</button></div>
+      <div class="pur-pos-sum">розраховано ${grnOf(total)}${target ? ` із ${grnOf(target)}` : ''}${rest}</div>
+      <div class="tbl pur-pos">${rows ? head + rows : '<div class="tbl__row tbl__row--plain"><div class="c-txt">Позицій ще немає.</div></div>'}</div></div>`;
+  });
+
+  /** Вікно позиції: нова (`p` порожня) чи виправлення. Ціна — середня з посилань, ціна комерційної пропозиції (КП) чи вписана
+   *  вручну. Показано всі посилання (не менше трьох) і всі КП: ціну `posPrice` бере з перших із ціною, і нічого, що її задає,
+   *  не лишається прихованим. Кількість читає `qtyIn`, суми — `moneyIn`: що не число, нулем не пишеться — поля червоніють разом,
+   *  слово лежить у самому вікні, а позиція не міняється. Ціна, якої правило не дає, теж не стає мовчки нулем: вписана вручну
+   *  чи колишня ціна, а за правилом ціни немає, — відмова словом. Дані, яких вікно не показує (дата перевірки, примітки), лишаються. */
+  function posDialog(pu, v, p) {
+    const fresh = !p;
+    const rec = JSON.parse(JSON.stringify(p || posBlank()));
+    const prev = { priceKop: +rec.priceKop || 0, kekv: rec.kekv || '', exp: rec.exp || '' };
+    rec.offers = rec.offers || [];
+    const links = rec.offers.filter((o) => o.kind === 'посилання');
+    while (links.length < 3) links.push(offerBlank('посилання'));
+    const quotes = rec.offers.filter((o) => o.kind === 'КП');
+    if (!quotes.length) quotes.push(offerBlank('КП'));
+    const kn = (k, i) => (i ? `${k}${i}` : k);                 // поля першої КП — kpSeller, kpNo, kpDate, kpPrice; далі — з номером
+    const lines = (pu.funds || []).map((f) => budById(f.line)).filter(Boolean);
+    if (rec.line && budById(rec.line) && !lines.includes(budById(rec.line))) lines.push(budById(rec.line));
+    const money = (kop) => (kop ? kopStr(kop) : '');
+    const el = modalOpen(fresh ? 'Нова позиція' : `Позиція · ${rec.name}`, `<form id="pos-form" class="pad"><div class="form__grid">
+        <div class="field field--span"><label>Найменування (як у 1ФС)</label><input name="name" value="${esc(rec.name)}" required autocomplete="off"></div>
+        <div class="field field--span"><label>Технічні вимоги (ТТХ)</label><textarea name="specs" rows="2">${esc(rec.specs)}</textarea></div>
+        <div class="field"><label>Одиниця</label><input name="uom" value="${esc(rec.uom)}" autocomplete="off"></div>
+        <div class="field"><label>Кількість</label><input name="qty" inputmode="decimal" value="${esc(rec.qty)}" required autocomplete="off"></div>
+        <div class="field"><label>Код ДК</label><input name="dk" value="${esc(rec.dk)}" autocomplete="off"></div>
+        <div class="field"><label>Код номенклатури</label><input name="code" value="${esc(rec.code)}" placeholder="якщо вже є в обліку" autocomplete="off"></div>
+        <div class="field"><label>Правило ціни</label><select name="rule">${PUR_RULES.map((r) => `<option${r === rec.rule ? ' selected' : ''}>${r}</option>`).join('')}</select></div>
+        <div class="field"><label>Ціна вручну, грн</label><input name="hand" inputmode="decimal" autocomplete="off" value="${rec.rule === 'вручну' ? esc(money(rec.priceKop)) : ''}"></div>
+        <div class="field"><label>КЕКВ</label><input name="kekv" value="${esc(rec.kekv)}" placeholder="за ціною" autocomplete="off"></div>
+        <div class="field"><label>Код видатків</label><input name="exp" value="${esc(rec.exp)}" placeholder="за ціною" autocomplete="off"></div>
+        <div class="field--span pur-links"><div class="pur-links__h">Посилання</div><div class="pur-links__h">Ціна, грн</div>
+          ${links.map((o, i) => `<div class="field"><input name="url${i}" value="${esc(o.url)}" placeholder="https://" autocomplete="off" aria-label="Посилання ${i + 1}"></div>
+          <div class="field"><input name="price${i}" inputmode="decimal" autocomplete="off" value="${esc(money(o.priceKop))}" aria-label="Ціна ${i + 1}, грн"></div>`).join('')}</div>
+        <div class="field--span pur-kps"><div class="pur-links__h">${quotes.length > 1 ? 'Комерційні пропозиції' : 'Комерційна пропозиція'}</div>
+          <div class="pur-links__h">№</div><div class="pur-links__h">Від</div><div class="pur-links__h">Ціна, грн</div>
+          ${quotes.map((o, i) => `<div class="field"><input name="${kn('kpSeller', i)}" value="${esc(o.seller)}" placeholder="постачальник" autocomplete="off" aria-label="КП ${i + 1}: постачальник"></div>
+          <div class="field"><input name="${kn('kpNo', i)}" value="${esc(o.no)}" autocomplete="off" aria-label="КП ${i + 1}: №"></div>
+          <div class="field"><input name="${kn('kpDate', i)}" type="date" value="${esc(o.date)}" aria-label="КП ${i + 1}: від"></div>
+          <div class="field"><input name="${kn('kpPrice', i)}" inputmode="decimal" autocomplete="off" value="${esc(money(o.priceKop))}" aria-label="КП ${i + 1}: ціна, грн"></div>`).join('')}</div>
+        ${lines.length > 1 ? `<div class="field field--span2"><label>Рядок коштів</label><select name="line"><option value="">—</option>${lines.map((l) =>
+    `<option value="${esc(l.id)}"${l.id === rec.line ? ' selected' : ''}>${esc(l.label)}</option>`).join('')}</select></div>` : ''}
+        <div class="field ${lines.length > 1 ? 'field--span2' : 'field--span'}"><label>Примітка</label><input name="note" value="${esc(rec.note)}" autocomplete="off"></div></div>
+      <div class="pos-foot"><div class="pad" data-pur-msg hidden style="color:var(--bad)"></div>
+        <div><button class="btn btn--primary" type="submit">Зберегти</button>
+          <button class="btn" type="button" data-md="close">Скасувати</button></div></div></form>`);
+    const form = el.querySelector('form');
+    const msg = el.querySelector('[data-pur-msg]');
+    const fail = (field, text) => {                              // слово — у липкому низі вікна (видиме саме); поле, з якого воно, — у фокусі й червоне
+      field.classList.add('is-bad');
+      msg.hidden = false;
+      msg.textContent = text;
+      field.focus();
+    };
+    let autoHand = rec.rule === 'вручну' ? money(rec.priceKop) : '';        // що в «Ціна вручну» поставила сама програма: людиною вписане воно не вважається
+    form.elements.rule.addEventListener('change', () => {
+      const hand = form.elements.hand;
+      const now = hand.value.trim();
+      if (form.elements.rule.value === 'вручну') {
+        if (!now && prev.priceKop) hand.value = autoHand = money(prev.priceKop);   // «вручну» замість «середня» чи «КП»: ціна лишається, а не стає нулем
+      } else if (now && now === autoHand) {
+        hand.value = '';                                                           // а назад — поставлене програмою не лишається в полі як вписане
+      }
+    });
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      msg.hidden = true;
+      const f = new FormData(form);
+      const g = (k) => String(f.get(k) || '').trim();
+      const rule = g('rule');
+      const bad = [];                                        // поля, що не пройшли: червоніють усі, слово — про перше з них
+      const miss = (field) => (text) => bad.push([field, text]);
+      const name = g('name').replace(/\s+/g, ' ');
+      form.elements.name.classList.toggle('is-bad', !name);
+      if (!name) bad.push([form.elements.name, 'Найменування не вказано.']);
+      const qty = qtyIn(form.elements.qty, miss(form.elements.qty));
+      const prices = links.map((o, i) => moneyIn(form.elements[`price${i}`], miss(form.elements[`price${i}`])));
+      const kpPrices = quotes.map((o, i) => moneyIn(form.elements[kn('kpPrice', i)], miss(form.elements[kn('kpPrice', i)])));
+      form.elements.hand.classList.remove('is-bad');
+      const typedHand = g('hand');                           // вписана людиною (порожнє поле — ні)
+      const hand = rule === 'вручну' || typedHand ? moneyIn(form.elements.hand, miss(form.elements.hand)) : 0;
+      if (bad.length) { fail(bad[0][0], bad[0][1]); return; }
+      if (rule === 'вручну' && !typedHand && prev.priceKop > 0) { fail(form.elements.hand, 'Впишіть ціну.'); return; }   // порожня — не нуль
+      rec.name = name; rec.specs = g('specs'); rec.uom = g('uom'); rec.qty = qty; rec.dk = g('dk'); rec.code = g('code');
+      rec.rule = rule; rec.note = g('note');
+      if (form.elements.line) rec.line = g('line');          // «—» знімає рядок; без вибору (рядок один) лишається як був
+      // Нові об'єкти, а не правка наявних: відмова нижче лишає вікно відкритим, і повторне «Зберегти» рахує від колишнього.
+      // Пропозиція зникає лише тоді, коли людина спорожнила її рядок: у ньому було що показати (посилання — адреса чи ціна; КП —
+      // постачальник, №, дата чи ціна), а тепер нічого. Усе інше з будь-якими даними (адреса, примітка, дата перевірки, продавець…)
+      // лишається, навіть коли рядок цього не показує; порожнього нового рядка — нема.
+      const linkShown = (o) => !!(+o.priceKop || o.url);
+      const quoteShown = (o) => !!(+o.priceKop || o.seller || o.no || o.date);
+      const anyData = (o) => !!(+o.priceKop || o.url || o.seller || o.no || o.date || o.note || o.checked);
+      const made = links.map((o, i) => ({ ...o, priceKop: prices[i], url: g(`url${i}`),
+        // Продавець — із адреси, але лише коли адресу змінили чи продавця ще не було: вписаного раніше (книга, імпорт) вікно не перебиває.
+        seller: o.seller && g(`url${i}`) === String(o.url || '').trim() ? o.seller
+          : (g(`url${i}`).match(/^https?:\/\/([^/]+)/) || [])[1] || o.seller || '',
+        checked: prices[i] && (prices[i] !== (+o.priceKop || 0) || !o.checked) ? today() : (o.checked || '') }))
+        .filter((n, i) => (linkShown(links[i]) ? linkShown(n) : anyData(n)));
+      const kept = quotes.map((o, i) => ({ ...o, seller: g(kn('kpSeller', i)), no: g(kn('kpNo', i)), date: g(kn('kpDate', i)),
+        priceKop: kpPrices[i] })).filter((n, i) => (quoteShown(quotes[i]) ? quoteShown(n) : anyData(n)));
+      rec.offers = made.concat(kept);
+      if (rule === 'вручну') rec.priceKop = hand;
+      rec.priceKop = posPrice(rec);
+      if (rule !== 'вручну') {
+        if (!rec.priceKop && ((typedHand && hand) || prev.priceKop > 0)) {         // вписана чи колишня ціна, а правило її не дає
+          fail(rule === 'КП' ? form.elements.kpPrice : form.elements.price0, `За правилом «${rule}» ціни немає — впишіть ${
+            rule === 'КП' ? 'ціну КП' : 'ціни за посиланнями'} або оберіть «вручну».`);
+          return;
+        }
+        if (rec.priceKop && typedHand && hand !== rec.priceKop) {                  // вписана ціна, якої правило не візьме, — не мовчки
+          fail(form.elements.hand, 'Щоб узяти вписану ціну, оберіть «вручну».');
+          return;
+        }
+      }
+      Object.assign(rec, purKekvAfter(prev, { kekv: g('kekv'), exp: g('exp') }, rec.priceKop));
+      const at = v.positions.findIndex((x) => x.id === rec.id);
+      if (at < 0) v.positions.push(rec); else v.positions[at] = rec;
+      logChange(fresh ? 'позицію додано' : 'позицію виправлено', `pur|${pu.id}`, `${v.label}: ${rec.name} × ${fmtNum(rec.qty)} по ${grnOf(rec.priceKop)}`);
+      modalClose();
+      save();
+      render();
+    });
+  }
+
+  /** «Підігнати до суми»: ціна вибраної позиції добирається так, щоб разом дорівнювало сумі (за умовчанням — гроші закупівлі);
+   *  коли рівно не виходить, ставиться найбільша ціна, з якою разом не перевищує суми (`fitPrice`), і сказано, скільки лишилось.
+   *  Решта позицій уже на всю суму — відмова. */
+  function purFitDialog(pu, v) {
+    const target = (pu.funds || []).reduce((s, f) => s + (+f.kop || 0), 0);
+    const el = modalOpen('Підігнати до суми', `<form id="fit-form" class="pad"><div class="form__grid">
+        <div class="field"><label>Позиція</label><select name="pos">${v.positions.map((p, i) =>
+    `<option value="${i}"${i === v.positions.length - 1 ? ' selected' : ''}>${esc(p.name)}</option>`).join('')}</select></div>
+        <div class="field"><label>Разом має бути, грн</label><input name="target" inputmode="decimal" autocomplete="off" value="${target ? esc(kopStr(target)) : ''}"></div></div>
+      <div class="pad" data-pur-msg hidden style="color:var(--bad)"></div>
+      <div style="padding-top:12px"><button class="btn btn--primary" type="submit">Підігнати</button>
+        <button class="btn" type="button" data-md="close">Скасувати</button></div></form>`, 'modal__box--form');
+    const form = el.querySelector('form');
+    const msg = el.querySelector('[data-pur-msg]');
+    const fail = (text) => { msg.hidden = false; msg.textContent = text; };
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      msg.hidden = true;
+      const p = v.positions[+new FormData(form).get('pos')];
+      const field = form.elements.target;
+      if (!p) return;
+      if (!field.value.trim()) { field.classList.add('is-bad'); fail('Суму не вказано.'); return; }
+      const want = moneyIn(field, fail);
+      if (want == null) return;
+      const others = verKop(v) - posKop(p);
+      if (!(+p.qty > 0)) { fail(`У позиції «${p.name}» не вказано кількість.`); return; }
+      if (want - others <= 0) {
+        field.classList.add('is-bad');
+        fail(`Інші позиції вже на ${grnOf(others)} грн: на «${p.name}» не лишається нічого.`);
+        return;
+      }
+      const got = fitPrice(want, others, p.qty);
+      if (got.priceKop <= 0) {
+        field.classList.add('is-bad');
+        fail(`На «${p.name}» лишається ${grnOf(want - others)} грн: ціна за одиницю вийшла б менша за копійку.`);
+        return;
+      }
+      const prev = { priceKop: +p.priceKop || 0, kekv: p.kekv || '', exp: p.exp || '' };
+      p.rule = 'вручну';
+      p.priceKop = got.priceKop;
+      Object.assign(p, purKekvAfter(prev, prev, p.priceKop));
+      logChange('ціну підігнано до суми', `pur|${pu.id}`, `${v.label}: ${p.name} по ${grnOf(p.priceKop)}${got.rest ? `, лишилось ${grnOf(got.rest)}` : ''}`);
+      modalClose();
+      save();
+      render();
+      if (got.rest) toast(`Рівно не виходить: лишилось ${grnOf(got.rest)} грн.`);
+    });
+  }
+
+  function purPosDel(pu, i) {
+    const v = pu && purVerOf(pu);
+    const p = v && !purVerSent(v) ? (v.positions || [])[+i] : null;
+    if (!p || !confirm(`Прибрати позицію «${p.name}»?`)) return;
+    v.positions.splice(+i, 1);
+    logChange('позицію прибрано', `pur|${pu.id}`, `${v.label}: ${p.name}`);
+    save(true, true);
+    render();
+  }
+  /** Нова версія пакета: копія позицій і пропозицій останньої, підтека `2.0`, `3.0`… Питання про причину можна скасувати —
+   *  тоді версії немає; порожня причина — теж причина. */
+  function purVerNew(pu) {
+    const last = purVersion(pu);
+    const asked = !last ? '' : prompt('Чому нова версія (наприклад, «не погоджено: майно не з номенклатури»)',
+      last.answer === 'не погоджено' ? [last.answer, last.answerNote].filter(Boolean).join(': ') : '');   // першій версії причина ні до чого
+    if (asked == null) return;
+    const reason = String(asked).trim();
+    const v = verBlank(purNextLabel(pu), today());
+    v.reason = reason;
+    v.positions = purCopyPositions(last);
+    pu.versions = (pu.versions || []).concat(v);
+    state.purVer = v.id;
+    logChange('нова версія пакета', `pur|${pu.id}`, `${v.label}${reason ? `: ${reason}` : ''}`);
+    save();
+    renderKeepingScroll();
+  }
+  /** «+ Закупівля з економії»: нова справа на нерозплановане рядків цієї закупівлі, з посиланням на неї. */
+  function purEconomy(pu) {
+    const title = `${pu.title} економія`;
+    const why = purTwinWhy(pu.year, title);
+    if (why) { toast(why, true); return; }
+    const ctx = purCtx();
+    const nu = purBlank(pu.year, title);
+    nu.parent = pu.id;
+    nu.what = `з економії закупівлі «${pu.title}»`;
+    for (const f of pu.funds || []) {
+      const line = budById(f.line);
+      const left = line ? budNums(line, ctx).unplanned : 0;
+      if (left > 0) nu.funds.push({ line: f.line, kop: left });
+    }
+    if (!nu.funds.length) { toast('Нерозпланованих коштів у рядках цієї закупівлі немає.', true); return; }
+    purList().push(nu);
+    logChange('закупівля з економії', `pur|${nu.id}`, `${title}: ${grnOf(nu.funds.reduce((s, f) => s + f.kop, 0))}`);
+    save();
+    go('purch', { purId: nu.id, purVer: nu.versions[0].id });
+  }
+  /** «Перероблено в нову закупівлю»: копія (гроші, відповідальний, позиції останньої версії) з новою темою й текою; ця стає
+   *  «скасовано» з приміткою, у новій — посилання на неї. */
+  function purRework(pu) {
+    const asked = prompt(`Тема нової закупівлі (назва нової теки). «${pu.title}» стане «скасовано».`, pu.title);
+    if (asked == null) return;
+    const title = String(asked).trim().replace(/\s+/g, ' ');
+    if (!title) return;
+    const why = purTwinWhy(pu.year, title);
+    if (why) { toast(why, true); return; }
+    const nu = purBlank(pu.year, title);
+    nu.source = pu.id;
+    nu.what = pu.what;
+    nu.person = pu.person;
+    nu.funds = JSON.parse(JSON.stringify(pu.funds || []));
+    nu.versions[0].positions = purCopyPositions(purVersion(pu));
+    pu.closed = 'скасовано';
+    pu.note = [pu.note, `перероблено в «${title}»`].filter(Boolean).join('; ');
+    purList().push(nu);
+    logChange('перероблено в нову закупівлю', `pur|${pu.id}`, `«${pu.title}» → «${title}»`);
+    save();
+    go('purch', { purId: nu.id, purVer: nu.versions[0].id });
+  }
+
+  // ---------------------------------------------------------------- пакет: папери, скани, подання й відповідь
+  /** Папери версії: ключ файла, підпис у картці, папір сервера (порожньо — лише підшити скан). */
+  const PUR_PAPERS = [['розрахунки', 'Розрахунки до рапорту', 'rozrakhunky'], ['рапорт', 'Рапорт з Додатком 1', 'raport'],
+    ['1фс', '1ФС', '1fs'], ['9фс', '9ФС', '9fs'], ['супровід', 'Супровід', 'suprovid'], ['кп', 'Комерційні пропозиції', '']];
+  /** Гроші для тексту паперу: «3 500,00» — звичайні пробіли між тисячами, кома, дві цифри копійок. Із `kopStr` (цілі числа), а не
+   *  з ділення на 100: у double сума з трильйонів копійок мала б хвіст, а папір повторює копійки сторінки до одної. */
+  const grnPlain = (kop) => {
+    const [whole, frac] = kopStr(kop).split('.');
+    return `${whole.replace(/\B(?=(\d{3})+$)/g, ' ')},${frac}`;
+  };
+  /** Підписант у папері — лише текст: `pid` людини з довідника й телефон виконавця в нього не йдуть. */
+  const sgPlain = (x) => ({ pos: (x || {}).pos || '', rank: (x || {}).rank || '', name: (x || {}).name || '' });
+  /** Дата паперу: підпис командира, а доки його нема, — сьогодні. За нею беруться місце складання й підписи з довідника. */
+  const purPaperDate = (v) => v.signedOn || today();
+  /** Рядок про комерційну пропозицію в Додатку 1: «Комерційна пропозиція ТОВ «Один» №7 від 02.02.2026» — з того, що вписано. */
+  const purQuoteText = (o) => ['Комерційна пропозиція', o.seller, o.no && `№${o.no}`, o.date && `від ${fmtDate(o.date)}`]
+    .filter(Boolean).join(' ');
+
+  /** Специфікація паперу для сервера: реквізити частини, рядки коштів, позиції версії, підписанти. Гроші в ній — цілі копійки
+   *  (сервер інших не приймає); місце складання — з дислокації на дату паперу, а не окреме поле реквізитів. */
+  function purPaperSpec(pu, v, paper) {
+    const u = unitInfo();
+    const lines = (pu.funds || []).map((f) => budById(f.line)).filter(Boolean);
+    const first = lines[0] || {};
+    const s = v.signers || {};
+    const positions = v.positions || [];
+    const subs = lines.filter((l) => l.fund === 'Субвенція').length;
+    const phrase = subs > 1 ? 'за рахунок субвенцій' : (PUR_PHRASE[first.fund] || '');
+    const groups = [];
+    for (const p of positions) {
+      let g = groups.find((x) => x.kekv === p.kekv);
+      if (!g) groups.push(g = { kekv: p.kekv, codes: [] });
+      let c = g.codes.find((x) => x.exp === p.exp);
+      if (!c) g.codes.push(c = { exp: p.exp, kop: 0 });
+      c.kop += posKop(p);
+    }
+    const pairs = groups.flatMap((g) => g.codes.map((c) => ({ kekv: g.kekv, exp: c.exp, kop: c.kop })));
+    const note = ['Просимо надати кошторисні призначення та асигнування по', first.kpkv || '', pairs.map((x) =>
+      `КЕКВ ${x.kekv} код видатків ${x.exp} в сумі ${grnPlain(x.kop)} грн`).join(', '), `на ${pu.what || 'придбання майна'}.`]
+      .filter(Boolean).join(' ');
+    const signers = [sgPlain(s.cmdr), sgPlain(s.fes), sgPlain(s.chief)];
+    const phone = (s.exec || {}).phone || u.phone || '';
+    const spec = { unit: { name: u.legalName || '', code: unitCode(), edrpou: u.edrpou || '', fundCode: u.fundCode || '',
+      service: u.serviceFull || '', place: locationAt(purPaperDate(v)), upperHq: u.upperHq || '', phone },
+    year: pu.year, kpkv: first.kpkv || '' };
+    if (paper === 'rozrakhunky') {
+      spec.positions = positions.map((p) => {
+        const offers = p.offers || [];
+        return { name: p.name, qty: p.qty, specs: p.specs, priceKop: p.priceKop, kop: posKop(p),
+          links: offers.filter((o) => o.kind === 'посилання' && o.url).map((o) => o.url)
+            .concat(offers.filter((o) => o.kind === 'КП').map(purQuoteText)),
+          offers: offers.map((o) => ({ kind: o.kind, seller: o.seller || '', url: o.url || '', priceKop: o.priceKop })) };      // робочий аркуш «Товари»
+      });
+      spec.chief = sgPlain(s.chief);
+    } else if (paper === 'raport') {
+      spec.chief = sgPlain(s.chief);
+    } else if (paper === '1fs') {
+      spec.rows = positions.map((p) => ({ kekv: p.kekv, exp: p.exp, name: p.name, uom: p.uom, qty: p.qty, priceKop: p.priceKop }));
+      spec.general = first.fund === 'Загальний фонд';
+      spec.signers = signers;
+    } else if (paper === '9fs') {
+      Object.assign(spec, { phrase, groups, note, signers, phone });
+    } else if (paper === 'suprovid') {
+      Object.assign(spec, { codes: pairs.map((x) => `КЕКВ ${x.kekv} код ${x.exp}`).join(', '), sumKop: verKop(v), phrase,
+        cmdr: sgPlain(s.cmdr), attachments: lines.filter((l) => l.fund === 'Субвенція')
+          .map((l) => `Рішення й угода ${l.community || l.label} – на ___ арк.`) });
+    }
+    return spec;
+  }
+
+  /** Слово, коли рядки коштів справи — з грошей закупівлі й з позицій версії (позиція може називати свій рядок) — різних КПКВ чи
+   *  фондів. Папери беруть КПКВ, фразу про фонд і форму 1ФС з ПЕРШОГО рядка грошей закупівлі (`purPaperSpec`), решти рядків у них
+   *  нема: людина має знати це до того, як віддасть папір на підпис. Порожньо — розбіжності нема (чи грошей закупівлі ще нема). */
+  function purMixedLines(pu, v) {
+    const first = (pu.funds || []).map((f) => budById(f.line)).filter(Boolean)[0];
+    if (!first) return '';
+    const ids = (pu.funds || []).map((f) => f.line).concat(((v && v.positions) || []).map((p) => p.line)).filter(Boolean);
+    const lines = [...new Set(ids)].map((id) => budById(id)).filter(Boolean);
+    const differs = (key) => lines.some((l) => (l[key] || '') !== (first[key] || ''));
+    const what = [differs('kpkv') ? 'КПКВ' : '', differs('fund') ? 'фондів' : ''].filter(Boolean);
+    return what.length ? `Рядки коштів різних ${what.join(' і ')}: папери складаються за першим із них («${first.label || 'без назви'}»).` : '';
+  }
+
+  /** Папери, які складаються зараз (ключі їхніх файлів): друге «Скласти», поки перше не повернулось, нічого не робить —
+   *  два запити про один файл бачили б один одного «зміненим руками». */
+  const purComposing = new Set();
+
+  /** Скласти папір версії в її теку. Файл, змінений руками, програма без згоди не перезаписує: сервер відповідає 409, сторінка
+   *  питає, і лише «так» шле запит ще раз із `force`. Теку справи без «теки» закріплює перший же папір. */
+  async function purPaper(pu, v, paper, key, force = false) {
+    if (!pu || !v || purVerSent(v) || !paper) return;
+    const fk = `purver|${v.id}|${key}`;
+    if (purComposing.has(fk)) return;
+    // Excel і Word запускаються секунди: кнопка каже, що йде складання. Блок «Пакет» малює її так само, коли екран перемальовано
+    // посеред складання (інший папір закінчився раніше), а після відмови вона вертається, бо екран тоді не перемальовується.
+    // Кнопка — саме цієї версії й цього паперу: людина могла перемкнути версію чи справу, і чужа кнопка не міняється.
+    const mark = () => {
+      const b = [...document.querySelectorAll('#scroll [data-act="pur-paper"]')].find((x) => x.dataset.ver === v.id && x.dataset.key === key);
+      if (b) purPaperButton(b, purComposing.has(fk));
+    };
+    try {
+      purComposing.add(fk);                                                       // усе, що може впасти, — у `try`: `finally` завжди знімає захист
+      mark();
+      let ask = await purPaperSend(pu, v, paper, fk, force);
+      if (ask && !force) {
+        if (!confirm(`${ask}\n\nЗміни, внесені у файл руками, буде втрачено.`)) return;
+        ask = await purPaperSend(pu, v, paper, fk, true);                         // «так»: той самий запит, але з «force»
+      }
+      if (ask) toast(ask, true);                                                  // «force» був, а сервер питає знову, — це відмова, а не коло питань
+    } catch (e) {
+      toast(`Не вдалося скласти: ${e.message || e}`, true);
+    } finally {
+      purComposing.delete(fk);
+      try { mark(); } catch (e) { /* екран змінився: кнопки вже нема */ }
+    }
+  }
+  /** «Скласти» чи «Складається…»: слово й позначка кнопки паперу. */
+  function purPaperButton(el, busy) {
+    el.textContent = busy ? 'Складається…' : 'Скласти';
+    el.classList.toggle('is-busy', busy);
+  }
+  /** Один запит `api/pur-paper`. Повертає питання сервера, коли файл змінено руками (409 `changed`); в усіх інших випадках — порожньо:
+   *  складено, або слово про відмову вже показано. */
+  async function purPaperSend(pu, v, paper, fk, force) {
+    purPinFolder(pu);                                          // теку справи без «теки» закріплює перший папір — до того, як з неї береться шлях
+    const where = purFolderFor(fk);
+    if (!where) { toast('Версії вже немає в справі: папір не складено.', true); return ''; }
+    const prev = (store.scans || []).find((f) => f.key === fk && f.made);
+    let r;
+    let j = {};
+    try {
+      const spec = Object.assign(purPaperSpec(pu, v, paper), { paper, dir: where.dir, prevSha: prev ? prev.sha || '' : '', force });
+      r = await fetch('api/pur-paper', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(spec) });
+      const text = await r.text();
+      try { j = JSON.parse(text); } catch (e) { j = { error: text }; }
+    } catch (e) {
+      toast(`Не вдалося скласти: ${e.message}`, true);
+      return '';
+    }
+    if (r.status === 409 && j.changed) return j.error || 'Файл змінено після програми — перезаписати?';
+    if (!r.ok || !j.ok) { toast(j.error || `помилка ${r.status}`, true); return ''; }       // 409 «відкрито в Excel чи Word» теж тут
+    store.scans = (store.scans || []).filter((f) => !(f.key === fk && f.made));
+    store.scans.push({ key: fk, date: today(), no: '', file: j.file, path: j.path, mime: '', size: j.size, added: today(),
+      folder: j.folder, sha: j.sha, made: true });
+    logChange('папір складено', `pur|${pu.id}`, `${v.label}: ${j.file}`);
+    save(true);
+    render();
+    if (j.download) {                                           // з іншого ПК файл віддається завантаженням
+      const a = document.createElement('a');
+      a.href = j.download;
+      a.download = j.file;
+      document.body.appendChild(a);                             // не всі браузери завантажують за кліком по елементу поза сторінкою
+      a.click();
+      a.remove();
+    }
+    // .xls робить Excel основного ПК: з іншого ПК слово про його відсутність — про основний, а не про цей
+    const noExcel = paper === '9fs' && !j.xls ? ` (.xlsx: на ${j.download ? 'основному' : 'цьому'} комп’ютері немає Excel для .xls)` : '';
+    toast(`${j.opened ? 'Відкрито' : 'Складено'}: ${j.file}${noExcel}`);
+    return '';
+  }
+
+  /** Стовпці таблиці підписантів: підпис у шапці, поле підписанта, ширина — ті самі в шапці й у рядках. Телефон — лише у виконавця
+   *  (його вносять у 9/фс); в інших рядках його місце порожнє, щоб стовпці стояли рівно. */
+  const PUR_SG_COLS = [['посада', 'pos', 'flex:2 1 220px'], ['звання', 'rank', 'flex:0 0 110px'],
+    ['Ім’я ПРІЗВИЩЕ', 'name', 'flex:1 1 150px'], ['телефон', 'phone', 'flex:0 0 120px']];
+  const purSgHead = () => `<div class="tbl__head"><div class="tbl__h" style="flex:0 0 130px">підписант</div>${PUR_SG_COLS.map(([ph, , style]) =>
+    `<div class="tbl__h" style="${style};min-width:0">${ph}</div>`).join('')}<div class="tbl__h c-acts" style="flex-basis:150px"></div></div>`;
+  /** Підписант версії: посада, звання й ім'я правляться (ТВО), людину можна взяти з довідника на дату паперу. */
+  function purSgRow(v, slot, label, ro) {
+    const s = (v.signers || {})[slot] || {};
+    const dis = ro ? ' disabled' : '';
+    const cell = ([ph, k, style]) => (k === 'phone' && slot !== 'exec' ? `<div class="c-txt" style="${style}"></div>`
+      : `<div class="c-txt" style="${style}"><input class="rc-in rc-in--wide" style="width:100%;text-align:left"
+        data-psg="${slot}" data-k="${k}" value="${esc(s[k] || '')}" placeholder="${ph}" aria-label="${esc(label)}: ${ph}" autocomplete="off"${dis}></div>`);
+    return `<div class="tbl__row tbl__row--plain" data-sg="${slot}"><div class="c-txt" style="flex:0 0 130px"><b>${esc(label)}</b></div>
+      ${PUR_SG_COLS.map(cell).join('')}
+      <div class="c-acts" style="flex-basis:150px">${ro ? '' : `<select data-psg-pick="${slot}" aria-label="${esc(label)}: людина з довідника" style="max-width:150px">
+        ${personOptions('', purPaperDate(v), 'з довідника…')}</select>`}</div></div>`;
+  }
+
+  /** Плитки файлів запису: складений програмою — «▤», підшитий скан — «▣»; плитка веде до свого файла. */
+  const purChips = (fk) => filesOf(fk).map((f, i) => `<span class="chip chip--btn" data-vw="${i}" data-vw-key="${esc(fk)}"
+    title="${esc(f.file)}">${f.made ? '▤' : '▣'} ${esc(f.file)}</span>`).join('');
+
+  /** Блок «Пакет»: папери версії — «Скласти» й «Підшити скан»; підписанти. Подана версія папери не складає й підписантів не править. */
+  PUR_BLOCKS.push((pu) => {
+    const v = purVerOf(pu);
+    if (!v) return '';
+    const ro = purVerSent(v);
+    const steps = PUR_PAPERS.map(([key, word, paper]) => {
+      const fk = `purver|${v.id}|${key}`;
+      return `<div class="pur-step" data-step="${esc(key)}"><div class="pur-step__k">${esc(word)}</div>
+        <div class="pur-files">${purChips(fk) || '<span class="c-num--dim">немає</span>'}</div>
+        <div class="pur-step__acts">${ro || !paper ? '' : `<button class="btn btn--sm${purComposing.has(fk) ? ' is-busy' : ''}" data-act="pur-paper"
+          data-paper="${paper}" data-key="${esc(key)}" data-ver="${esc(v.id)}" title="Скласти: ${esc(word)}">${purComposing.has(fk) ? 'Складається…' : 'Скласти'}</button>`}
+          ${native ? `<button class="btn btn--sm" data-act="file-add" data-key="${esc(fk)}" title="Підшити скан: ${esc(word)}">Підшити скан</button>
+          <button class="btn btn--sm" data-act="pur-folder-pick" data-key="${esc(fk)}" title="Підшити з теки: ${esc(word)}">Підшити з теки…</button>` : ''}</div></div>`;
+    }).join('');
+    const mixed = purMixedLines(pu, v);
+    return `<div class="card pur-block pur-pack"><div class="card__head"><div class="card__title">Пакет · версія ${esc(v.label)}</div>
+        <span class="panel__count">${esc((purFolderFor(`purver|${v.id}|рапорт`) || {}).dir || '')}</span></div>
+      ${mixed ? `<div class="pur-warn" data-pur-warn>${esc(mixed)}</div>` : ''}${steps}
+      <div class="tbl pur-sg-tbl">${purSgHead()}${purSgRow(v, 'cmdr', 'Командир', ro)}${purSgRow(v, 'fes', 'Начальник ФЕС', ro)}
+        ${purSgRow(v, 'chief', 'Начальник служби', ro)}${purSgRow(v, 'exec', 'Виконавець', ro)}</div></div>`;
+  });
+
+  /** Блок «Подано й відповідь»: підпис командира, супровід, відповідь штабу (з листом), вимоги, передача закупівельникам. */
+  PUR_BLOCKS.push((pu) => {
+    const v = purVerOf(pu);
+    if (!v) return '';
+    const fk = `purver|${v.id}|відповідь`;
+    const chips = purChips(fk);
+    const row = (name, k, val) => `<div class="pur-step" data-sent="${name}"><div class="pur-step__k">${esc(k)}</div>
+      <div class="pur-files">${val || '<span class="c-num--dim">—</span>'}</div><div></div></div>`;
+    // № і дата відповіді видно й без самої відповіді: внесене в форму не ховається
+    const words = [v.answerNo ? numNo(v.answerNo) : '', v.answerOn ? `від ${fmtDate(v.answerOn)}` : ''].filter(Boolean).join(' ');
+    const answer = (v.answer ? `<span class="tag ${PUR_TAG[v.answer] || ''}">${esc(v.answer)}</span>` : '') + (words ? `<span>${esc(words)}</span>` : '') + chips;
+    // Лист штабу називається за відповіддю («Погодження» чи «Не погоджено»): до відповіді його підшивати нема як
+    return `<div class="card pur-block pur-sent"><div class="card__head"><div class="card__title">Подано й відповідь</div>
+        <div class="panel__spacer"></div>
+        <button class="btn btn--sm" data-act="pur-sent" title="Підпис командира, супровід, відповідь штабу">Внести подання й відповідь…</button>
+        ${native && v.answer ? `<button class="btn btn--sm" data-act="file-add" data-key="${esc(fk)}" title="Лист штабу з відповіддю">Підшити відповідь</button>` : ''}</div>
+      ${row('signed', 'Підпис командира', v.signedOn ? fmtDate(v.signedOn) : '')}
+      ${row('sent', 'Супровід', v.sentNo ? `${esc(numNo(v.sentNo))}${v.sentOn ? ` від ${fmtDate(v.sentOn)}` : ''}` : '')}
+      ${row('answer', 'Відповідь штабу', answer)}
+      ${row('note', 'Вимоги', esc(v.answerNote))}
+      ${row('handed', 'Закупівельникам', v.handedOn ? fmtDate(v.handedOn) : '')}</div>`;
+  });
+
+  /** «Внести подання й відповідь…»: підпис, подання (супровід № і дата), відповідь штабу, передача закупівельникам — одна форма.
+   *  Версія з № супроводу чи відповіддю подана; прибрати їх — виправити помилково внесене (стерти й дату супроводу: вона без № не
+   *  приймається). Дати й поля, що суперечать одне одному, форма відмовляє словом у самому вікні: дата супроводу без №, відповідь
+   *  раніше за супровід, версія «не погоджено», яку «передано закупівельникам». */
+  function purSentDialog(pu, v) {
+    if (!pu || !v) return;
+    const el = modalOpen(`Версія ${v.label} · подання й відповідь`, `<form id="sent-form" class="pad"><div class="form__grid">
+        <div class="field"><label>Підпис командира</label><input name="signedOn" type="date" value="${esc(v.signedOn)}"></div>
+        <div class="field"><label>Супровід №</label><input name="sentNo" value="${esc(v.sentNo)}" placeholder="0000/…" autocomplete="off"></div>
+        <div class="field"><label>Супровід від</label><input name="sentOn" type="date" value="${esc(v.sentOn)}"></div>
+        <div class="field"><label>Відповідь</label><select name="answer">${['', 'погоджено', 'не погоджено'].map((a) =>
+    `<option value="${a}"${a === v.answer ? ' selected' : ''}>${a || '—'}</option>`).join('')}</select></div>
+        <div class="field"><label>Відповідь №</label><input name="answerNo" value="${esc(v.answerNo)}" placeholder="000/00/…" autocomplete="off"></div>
+        <div class="field"><label>Відповідь від</label><input name="answerOn" type="date" value="${esc(v.answerOn)}"></div>
+        <div class="field field--span"><label>Вимоги штабу</label><input name="answerNote" value="${esc(v.answerNote)}" autocomplete="off"></div>
+        <div class="field"><label>Передано закупівельникам</label><input name="handedOn" type="date" value="${esc(v.handedOn)}"></div></div>
+      <div class="pad" data-pur-msg hidden style="color:var(--bad)"></div>
+      <div style="padding-top:12px"><button class="btn btn--primary" type="submit">Зберегти</button>
+        <button class="btn" type="button" data-md="close">Скасувати</button></div></form>`, 'modal__box--form');
+    const form = el.querySelector('form');
+    const msg = el.querySelector('[data-pur-msg]');
+    const fail = (name, text) => {                               // слово — у самому вікні, поле, з якого воно, — червоне й у фокусі
+      form.elements[name].classList.add('is-bad');
+      msg.hidden = false;
+      msg.textContent = text;
+      form.elements[name].focus();
+    };
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      msg.hidden = true;
+      for (const x of form.querySelectorAll('.is-bad')) x.classList.remove('is-bad');
+      const f = new FormData(form);
+      const g = (k) => String(f.get(k) || '').trim();
+      if (g('sentOn') && !g('sentNo')) { fail('sentNo', 'Дату супроводу вказано без №.'); return; }
+      if (g('sentOn') && g('answerOn') && g('answerOn') < g('sentOn')) { fail('answerOn', 'Дата відповіді раніша за дату супроводу.'); return; }
+      if (g('handedOn') && g('answer') === 'не погоджено') { fail('handedOn', 'Не погоджену версію закупівельникам не передають.'); return; }
+      const was = v.sentNo;
+      for (const k of ['signedOn', 'sentNo', 'sentOn', 'answer', 'answerNo', 'answerOn', 'answerNote', 'handedOn']) v[k] = g(k);
+      logChange(v.sentNo && !was ? 'версію подано' : 'подання й відповідь', `pur|${pu.id}`,
+        [v.label, v.sentNo && `супровід ${numNo(v.sentNo)}`, v.answer].filter(Boolean).join(' · '));
+      modalClose();
+      saveThen(v.sentNo && !was ? 'Версію подано: позиції більше не правляться.' : 'Збережено.');
+      render();
+    });
+  }
+
+  PUR_BINDS.push((sc, pu) => {
+    const v = pu && purVerOf(pu);
+    if (!v || purVerSent(v)) return;
+    sc.querySelectorAll('[data-psg]').forEach((el) => el.addEventListener('change', () => {
+      v.signers = v.signers || {};
+      v.signers[el.dataset.psg] = Object.assign({}, v.signers[el.dataset.psg], { [el.dataset.k]: el.value.trim() });
+      save();
+    }));
+    sc.querySelectorAll('[data-psg-pick]').forEach((el) => el.addEventListener('change', () => {
+      const person = personBy(el.value);
+      if (!person) return;
+      const slot = el.dataset.psgPick;
+      v.signers = v.signers || {};
+      const phone = slot === 'exec' ? { phone: (v.signers.exec || {}).phone || '' } : {};
+      v.signers[slot] = Object.assign(sgOf(person, purPaperDate(v)), phone);
+      save();
+      render();
+    }));
+  });
+
+  // ---------------------------------------------------------------- документи закупівель: договори, ВН, рахунки, довіреності, оплати; чого бракує
+  /** Як документ закупівлі зветься в написах і в журналі змін. */
+  const PD_WORD = { 'договір': 'Договір', 'ВН': 'ВН', 'рахунок': 'Рахунок', 'довіреність': 'Довіреність', 'оплата': 'Оплата',
+    'акт введення': 'Акт введення', 'інше': 'Документ' };
+  /** Над чим стоїть документ: ВН — над договором, рахунок — над договором чи ВН, оплата — над ВН чи рахунком,
+   *  довіреність — над ВН чи договором. */
+  const PD_PARENT = { 'ВН': ['договір'], 'рахунок': ['договір', 'ВН'], 'оплата': ['ВН', 'рахунок'], 'довіреність': ['ВН', 'договір'] };
+  /** Чипи реєстру: папери пакета, відповіді штабу й підстави громад — групами, документи — своїм видом. */
+  const PD_GROUPS = { 'супровід': 'пакет', 'Розрахунки до рапорту': 'пакет', 'Рапорт з Додатком 1': 'пакет', '1ФС': 'пакет',
+    '9ФС': 'пакет', 'Комерційні пропозиції': 'пакет', 'погодження': 'штаб', 'відмова': 'штаб', 'угода': 'громада',
+    'рішення': 'громада', 'реєстр на ФЕС': 'реєстр' };
+  const PD_SEG = ['пакет', 'штаб', 'договір', 'ВН', 'рахунок', 'довіреність', 'оплата', 'акт введення', 'громада', 'реєстр', 'інше'];
+  const pdLabel = (d) => `${PD_WORD[d.kind] || 'Документ'} ${d.no ? numNo(d.no) : 'б/н'}${d.date ? ` від ${fmtDate(d.date)}` : ''}`;
+  /** «Кому» довіреності — ПІБ людини зі «Люди й МВО»; людини вже нема — порожньо (а не «кому » без імені). */
+  const pdWho = (d) => (d.kind === 'довіреність' ? pSign(personBy(d.person)) : '');
+  const pdWhoNote = (d) => (pdWho(d) ? `кому ${pdWho(d)}` : '');                                // у дереві: «кому Марко ЛЕВЧЕНКО»
+  /** Плитки файлів запису: складений програмою — «▤», підшитий скан — «▣»; плитка веде до свого файла. */
+  const pdChips = (key) => filesOf(key).map((f, i) => `<span class="chip chip--btn" data-vw="${i}" data-vw-key="${esc(key)}"
+    title="${esc(f.file)}">${f.made ? '▤' : '▣'} ${esc(f.file)}</span>`).join(' ');
+
+  /** Документ у назві списку: «ВН №0000», «оплата №б/н» (вид малими літерами, як у «Чого бракує»). */
+  const pdShort = (d) => `${d.kind === 'інше' ? 'документ' : d.kind} ${d.no ? numNo(d.no) : 'б/н'}`;
+  /** «Під договором є: …» — вид документа в орудному відмінку. */
+  const PD_UNDER = { 'договір': 'договором', 'ВН': 'ВН', 'рахунок': 'рахунком', 'довіреність': 'довіреністю', 'оплата': 'оплатою',
+    'акт введення': 'актом введення', 'інше': 'документом' };
+  /** Слова для підрахунку документів за видом: 1 договір, 2 договори, 5 договорів. */
+  const PD_PLURAL = { 'договір': ['договір', 'договори', 'договорів'], 'ВН': ['ВН', 'ВН', 'ВН'], 'рахунок': ['рахунок', 'рахунки', 'рахунків'],
+    'довіреність': ['довіреність', 'довіреності', 'довіреностей'], 'оплата': ['оплата', 'оплати', 'оплат'],
+    'акт введення': ['акт введення', 'акти введення', 'актів введення'], 'інше': ['інший документ', 'інші документи', 'інших документів'] };
+  /** Підзаголовок вкладки «Документи»: скільки документів кожного виду; доки їх нема — про що ця вкладка. */
+  function pdSubtitle() {
+    const list = purDocsList();
+    const parts = Object.keys(PD_PLURAL).map((k) => [k, list.filter((d) => d.kind === k).length]).filter(([, n]) => n)
+      .map(([k, n]) => cnt(n, ...PD_PLURAL[k]));
+    return parts.length ? parts.join(' · ') : 'Договори, ВН, рахунки, довіреності й оплати закупівель';
+  }
+
+  /** Реєстр паперів закупівель: документи, папери версій, підстави рядків коштів, реєстри на ФЕС. */
+  function pdRows() {
+    const up = unitInfo().upperHq || 'штаб';
+    const rows = purDocsList().map((d) => ({ d, kind: d.kind, no: d.no, sub: '', date: d.date, party: d.party || '',
+      who: pdWho(d),                                                                          // кому видано довіреність
+      kop: +d.kop || 0, pu: purById(d.purchase), fes: (d.fes || {}).status || '', files: filesOf(`purdoc|${d.id}`).length,
+      open: { act: 'pd-open', id: d.id } }));
+    for (const pu of purList()) {
+      for (const v of pu.versions || []) {
+        const open = { act: 'pur-open', id: pu.id };
+        const sub = `версія ${v.label}`;
+        if (v.sentNo) rows.push({ kind: 'супровід', no: v.sentNo, sub, date: v.sentOn, party: up, kop: verKop(v), pu, fes: '',
+          files: filesOf(`purver|${v.id}|супровід`).length, open });
+        if (v.answer) rows.push({ kind: v.answer === 'погоджено' ? 'погодження' : 'відмова', no: v.answerNo, sub, date: v.answerOn,
+          party: up, kop: 0, pu, fes: '', files: filesOf(`purver|${v.id}|відповідь`).length, open });
+        for (const [key, word] of PUR_PAPERS) {
+          const fs = filesOf(`purver|${v.id}|${key}`);
+          if (key !== 'супровід' && fs.length) rows.push({ kind: word, no: '', sub, date: fs[0].added || '', party: '',
+            kop: key === 'розрахунки' ? verKop(v) : 0, pu, fes: '', files: fs.length, open });
+        }
+      }
+    }
+    for (const l of purBudget()) {
+      const open = { act: 'bud-open', id: l.id };
+      if (l.agreeNo) rows.push({ kind: 'угода', no: l.agreeNo, sub: l.label, date: l.agreeDate, party: l.community, kop: 0, pu: null,
+        fes: '', files: filesOf(`bud|${l.id}|угода`).length, open });
+      if (l.decisionNo) rows.push({ kind: 'рішення', no: l.decisionNo, sub: l.label, date: l.decisionDate, party: l.community, kop: 0,
+        pu: null, fes: '', files: filesOf(`bud|${l.id}|рішення`).length, open });
+    }
+    for (const key of [...new Set((store.scans || []).filter((f) => f.key.startsWith('fesreg|')).map((f) => f.key))]) {
+      rows.push({ kind: 'реєстр на ФЕС', no: '', sub: key.slice(7), date: (store.scans.find((f) => f.key === key) || {}).date || '',
+        party: 'ФЕС', kop: 0, pu: null, fes: '', files: filesOf(key).length, open: { act: 'pd-reg', key } });
+    }
+    return rows;
+  }
+  function pdSpec() {
+    const rows = pdRows();
+    const grp = (x) => PD_GROUPS[x.kind] || x.kind;
+    const have = new Set(rows.map(grp));
+    const uniq = (f) => [...new Set(rows.map(f).filter(Boolean))].sort((a, b) => String(a).localeCompare(String(b), 'uk'));
+    const pus = [...new Map(rows.filter((x) => x.pu).map((x) => [x.pu.id, x.pu])).values()];
+    return {
+      id: 'pd', rows, minWidth: '1000px', limit: REG_LIMIT,
+      placeholder: 'Пошук: номер, постачальник, закупівля',
+      search: (x) => [x.kind, x.no, x.sub, x.party, x.who, x.pu ? x.pu.title : ''],
+      filters: [
+        { type: 'seg', key: 'kind', options: [['', 'усі']].concat(PD_SEG.filter((g) => have.has(g)).map((g) => [g, g])),
+          test: (x, v) => grp(x) === v },
+        { type: 'select', key: 'year', label: 'рік', all: 'усі', options: uniq((x) => String(x.date || '').slice(0, 4)).map((v) => [v, v]),
+          test: (x, v) => String(x.date || '').slice(0, 4) === v },
+        { type: 'select', key: 'pu', label: 'закупівля', all: 'усі', options: pus.map((p) => [p.id, `${p.year} · ${p.title}`]),
+          test: (x, v) => !!x.pu && x.pu.id === v },
+        { type: 'select', key: 'party', label: 'постачальник', all: 'усі', options: uniq((x) => x.party).map((v) => [v, v]),
+          test: (x, v) => x.party === v },
+        { type: 'select', key: 'fes', label: 'ФЕС', all: 'усі', options: FES_STATUSES.map((s) => [s, s]).concat([['-', 'без статусу']]),
+          test: (x, v) => (v === '-' ? !x.fes : x.fes === v) },
+        { type: 'toggle', key: 'noscan', label: 'без скану', title: 'Документи без жодного файла', test: (x) => !x.files },
+        { type: 'toggle', key: 'nopu', label: 'без закупівлі', title: 'Документи, не віднесені до жодної закупівлі: «Кошти» їх не бачать',
+          test: (x) => !!x.d && !x.pu },
+        { type: 'toggle', key: 'valid', label: 'довіреність діє', title: 'Довіреності, строк яких не минув і які не повернуто',
+          test: (x) => x.kind === 'довіреність' && !!x.d && !x.d.returnedOn && (!x.d.validTo || x.d.validTo >= today()) },
+      ],
+      columns: [
+        { key: 'kind', label: 'вид', cls: 'c-txt', style: 'width:130px', first: 1, sort: (x) => x.kind, cell: (x) => esc(x.kind) },
+        { key: 'no', label: '№ / дата', cls: 'c-name c-name--stack', style: 'flex:0 1 170px', sort: (x) => `${x.date}|${x.no}`,
+          cell: (x) => `<b>${esc(x.no ? numNo(x.no) : '—')}</b><small>${esc([fmtDate(x.date), x.sub].filter(Boolean).join(' · '))}</small>` },
+        { key: 'party', label: 'постачальник / кому', cls: 'c-name c-name--stack', style: 'flex:1 1 170px', first: 1, sort: (x) => x.who || x.party,
+          cell: (x) => `<b>${esc(x.who || x.party || '—')}</b>${x.who && x.party ? `<small>${esc(x.party)}</small>` : ''}` },
+        { key: 'kop', label: 'сума, грн', cls: 'c-num', style: 'width:110px', sort: (x) => x.kop, cell: (x) => (x.kop ? grnOf(x.kop) : '—') },
+        { key: 'pu', label: 'закупівля', cls: 'c-name', style: 'flex:1 1 160px', first: 1, sort: (x) => (x.pu ? x.pu.title : '~'),
+          cell: (x) => `<b>${esc(x.pu ? x.pu.title : '—')}</b>` },
+        { key: 'fes', label: 'ФЕС', cls: 'c-txt', style: 'width:100px', sort: (x) => x.fes, cell: (x) => esc(x.fes || '—') },
+        { key: 'files', label: 'файл', cls: 'c-num', style: 'width:50px', sort: (x) => x.files, cell: (x) => (x.files ? '▣' : '—') },
+      ],
+      row: (x) => ({ attrs: `data-act="${x.open.act}"${x.open.id ? ` data-id="${esc(x.open.id)}"` : ''}${x.open.key ? ` data-key="${esc(x.open.key)}"` : ''}` }),
+      count: (shown, all) => (shown.length === all.length ? String(all.length) : `${shown.length} із ${all.length}`),
+      empty: 'Документів закупівель ще немає.', emptyFiltered: 'За цими фільтрами документів немає.',
+    };
+  }
+  function renderPurDocs() {
+    const av = state.purDocId ? pdById(state.purDocId) : null;
+    if (av && av.kind === 'акт введення') return renderAvCard(av);
+    const reg = registry(pdSpec());
+    return {
+      fill: true,
+      head: head('закупівлі / документи', 'Документи закупівель', `${purSeg('purdocs')}
+        <button class="btn" data-act="pd-fes-register">Реєстр на ФЕС…</button>
+        <button class="btn" data-act="pd-xls">В Excel</button>
+        <button class="btn btn--primary" data-act="pd-new">+ Документ</button>`),
+      body: `${flashBlock()}${reg.panel}<div class="card card--scroll card--fill">${reg.table}</div>`,
+    };
+  }
+  function pdXls() {
+    const shown = regRows(pdSpec());
+    return toExcel({ file: 'Документи закупівель', sheets: [{ name: 'Документи', orientation: 'landscape', top: [unitTop()],
+      title: 'Документи закупівель', head: [['Вид', '№', 'Дата', 'Що', 'Постачальник / кому', 'Сума, грн', 'Закупівля', 'ФЕС', 'Файлів']],
+      widths: [22, 16, 11, 22, 30, 14, 30, 14, 8], rows: shown.map((x) => [x.kind, x.no || '', x.date ? fmtDate(x.date) : '', x.sub,
+        [x.who, x.party].filter(Boolean).join(' · '), x.kop / 100, x.pu ? x.pu.title : '', x.fes, x.files]), money: [5], num: [8] }] });
+  }
+
+  function pdKindDialog(purchase) {
+    const el = modalOpen('Новий документ закупівлі', `<div class="pad"><div class="seg">${PUR_DOC_KINDS.filter((k) => k !== 'акт введення').map((k) =>
+      `<button type="button" data-pd-kind="${esc(k)}">${esc(PD_WORD[k])}</button>`).join('')}</div>
+      <p class="set-note" style="margin-top:10px">Акт введення складається з акта приймання.</p></div>`, 'modal__box--form');
+    el.querySelectorAll('[data-pd-kind]').forEach((b) => b.addEventListener('click', () => {
+      modalClose();
+      pdDialog(pdNew(b.dataset.pdKind, purchase || '', ''), true);
+    }));
+  }
+  /** Новий документ закупівлі з тим, що відомо з документа, над яким він стоїть. */
+  function pdNew(kind, purchase, parent) {
+    const doc = docBlank(kind, purchase);
+    const up = parent ? pdById(parent) : null;
+    if (up) {
+      Object.assign(doc, { parent: up.id, purchase: up.purchase || purchase, party: up.party || '' });
+      if (kind === 'оплата') doc.kop = Math.max(0, (+up.kop || 0) - purDocsList().filter((x) => x.kind === 'оплата' && x.parent === up.id)
+        .reduce((s, x) => s + (+x.kop || 0), 0));
+    }
+    return doc;
+  }
+
+  /** «+ …» біля документа чи в шапці блока: вікно нового документа з основою. Вид, якого нема, акт введення (його складають з акта
+   *  приймання) і основа, під якою такий вид не стоїть (`PD_PARENT`), вікна не відкривають; основа, якої вже нема (її видалили в
+   *  іншому вікні), — слово. */
+  function pdAdd(kind, purchase, parent) {
+    if (!PUR_DOC_KINDS.includes(kind) || kind === 'акт введення') return null;
+    const up = parent ? pdById(parent) : null;
+    if (parent && !up) { toast('Документа, під який це додають, уже немає.', true); return null; }
+    if (up && !(PD_PARENT[kind] || []).includes(up.kind)) return null;
+    return pdDialog(pdNew(kind, purchase, parent), true);
+  }
+
+  /** Документи, що стоять під документом на будь-якій глибині (за основою), у порядку переліку; кільце в даних не зациклює. */
+  function pdDescendants(id) {
+    const out = [];
+    const seen = new Set([id]);
+    const walk = (up) => {
+      for (const d of purDocsList()) {
+        if (d.parent !== up || seen.has(d.id)) continue;
+        seen.add(d.id);
+        out.push(d);
+        walk(d.id);
+      }
+    };
+    walk(id);
+    return out;
+  }
+
+  /** Документ закупівлі: поля за видом, частки між рядками коштів, статус ФЕС, рядки ВН чи договору. Суми, частки, ціни й
+   *  кількості читаються через `moneyIn` і `qtyIn`: текст, що не число, червонить поле, слово лежить унизу вікна, і нічого не
+   *  пишеться. Що вікно для цього виду не показує (ПДВ оплати, «до сплати» рахунка, контрагент оплати без основи, основа з іншої
+   *  закупівлі…), лишається в записі як було. */
+  function pdDialog(doc, fresh = false) {
+    const rec = JSON.parse(JSON.stringify(doc));
+    const kind = rec.kind;
+    rec.fes = Object.assign({ status: '', date: '', register: '', ref: '' }, rec.fes);
+    rec.lines = rec.lines || [];
+    rec.parts = rec.parts || [];
+    const parties = [...new Set(purDocsList().map((x) => x.party).concat((D.parties || []).map((p) => p[0])).filter(Boolean))];
+    const money = (kop) => (kop ? kopStr(kop) : '');
+    const f = (name, label, val, type = '') => `<div class="field${type === 'wide' ? ' field--span' : ''}"><label>${label}</label>
+      <input name="${name}"${type === 'date' ? ' type="date"' : type === 'money' ? ' inputmode="decimal"' : ''} value="${esc(val || '')}" autocomplete="off"></div>`;
+    const el = modalOpen(fresh ? `Новий документ: ${PD_WORD[kind]}` : pdLabel(rec), `<form id="pd-form" class="pad"><div class="form__grid">
+        ${f('no', '№', rec.no)}${f('date', 'Дата', rec.date, 'date')}
+        <div class="field"><label>Закупівля</label><select name="purchase"><option value="">—</option>${purList().map((p) =>
+    `<option value="${esc(p.id)}"${p.id === rec.purchase ? ' selected' : ''}>${esc(`${p.year} · ${p.title}`)}</option>`).join('')}</select></div>
+        ${PD_PARENT[kind] ? '<div class="field"><label>До документа</label><select name="parent"></select></div>' : ''}
+        ${kind === 'оплата' ? '' : `<div class="field field--span"><label>Контрагент</label><input name="party" list="pd-parties" value="${esc(rec.party)}" autocomplete="off"></div>`}
+        ${f('sum', 'Сума, грн', money(rec.kop), 'money')}${['договір', 'ВН', 'рахунок'].includes(kind) ? f('vat', 'у т.ч. ПДВ, грн', money(rec.vatKop), 'money') : ''}
+        ${kind === 'договір' ? f('deliverBy', 'Строк поставки', rec.deliverBy, 'date') + f('procedure', 'Процедура (№ UA-…)', rec.procedure) : ''}
+        ${kind === 'ВН' ? f('payOn', '«До сплати»: дата', rec.payOn, 'date') : ''}
+        ${kind === 'довіреність' ? `<div class="field"><label>Кому</label><select name="person">${personOptions(rec.person, rec.date || today(), '—')}</select></div>
+          ${f('validTo', 'Дійсна до', rec.validTo, 'date')}${f('usedOn', 'Використана', rec.usedOn, 'date')}${f('returnedOn', 'Повернута', rec.returnedOn, 'date')}` : ''}
+        ${['ВН', 'рахунок'].includes(kind) ? `<div class="field"><label>Статус ФЕС</label><select name="fes"><option value="">—</option>${FES_STATUSES.map((st) =>
+    `<option${st === rec.fes.status ? ' selected' : ''}>${st}</option>`).join('')}</select></div>
+          ${f('register', 'Реєстр', rec.fes.register)}${f('ref', '№ проводки ФЕС', rec.fes.ref)}` : ''}
+        ${f('missing', 'Скану немає: причина', rec.missing, 'wide')}${f('note', 'Примітка', rec.note, 'wide')}</div>
+      <div data-pd-parts></div>
+      ${['ВН', 'договір'].includes(kind) ? `<div class="pd-sect"><div class="pd-sect__h"><b>Рядки</b>
+        <button class="btn btn--sm" type="button" data-pd-line>+ Рядок</button>
+        ${kind === 'ВН' ? '<button class="btn btn--sm" type="button" data-pd-copy>Рядки з договору</button>' : ''}</div><div data-pd-lines></div>
+        <p class="set-note" data-pd-total hidden></p></div>` : ''}
+      <datalist id="pd-parties">${parties.map((p) => `<option value="${esc(p)}">`).join('')}</datalist>
+      <div class="pos-foot"><div class="pad" data-pd-msg hidden style="color:var(--bad)"></div>
+        <div><button class="btn btn--primary" type="submit">Зберегти</button>
+          <button class="btn" type="button" data-md="close">Скасувати</button>
+          ${fresh ? '' : '<button class="btn btn--danger" type="button" data-pd-del>Видалити</button>'}</div></div></form>`);
+    const form = el.querySelector('form');
+    const msg = el.querySelector('[data-pd-msg]');
+    const say = (text) => { msg.hidden = false; msg.textContent = text; };
+    const fail = (field, text) => {                                // слово — у липкому низі вікна; поле, з якого воно, — у фокусі й червоне
+      field.classList.add('is-bad');
+      say(text);
+      field.focus();
+    };
+    const has = (name) => !!form.elements[name];                     // поле є у вікні цього виду
+
+    // Основа: документи того виду, що може стояти над цим; поточна основа лишається в переліку, навіть коли вона з іншої закупівлі.
+    const drawParents = (selected) => {
+      const select = form.elements.parent;
+      if (!select) return;
+      const purchase = form.elements.purchase.value;
+      const kinds = PD_PARENT[kind] || [];
+      const list = purDocsList().filter((x) => x.id !== rec.id && kinds.includes(x.kind) && (!purchase || x.purchase === purchase));
+      const cur = pdById(selected);
+      if (cur && cur.id !== rec.id && !list.includes(cur)) list.push(cur);
+      select.innerHTML = `<option value="">—</option>${list.map((x) =>
+        `<option value="${esc(x.id)}"${x.id === selected ? ' selected' : ''}>${esc(pdLabel(x))}</option>`).join('')}`;
+    };
+
+    // Частки між рядками коштів: рядки закупівлі, а ще ті, на які документ уже розділено (вони першими, у тому ж порядку).
+    const typed = new Map(rec.parts.map((p) => [p.line, money(p.kop)]));
+    const drawParts = () => {
+      const pu = purById(form.elements.purchase.value);
+      const lines = [...new Set(rec.parts.map((p) => p.line).concat(pu ? (pu.funds || []).map((x) => x.line) : []))]
+        .map((id) => budById(id)).filter(Boolean);
+      const show = rec.parts.length > 0 || (kind !== 'довіреність' && lines.length > 1);
+      el.querySelector('[data-pd-parts]').innerHTML = !show ? '' : `<div class="pd-sect"><div class="pd-sect__h"><b>Частки між рядками коштів</b></div>
+        <div class="form__grid">${lines.map((l) => `<div class="field"><label>${esc(l.label)}, грн</label>
+          <input data-part="${esc(l.id)}" inputmode="decimal" autocomplete="off" value="${esc(typed.get(l.id) ?? '')}"></div>`).join('')}</div>
+        <p class="set-note">Без часток діють частки документа, до якого цей належить; без нього документ не віднесено до жодного рядка.</p></div>`;
+    };
+    form.addEventListener('input', (e) => { if (e.target.dataset && e.target.dataset.part) typed.set(e.target.dataset.part, e.target.value); });
+
+    // Рядки ВН чи договору: набраний текст лежить у `draft` як є (перемальовування його не губить), читається лише при «Зберегти».
+    const box = el.querySelector('[data-pd-lines]');
+    const blankLine = () => ({ id: uid(), name: '', code: '', uom: 'шт', qty: 1, priceKop: 0, fesNo: '', year: '', passport: '', life: '' });
+    const asRow = (ln) => ({ ln, name: ln.name || '', code: ln.code || '', uom: ln.uom || '', qty: String(ln.qty ?? ''), price: money(ln.priceKop) });
+    let draft = rec.lines.map(asRow);
+    const untouched = (d) => !d.name.trim() && !d.code.trim() && !d.price.trim() && ['', '1'].includes(d.qty.trim()) && ['', 'шт'].includes(d.uom.trim());
+    const syncLines = () => {
+      if (!box) return;
+      box.querySelectorAll('[data-li]').forEach((row) => {
+        const d = draft[+row.dataset.li];
+        if (d) for (const k of ['name', 'code', 'uom', 'qty', 'price']) d[k] = row.querySelector(`[data-lk="${k}"]`).value;
+      });
+    };
+    // «Рядки разом»: рядки можуть бути неповні, тож розбіжність із сумою документа — лише слово, не відмова. Рядок, у якому
+    // кількість чи ціна не число, не рахується (слова про нього скаже «Зберегти»); читає ті самі `qtyIn` і `moneyIn`, але мовчки.
+    const total = el.querySelector('[data-pd-total]');
+    const quiet = (value) => ({ value, classList: { toggle() {} } });
+    const lineTotal = () => {
+      if (!total) return;
+      let counted = 0;
+      let sum = 0;
+      for (const d of draft) {
+        if (untouched(d)) continue;
+        const qty = qtyIn(quiet(d.qty), () => {});
+        const price = moneyIn(quiet(d.price), () => {});
+        if (qty == null || price == null) continue;
+        counted++;
+        sum += lineKop(qty, price);
+      }
+      const own = moneyIn(quiet(form.elements.sum.value), () => {});
+      total.hidden = !counted || own == null || !Number.isSafeInteger(sum) || sum === own;
+      total.textContent = total.hidden ? '' : `Рядки разом: ${grnOf(sum)}`;
+    };
+    const drawLines = () => {
+      if (!box) return;
+      const cell = (k, i, val, label, extra = '') => `<div class="field"><input data-lk="${k}"${extra} value="${esc(val)}" autocomplete="off" aria-label="Рядок ${i + 1}: ${label}"></div>`;
+      box.innerHTML = !draft.length ? '<p class="set-note">Рядків ще немає.</p>' : `<div class="pd-line pd-line--head">${['Найменування', 'Код', 'Од.', 'К-сть', 'Ціна, грн']
+        .map((t) => `<div class="pur-links__h">${t}</div>`).join('')}<div></div></div>${draft.map((d, i) => `<div class="pd-line" data-li="${i}">
+        ${cell('name', i, d.name, 'найменування')}${cell('code', i, d.code, 'код')}${cell('uom', i, d.uom, 'одиниця')}
+        ${cell('qty', i, d.qty, 'кількість', ' inputmode="decimal"')}${cell('price', i, d.price, 'ціна, грн', ' inputmode="decimal"')}
+        <div><button type="button" class="ico-btn ico-btn--bad" data-pd-line-del="${i}" title="Прибрати рядок">✕ Прибрати</button></div></div>`).join('')}`;
+      lineTotal();
+    };
+    form.addEventListener('input', (e) => {
+      if (e.target.name === 'sum' || (box && box.contains(e.target))) { syncLines(); lineTotal(); }
+    });
+
+    drawParents(rec.parent);
+    drawParts();
+    drawLines();
+    form.elements.purchase.addEventListener('change', () => {
+      const cur = form.elements.parent ? pdById(form.elements.parent.value) : null;
+      const purchase = form.elements.purchase.value;
+      drawParents(cur && (!purchase || cur.purchase === purchase) ? cur.id : '');
+      drawParts();
+    });
+    form.elements.parent?.addEventListener('change', () => {       // основа ставить свою закупівлю й, поки порожньо, свого контрагента
+      const up = pdById(form.elements.parent.value);
+      if (!up) return;
+      if (up.purchase && up.purchase !== form.elements.purchase.value) { form.elements.purchase.value = up.purchase; drawParts(); }
+      if (form.elements.party && !form.elements.party.value.trim() && up.party) form.elements.party.value = up.party;
+    });
+    el.querySelector('[data-pd-line]')?.addEventListener('click', () => {
+      syncLines();
+      draft.push(asRow(blankLine()));
+      drawLines();
+    });
+    el.querySelector('[data-pd-copy]')?.addEventListener('click', () => {
+      const up = pdById(form.elements.parent.value);
+      if (!up || !(up.lines || []).length) { say(up ? 'У договорі рядків немає.' : 'Спершу оберіть договір.'); return; }
+      syncLines();
+      if (draft.some((d) => !untouched(d)) && !confirm('Рядки ВН буде замінено рядками договору.')) return;
+      draft = up.lines.map((x) => asRow(Object.assign({}, x, { id: uid() })));
+      drawLines();
+    });
+    box?.addEventListener('click', (e) => {
+      const b = e.target.closest('[data-pd-line-del]');
+      if (!b) return;
+      syncLines();
+      draft.splice(+b.dataset.pdLineDel, 1);
+      drawLines();
+    });
+
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      msg.hidden = true;
+      syncLines();
+      form.querySelectorAll('.is-bad').forEach((x) => x.classList.remove('is-bad'));
+      const fd = new FormData(form);
+      const g = (k) => String(fd.get(k) || '').trim();
+      const bad = [];                                                // поля, що не пройшли: червоніють усі, слово — про перше з них
+      const miss = (field) => (text) => bad.push([field, text]);
+      const kop = moneyIn(form.elements.sum, miss(form.elements.sum));
+      const vat = has('vat') ? moneyIn(form.elements.vat, miss(form.elements.vat)) : rec.vatKop;
+      if (has('vat') && vat != null && kop != null && vat > kop) {   // ПДВ — частина суми: більший за неї не буває (поле червонить `fail`)
+        bad.push([form.elements.vat, 'ПДВ не може бути більшим за суму документа.']);
+      }
+      const partEls = [...form.querySelectorAll('[data-part]')];
+      const parts = partEls.map((x) => ({ line: x.dataset.part, kop: moneyIn(x, miss(x)) }));
+      const made = [];
+      if (box) {
+        draft.forEach((d, i) => {
+          if (untouched(d)) return;                                  // порожній рядок не пишеться
+          const row = box.querySelector(`[data-li="${i}"]`);
+          const field = (k) => row.querySelector(`[data-lk="${k}"]`);
+          const name = d.name.trim().replace(/\s+/g, ' ');
+          if (!name) { field('name').classList.add('is-bad'); bad.push([field('name'), `Рядок ${i + 1}: найменування не вказано.`]); }
+          const qty = qtyIn(field('qty'), miss(field('qty')));
+          const priceKop = moneyIn(field('price'), miss(field('price')));
+          made.push({ ln: d.ln, name, code: d.code.trim(), uom: d.uom.trim(), qty, priceKop });
+        });
+      }
+      if (bad.length) { fail(bad[0][0], bad[0][1]); return; }
+      const used = parts.filter((p) => p.kop);                       // частка 0 — рядок без частки
+      if (used.length) {
+        const total = used.reduce((s, p) => s + BigInt(p.kop), 0n);
+        if (total !== BigInt(kop)) {
+          for (const x of partEls) if (x.value.trim()) x.classList.add('is-bad');
+          form.elements.sum.classList.add('is-bad');
+          fail(partEls.find((x) => x.value.trim()), `Частки дають ${grnOf(Number(total))} грн, а сума документа — ${grnOf(kop)} грн.`);
+          return;
+        }
+      }
+      const parent = PD_PARENT[kind] ? g('parent') : rec.parent;
+      const up = pdById(parent);
+      const purchase = g('purchase') || (up && up.purchase) || '';
+      if (['договір', 'ВН', 'оплата'].includes(kind) && !purchase) {   // «Кошти» бачать лише документи закупівлі (довіреність і акт введення можуть бути без неї)
+        fail(form.elements.purchase, 'Оберіть закупівлю: без неї документ не потрапить у «Кошти».');
+        return;
+      }
+      // Договір, ВН чи оплата, яких не візьме жоден рядок коштів, зникли б із «Коштів»: у закупівлі з кількома рядками суму
+      // розкладають між ними (або вона береться в основи з частками).
+      const home = purById(purchase);
+      if (['договір', 'ВН', 'оплата'].includes(kind) && kop > 0 && home && (home.funds || []).length > 1
+        && !docParts({ id: rec.id, parent, purchase, kop, parts: partEls.length ? used : rec.parts },
+          { purchases: purList(), purDocs: purDocsList() }).length) {
+        for (const x of partEls) x.classList.add('is-bad');
+        fail(partEls[0] || form.elements.sum, 'У закупівлі кілька рядків коштів: розкладіть суму документа між ними.');
+        return;
+      }
+      Object.assign(rec, { no: g('no'), date: g('date'), purchase, parent, kop, vatKop: vat, missing: g('missing'), note: g('note') });
+      rec.party = kind === 'оплата' ? ((up && up.party) || rec.party || '') : g('party');
+      for (const k of ['deliverBy', 'procedure', 'payOn', 'validTo', 'usedOn', 'returnedOn']) if (has(k)) rec[k] = g(k);
+      if (has('person')) rec.person = g('person');
+      if (has('fes')) {
+        const st = g('fes');
+        const was = doc.fes || {};
+        rec.fes = { status: st, date: st !== (was.status || '') ? (st ? today() : '') : was.date || '', register: g('register'), ref: g('ref') };
+      }
+      if (partEls.length) rec.parts = used;
+      if (box) rec.lines = made.map((m) => Object.assign(m.ln, { name: m.name, code: m.code, uom: m.uom, qty: m.qty, priceKop: m.priceKop }));
+      const list = purDocsList();
+      const at = list.findIndex((x) => x.id === rec.id);
+      if (at >= 0) list[at] = rec; else list.push(rec);
+      logChange(fresh ? 'документ закупівлі додано' : 'документ закупівлі виправлено', `purdoc|${rec.id}`, pdLabel(rec));
+      modalClose();
+      saveThen(`${pdLabel(rec)}: збережено.`);
+      render();
+    });
+    el.querySelector('[data-pd-del]')?.addEventListener('click', () => {
+      const under = pdDescendants(rec.id);
+      if (under.length) {                                            // без основи вони втратили б її частки, а з ними — гроші в «Коштах»
+        say(`Під ${PD_UNDER[kind] || 'документом'} є: ${under.map(pdShort).join(', ')} — спершу перенесіть їх під інший документ або видаліть.`);
+        return;
+      }
+      const acts = (rec.receipts || []).length;
+      if (!confirm(`Видалити ${pdLabel(rec)}?${acts ? `\n\nЗв’язок з актами приймання (${acts}) зникне, самі акти лишаться.` : ''}\n\nФайли в теці лишаться.`)) return;
+      store.purDocs = purDocsList().filter((x) => x.id !== rec.id);
+      store.scans = (store.scans || []).filter((s) => s.key !== `purdoc|${rec.id}`);      // записи про файли йдуть з документом, самі файли лишаються
+      logChange('документ закупівлі видалено', `purdoc|${rec.id}`, pdLabel(rec));
+      modalClose();
+      save(true, true);
+      render();
+    });
+  }
+  function pdOpen(doc) {
+    if (!doc) return;
+    if (doc.kind === 'акт введення') go('purdocs', { purDocId: doc.id }); else pdDialog(doc);
+  }
+
+  /** Реєстр на ФЕС: складений файл і скан із підписом «Отримав». */
+  const pdRegBody = (key) => `${pdChips(key) || 'Файлів немає.'}
+      ${native ? `<div style="padding-top:12px"><button class="btn btn--primary" data-act="file-add" data-key="${esc(key)}">Підшити скан з «Отримав»</button></div>` : ''}`;
+  function pdRegDialog(key) {
+    modalOpen(key.slice(7), `<div class="pad" data-pd-reg="${esc(key)}">${pdRegBody(key)}</div>`);
+  }
+  // Вікно реєстру, відкрите під час перемальовування (після «Підшити скан»), показує файли запису заново — разом із новим.
+  PUR_BINDS.push(() => {
+    const body = $('#modal [data-pd-reg]');
+    if (body) body.innerHTML = pdRegBody(body.dataset.pdReg);
+  });
+
+  // РЕЄСТР НА ФЕС: ПОЧАТОК — що передати на ФЕС і як це лягає в запит і в статуси (функції над станом сторінки, їх перевіряють у node).
+  /** Як у реєстрі названо вид паперу обліку: акт приймання-передачі — повністю (так його називає й вивантаження в Excel). */
+  const FES_DOC_NAME = { 'Акт приймання': 'Акт приймання-передачі', 'Акт ПП': 'Акт приймання-передачі', 'Акт ПП ОЗ': 'Акт приймання-передачі ОЗ',
+    'Накладна': 'Накладна', 'Акт списання': 'Акт списання' };
+  /** Документи закупівель, які йдуть на ФЕС, і як вони названі в реєстрі. */
+  const FES_PUR_NAME = { 'ВН': 'Видаткова накладна', 'рахунок': 'Рахунок', 'акт введення': 'Акт введення в експлуатацію' };
+  /** Назва реєстру — вона ж ключ запису про його файл і слово в статусі документів: «Реєстр від 01.10.2026». Файл сервер називає за тією
+   *  самою датою, тож реєстр дня один. */
+  const fesRegLabel = (date) => `Реєстр від ${fmtDate(date)}`;
+  /** Примірники й аркуші — ціле число від 1 до 999; усе інше (порожнє, дріб, мінус, нуль попереду, слово) — 0, тобто відмова. */
+  const fesRegWhole = (v) => (/^[1-9]\d{0,2}$/.test(String(v ?? '').trim()) ? Number(String(v).trim()) : 0);
+
+  /** Порядок реєстру й файла: від давніх до нових, у межах дня — за номером (число в номері — як число). */
+  const fesRegOrder = (a, b) => String(a.date || '').localeCompare(String(b.date || ''))
+    || String(a.no || '').localeCompare(String(b.no || ''), 'uk', { numeric: true });
+
+  /** Усі документи, що можуть іти до реєстру, — з будь-яким статусом: обліку всіх книг (без переносів залишків) і ВН, рахунки та акти
+   *  введення закупівель. Кожен несе назву, номер, дату, статус ФЕС (`fes`), суму цілими копійками (за партіями рядків, як у картці
+   *  документа), число примірників і книгу; `draft` — акт введення в чернетці: ще не папір. */
+  function fesRegPool() {
+    const out = [];
+    const by = new Map();                                     // id документа обліку → його рядки (документ несе кілька позицій)
+    for (const r of docs) {
+      if (!r.id || !['in', 'mv', 'wr'].includes(r.kind) || (r.kind === 'in' && purCarry(r))) continue;
+      if (!by.has(r.id)) by.set(r.id, []);
+      by.get(r.id).push(r);
+    }
+    for (const [id, rows] of by) {
+      const r = rows[0];
+      const kop = rows.reduce((s, x) => s + rowParts(x).reduce((t, p) => t + lineKop(p.q, kopOf(p.price)), 0), 0);
+      out.push({ key: `d:${id}`, ref: { doc: id }, name: FES_DOC_NAME[r.t] || r.t || 'Документ', no: r.no, date: r.d, fes: fesOf(id), kop,
+        copies: r.kind === 'in' ? 3 : 1, book: bookOf(r.code), draft: false });
+    }
+    for (const d of purDocsList()) {
+      const name = FES_PUR_NAME[d.kind];
+      if (!name) continue;
+      out.push({ key: `p:${d.id}`, ref: { pd: d.id }, name, no: d.no, date: d.date, fes: d.fes || null, kop: +d.kop || 0,
+        copies: d.kind === 'акт введення' ? 3 : 1, book: '', draft: d.kind === 'акт введення' && avSt(d) === 'чернетка' });
+    }
+    return out;
+  }
+
+  /** Документи для реєстру від `date`. Кожен несе `group` (див. `fesRegGroup`), назву, номер, дату, статус ФЕС, суму, число примірників
+   *  і книгу. Акт введення в чернетці не пропонується (лише вже внесений у реєстр цієї дати лишається в ньому). Від давніх до нових,
+   *  у межах дня — за номером. */
+  function fesRegCandidates(date = today()) {
+    const label = fesRegLabel(date);
+    const out = [];
+    for (const x of fesRegPool()) {
+      const group = fesRegGroup(x.fes, x.date, date, label);
+      if (!group || (x.draft && group !== 'inreg')) continue;
+      out.push({ key: x.key, ref: x.ref, group, name: x.name, no: x.no, date: x.date, status: (x.fes || {}).status || '', kop: x.kop,
+        copies: x.copies, book: x.book });
+    }
+    return out.sort(fesRegOrder);
+  }
+
+  /** Порядок у вікні: спершу позначені за умовчанням (що чекають і вже в реєстрі), далі свіжі, далі — коли розкрито — старші; у межах
+   *  групи — за датою, як у списку. Згорнуті старші не показуються. */
+  const FES_REG_RANK = { wait: 0, inreg: 0, recent: 1, older: 2 };
+  function fesRegView(list, showOld) {
+    return list.filter((x) => showOld || x.group !== 'older').map((x, i) => [x, i])
+      .sort((a, b) => FES_REG_RANK[a[0].group] - FES_REG_RANK[b[0].group] || a[1] - b[1]).map(([x]) => x);
+  }
+
+  /** Чи позначений документ: вже внесений у реєстр цієї дати — завжди (його позначку не знімають); інакше — як вибрала людина (`u.on`
+   *  з пам'яті вікна), а коли вона не вибирала, — позначений лише той, що чекає. */
+  const fesRegOn = (x, u) => x.group === 'inreg' || (u && typeof u.on === 'boolean' ? u.on : x.group === 'wait');
+
+  /** Позначені документи за пам'яттю вікна (`ui`: ключ → { on, copies, sheets }), а не за тим, що видно на екрані: позначений, але схований
+   *  (старший при згорнутому переліку чи такий, що став старшим після зміни дати) мовчки не пропадає. `hidden` — які з позначених
+   *  зараз не видно. Порядок — як у списку (від давніх до нових): так вони йдуть і в реєстр. */
+  function fesRegTicked(list, ui, showOld) {
+    const ticked = list.filter((x) => fesRegOn(x, ui.get(x.key)));
+    return { ticked, hidden: showOld ? [] : ticked.filter((x) => x.group === 'older') };
+  }
+
+  /** Примірники й аркуші рядка: що вписала людина (`u`), а ні — що стояло в складеному реєстрі цієї дати (`saved[ключ]` = [примірників,
+   *  аркушів]), а ні — за умовчанням. */
+  function fesRegCounts(x, u, saved) {
+    const was = (saved && saved[x.key]) || [];
+    return { copies: (u && u.copies) ?? was[0] ?? x.copies, sheets: (u && u.sheets) ?? was[1] ?? 1 };
+  }
+
+  /** Слово в порожньому вікні: лишилися самі старші (`olderCount`; їх ховає кнопка), усе вже передано (документи є, і всі мають статус за
+   *  реєстром) чи документів до реєстру нема взагалі (акт введення в чернетці не документ реєстру). */
+  function fesRegEmptyWord(olderCount, pool) {
+    if (olderCount) return 'Свіжих документів для реєстру немає.';
+    return pool.some((x) => !x.draft) ? 'Усі документи вже передано на ФЕС.' : 'Документів для реєстру немає.';
+  }
+
+  /** Запит на реєстр: рядки — назва, №, дата, примірники, аркуші, сума (цілі копійки); «Передав» — начальник служби на дату реєстру. */
+  function fesRegSpec(picked, date) {
+    const u = unitInfo();
+    const chief = officialAt('начальник служби', date);
+    return { paper: 'reestr', date, year: +date.slice(0, 4), unit: { name: u.legalName || '', code: unitCode() },
+      rows: picked.map((x) => ({ name: x.name, no: x.no || '', date: x.date || '', copies: x.copies, sheets: x.sheets, kop: x.kop })),
+      giver: { name: chief ? pSign(chief) : '' } };
+  }
+
+  /** Документам реєстру — «їде на ФЕС» і назва реєстру (решта їхнього статусу — витяг, примітка — лишається). Документ, що вже в цьому
+   *  реєстрі, свого статусу не втрачає: «проведено» не вертається в «їде на ФЕС». Повертає, скільком документам статус змінено. */
+  function fesRegMark(picked, label) {
+    let n = 0;
+    for (const x of picked) {
+      if (x.group === 'inreg') continue;
+      if (x.ref.doc) {
+        fesSet(x.ref.doc, { status: 'їде на ФЕС', register: label });
+      } else {
+        const d = pdById(x.ref.pd);
+        if (!d) continue;
+        d.fes = { status: 'їде на ФЕС', date: today(), register: label, ref: (d.fes || {}).ref || '' };
+        logChange('статус ФЕС', `purdoc|${d.id}`, `${d.no ? numNo(d.no) : 'б/н'}: їде на ФЕС`);
+      }
+      n++;
+    }
+    return n;
+  }
+  // РЕЄСТР НА ФЕС: КІНЕЦЬ
+
+  /** Один запит `api/pur-paper` для реєстру. Повертає `{ ask }` — питання сервера, коли файл змінено руками (409 `changed`), `{ j }` —
+   *  відповідь про складений файл; в усіх інших випадках — порожній об'єкт: слово про відмову вже показано (409 «відкрито в Excel чи
+   *  Word» теж слово). */
+  async function fesRegSend(spec, fk, force) {
+    const prev = (store.scans || []).find((f) => f.key === fk && f.made);
+    let r;
+    let j = {};
+    try {
+      r = await fetch('api/pur-paper', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(Object.assign({}, spec, { prevSha: prev ? prev.sha || '' : '', force })) });
+      const text = await r.text();
+      try { j = JSON.parse(text); } catch (e) { j = { error: text }; }
+    } catch (e) {
+      toast(`Не вдалося скласти: ${e.message}`, true);
+      return {};
+    }
+    if (r.status === 409 && j.changed) return { ask: j.error || 'Файл змінено після програми — перезаписати?' };
+    if (!r.ok || !j.ok) { toast(j.error || `помилка ${r.status}`, true); return {}; }
+    return { j };
+  }
+
+  /** Реєстр складено: документам — «їде на ФЕС», запис про файл (з примірниками й аркушами кожного документа: реєстр цієї дати, складений
+   *  наново, бере їх звідси, а не втрачає; наново складений запис стає на місце попереднього), журнал, закрите вікно, а з іншого ПК —
+   *  завантаження файла. */
+  function fesRegDone(el, picked, date, label, fk, j) {
+    const n = fesRegMark(picked, label);
+    const rec = { key: fk, date, no: '', file: j.file, path: j.path, mime: '', size: j.size, added: today(), folder: j.folder, sha: j.sha,
+      made: true, counts: Object.fromEntries(picked.map((x) => [x.key, [x.copies, x.sheets]])) };
+    store.scans = store.scans || [];
+    const at = store.scans.findIndex((f) => f.key === fk && f.made);
+    if (at >= 0) store.scans[at] = rec;                        // на своєму місці: скан «Отримав», підшитий до першого файла, не опиняється перед ним
+    else store.scans.push(rec);                                // (рядок реєстру в «Документах» бере дату з першого запису ключа)
+    logChange('реєстр на ФЕС складено', fk, `${cnt(picked.length, 'документ', 'документи', 'документів')}: ${j.file}`);
+    if (el.isConnected) modalClose();                          // вікно могли закрити, поки йшов запит, і тоді відкрите зараз — не наше
+    save(true);
+    render();
+    if (j.download) {                                          // з іншого ПК файл віддається завантаженням
+      const a = document.createElement('a');
+      a.href = j.download;
+      a.download = j.file;
+      document.body.appendChild(a);                            // не всі браузери завантажують за кліком по елементу поза сторінкою
+      a.click();
+      a.remove();
+    }
+    toast(`Реєстр складено: ${j.file}.${n ? ` Позначено «їде на ФЕС»: ${n}.` : ''}`);
+  }
+
+  /** «Реєстр на ФЕС…»: дата реєстру й перелік документів. Угорі — позначене за умовчанням (явне очікування й уже внесене в реєстр цієї дати),
+   *  далі свіже без статусу — без позначки, внизу — старше за FES_REG_DAYS днів, його ховає «Показати старші». Документ, що вже в реєстрі
+   *  цієї дати, замкнений: файл складається наново повним. Дату можна міняти — перелік перераховується, а вписане в рядках лишається.
+   *  Позначене береться з пам'яті вікна (`ui`), а не з екрана: позначений, але схований документ мовчки не пропадає — «Скласти реєстр»
+   *  розгортає старші, каже про це й нічого не шле. Запит іде лише тоді, і лише після складеного файла ставляться статуси. Друге
+   *  надсилання, поки перше в дорозі, нічого не робить. */
+  function fesRegDialog() {
+    const ui = new Map();                                      // що людина вписала в рядки: ключ → { on, copies, sheets }
+    let date = today();
+    let list = fesRegCandidates(date);
+    let showOld = false;
+    const el = modalOpen('Реєстр документів на ФЕС', `<form id="fes-reg" class="pad">
+        <div class="field" style="max-width:240px;padding-top:16px"><label>Дата реєстру</label><input name="date" type="date" value="${esc(date)}"></div>
+        <p class="set-note" data-reg-note hidden style="margin-top:10px"></p>
+        <div style="margin-top:12px"><button class="btn btn--sm" type="button" data-reg-old hidden></button></div>
+        <div class="tbl" data-reg-list style="--tbl-min:auto;margin-top:10px"></div>
+        <div class="pos-foot"><div class="pad" data-reg-msg hidden style="color:var(--bad)"></div>
+          <div><button class="btn btn--primary" type="submit">Скласти реєстр</button>
+            <button class="btn" type="button" data-md="close">Скасувати</button></div></div></form>`);
+    const form = el.querySelector('form');
+    const box = el.querySelector('[data-reg-list]');
+    const toggle = el.querySelector('[data-reg-old]');
+    const note = el.querySelector('[data-reg-note]');
+    const msg = el.querySelector('[data-reg-msg]');
+    const send = form.querySelector('button[type="submit"]');
+    const dateEl = form.elements.date;
+    const rowEls = () => [...box.querySelectorAll('[data-reg-row]')];
+    const rowOf = (key) => rowEls().find((r) => r.dataset.regRow === key) || null;
+    /** Вписане в рядках — у пам'ять: перед тим як перелік малюється наново і перед «Скласти реєстр» (далі позначене й вписане беруться з
+     *  пам'яті, а не з екрана). Замкнений рядок позначки не несе: вона не від людини. */
+    const keep = () => {
+      for (const r of rowEls()) {
+        const on = r.querySelector('[data-reg]');
+        ui.set(r.dataset.regRow, { on: on.disabled ? undefined : on.checked, copies: r.querySelector('[data-copies]').value,
+          sheets: r.querySelector('[data-sheets]').value });
+      }
+    };
+    /** Складений раніше реєстр цієї дати: його запис, а в ньому — примірники й аркуші кожного документа. */
+    const madeAt = (d) => (store.scans || []).find((f) => f.made && f.key === `fesreg|${fesRegLabel(d)}`) || null;
+    const paint = () => {
+      const older = list.filter((x) => x.group === 'older');
+      const shown = fesRegView(list, showOld);
+      const { hidden } = fesRegTicked(list, ui, showOld);
+      const made = madeAt(date);
+      const counts = (made && made.counts) || {};
+      toggle.hidden = !older.length;
+      toggle.textContent = `${showOld ? 'Сховати' : 'Показати'} старші (${older.length})`;
+      note.hidden = !(made || list.some((x) => x.group === 'inreg'));
+      note.textContent = `${fesRegLabel(date)} уже складено: документи в ньому лишаються, а файл складається знову.`;
+      const row = (x) => {
+        const u = ui.get(x.key);
+        const c = fesRegCounts(x, u, counts);
+        return `<label class="tbl__row tbl__row--plain" data-reg-row="${esc(x.key)}">
+          <div class="c-txt" style="flex:0 0 30px"><input type="checkbox" data-reg="${esc(x.key)}"${fesRegOn(x, u) ? ' checked' : ''}${x.group === 'inreg' ? ' disabled' : ''}></div>
+          <div class="c-name c-name--stack" style="flex:2 1 220px"><b>${esc(x.name)} ${esc(x.no ? numNo(x.no) : 'б/н')}${esc(bookWord(x.book))}</b>
+            <small>${esc([fmtDate(x.date), x.status].filter(Boolean).join(' · '))}</small></div>
+          <div class="c-num" style="flex:0 0 110px">${x.kop ? grnOf(x.kop) : '—'}</div>
+          <div class="c-num" style="flex:0 0 90px"><input class="rc-in" data-copies="${esc(x.key)}" value="${esc(c.copies)}"
+            aria-label="примірників" title="примірників" autocomplete="off"></div>
+          <div class="c-num" style="flex:0 0 90px"><input class="rc-in" data-sheets="${esc(x.key)}" value="${esc(c.sheets)}"
+            aria-label="аркушів" title="аркушів" autocomplete="off"></div></label>`;
+      };
+      box.innerHTML = shown.length ? `<div class="tbl__head"><div class="tbl__h" style="flex:0 0 30px"></div>
+          <div class="tbl__h c-name" style="flex:2 1 220px">документ</div><div class="tbl__h c-num" style="flex:0 0 110px">сума, грн</div>
+          <div class="tbl__h c-num" style="flex:0 0 90px">примірників</div><div class="tbl__h c-num" style="flex:0 0 90px">аркушів</div></div>${shown.map(row).join('')}`
+        : `<div class="tbl__row tbl__row--plain"><div class="c-txt">${fesRegEmptyWord(older.length, fesRegPool())}</div></div>`;
+      send.disabled = !shown.length && !hidden.length;           // позначений, але схований документ лишає кнопку доступною: вона скаже про нього
+    };
+    /** Інша дата реєстру — інший перелік (вікно «свіжих» рахується від неї); недописана дата перелік не чіпає. */
+    const recount = () => {
+      const v = dateEl.value;
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(v) || v === date) return;
+      keep();
+      date = v;
+      list = fesRegCandidates(date);
+      paint();
+    };
+    dateEl.addEventListener('input', recount);
+    dateEl.addEventListener('change', recount);
+    toggle.addEventListener('click', () => { keep(); showOld = !showOld; paint(); });
+    const say = (text, field) => {                             // слово — у липкому низі вікна; поле, з якого воно, — червоне й у фокусі
+      msg.hidden = false;
+      msg.textContent = text;
+      if (field) { field.classList.add('is-bad'); field.focus(); }
+    };
+    const busy = (on) => {
+      send.textContent = on ? 'Складається…' : 'Скласти реєстр';
+      send.classList.toggle('is-busy', on);
+    };
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      msg.hidden = true;
+      for (const x of form.querySelectorAll('.is-bad')) x.classList.remove('is-bad');
+      const day = dateEl.value;
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) { say('Вкажіть дату реєстру.', dateEl); return; }
+      keep();                                                  // що видно на екрані — у пам'ять: далі позначене й вписане беруться звідти
+      const { ticked, hidden } = fesRegTicked(list, ui, showOld);
+      if (hidden.length) {                                     // позначений, але схований документ мовчки не пропадає: старші розгортаються, і його видно
+        showOld = true;
+        paint();
+        rowOf(hidden[0].key)?.scrollIntoView({ block: 'center' });
+        say('Відмічені документи серед старших — перегляньте їх і натисніть «Скласти реєстр» ще раз.');
+        return;
+      }
+      const saved = (madeAt(date) || {}).counts;
+      const picked = [];
+      for (const x of ticked) {
+        const c = fesRegCounts(x, ui.get(x.key), saved);
+        const copies = fesRegWhole(c.copies);
+        const sheets = fesRegWhole(c.sheets);
+        if (!copies) { say('Примірників — ціле число від 1 до 999.', rowOf(x.key)?.querySelector('[data-copies]')); return; }
+        if (!sheets) { say('Аркушів — ціле число від 1 до 999.', rowOf(x.key)?.querySelector('[data-sheets]')); return; }
+        picked.push(Object.assign({}, x, { copies, sheets }));
+      }
+      if (!picked.length) { say('Позначте документи реєстру.'); return; }
+      const label = fesRegLabel(day);
+      const fk = `fesreg|${label}`;
+      if (purComposing.has(fk)) return;                        // той самий реєстр уже складається: другий запит бачив би щойно записаний файл «зміненим»
+      const spec = fesRegSpec(picked, day);
+      try {
+        purComposing.add(fk);                                  // усе, що може впасти, — у `try`: `finally` завжди знімає захист
+        busy(true);
+        let got = await fesRegSend(spec, fk, false);
+        if (got.ask) {
+          if (!confirm(`${got.ask}\n\nЗміни, внесені у файл руками, буде втрачено.`)) return;
+          got = await fesRegSend(spec, fk, true);              // «так»: той самий запит, але з «force»
+          if (got.ask) { toast(got.ask, true); return; }       // «force» був, а сервер питає знову, — це відмова, а не коло питань
+        }
+        if (got.j) fesRegDone(el, picked, day, label, fk, got.j);
+      } catch (err) {
+        toast(`Не вдалося скласти: ${err.message || err}`, true);
+      } finally {
+        purComposing.delete(fk);
+        busy(false);
+      }
+    });
+    paint();
+  }
+
+  /** Де лежать позначки «не було» справи: у самій справі, у її версіях і в рядках коштів, з яких вона бере гроші. */
+  const pdMarkHolders = (pu) => [pu].concat(pu.versions || [], (pu.funds || []).map((x) => budById(x.line)).filter(Boolean));
+  /** Позначка «не було»: пункт «Чого бракує», якого й не мало бути, — з причиною; бере текст пункту. Пункт рядка коштів
+   *  (`bud:<рядок>:…`) позначається в самому рядку (його бачать усі закупівлі з нього), решта — у закупівлі. */
+  function pdMiss(pu, key, text) {
+    const asked = prompt('Чому немає (наприклад, «закупівля 2024 без пакета»)', 'не було');
+    if (asked == null) return;                                       // «Скасувати» — позначки немає
+    const why = String(asked).trim() || 'не було';                   // «Гаразд» без тексту — причина за умовчанням
+    const mark = { [key]: `${text || key}: ${why}` };
+    const line = key.startsWith('bud:') ? budById(key.split(':')[1]) : null;
+    if (line) line.missing = Object.assign({}, line.missing, mark);
+    else pu.missing = Object.assign({}, pu.missing, mark);
+    logChange('позначено «не було»', `pur|${pu.id}`, mark[key]);
+    save();
+    render();
+  }
+  function pdUnmiss(pu, key) {
+    for (const h of pdMarkHolders(pu)) {
+      if (!h.missing || !(key in h.missing)) continue;
+      h.missing = Object.assign({}, h.missing);
+      delete h.missing[key];
+    }
+    logChange('позначку «не було» знято', `pur|${pu.id}`, key);
+    save();
+    render();
+  }
+
+  /** Блок «Договори»: кожен договір із ВН, рахунками, довіреностями й оплатами — деревом. */
+  PUR_BLOCKS.push((pu) => {
+    const mine = purDocsList().filter((d) => d.purchase === pu.id && d.kind !== 'акт введення');
+    const ids = new Set(mine.map((d) => d.id));
+    const seen = new Set();
+    const add = (d, kind, label) => `<button class="btn btn--sm" data-act="pd-add" data-kind="${kind}" data-parent="${esc(d.id)}">${label}</button>`;
+    const acts = (d) => {
+      if (d.kind === 'договір') return add(d, 'ВН', '+ ВН') + add(d, 'рахунок', '+ Рахунок') + add(d, 'довіреність', '+ Довіреність');
+      if (d.kind === 'ВН') {
+        return add(d, 'оплата', '+ Оплата') + add(d, 'довіреність', '+ Довіреність')
+          + `<button class="btn btn--sm btn--primary" data-act="pur-receive" data-id="${esc(d.id)}">Прийняти поставку</button>`;
+      }
+      if (d.kind === 'рахунок') return add(d, 'оплата', '+ Оплата');                   // довіреність — лише під ВН чи договором (PD_PARENT)
+      return '';
+    };
+    const line = (d, depth) => `<div class="tbl__row tbl__row--plain" style="padding-left:${12 + depth * 22}px">
+        <div class="c-name c-name--stack pd-name"><b class="lnk" data-act="pd-open" data-id="${esc(d.id)}">${esc(pdLabel(d))}</b>
+          <small>${esc([pdWhoNote(d), d.party,
+    d.kind === 'ВН' && d.payOn ? `до сплати ${fmtDate(d.payOn)}` : '',
+    d.kind === 'договір' && d.deliverBy ? `поставка до ${fmtDate(d.deliverBy)}` : '',
+    d.kind === 'довіреність' && d.validTo ? `дійсна до ${fmtDate(d.validTo)}` : '', (d.fes || {}).status].filter(Boolean).join(' · '))}</small></div>
+        <div class="c-num pd-sum">${d.kop ? grnOf(d.kop) : '—'}</div>
+        <div class="pur-files pd-files">${pdChips(`purdoc|${d.id}`)}</div>
+        <div class="c-acts pd-acts">${acts(d)}${native ? `<button class="btn btn--sm" data-act="file-add" data-key="purdoc|${esc(d.id)}">Підшити скан</button>` : ''}</div></div>`;
+    // Кожен документ — раз: ті, що не дійшли в дерево (зациклена основа, глибше за чотири рівні), стоять окремо, а не пропадають.
+    const branch = (d, depth) => {
+      seen.add(d.id);
+      return line(d, depth) + (depth < 3 ? mine.filter((x) => x.parent === d.id).map((x) => (seen.has(x.id) ? '' : branch(x, depth + 1))).join('') : '');
+    };
+    const tree = mine.filter((d) => !d.parent || !ids.has(d.parent)).map((d) => branch(d, 0)).join('')
+      + mine.filter((d) => !seen.has(d.id)).map((d) => (seen.has(d.id) ? '' : branch(d, 0))).join('');
+    return `<div class="card pur-block pur-docs"><div class="card__head"><div class="card__title">Договори</div>
+        <button class="btn btn--sm" data-act="pd-add" data-kind="договір">+ Договір</button>
+        <button class="btn btn--sm" data-act="pd-add" data-kind="рахунок">+ Рахунок</button>
+        <button class="btn btn--sm" data-act="pd-add" data-kind="довіреність">+ Довіреність</button></div>
+      <div class="tbl">${tree || '<div class="tbl__row tbl__row--plain"><div class="c-txt">Договорів ще немає.</div></div>'}</div></div>`;
+  });
+
+  /** Блок «Чого бракує» — останнім у картці: пункти й позначки «не було» (справи, її версій і рядків коштів). */
+  function purMissBlock(pu, ctx) {
+    const list = purMissing(pu, ctx);
+    const marks = new Map();
+    for (const h of pdMarkHolders(pu)) for (const [k, why] of Object.entries(h.missing || {})) marks.set(k, why);
+    // Сума без часток (`doc:…:частки`) і закупівля без рядків коштів (`pu:…:кошти`) — не папір, якого не було, а гроші, яких не видно в
+    // «Коштах»: позначити «не було» їх не можна.
+    const notMissed = (x) => /:(частки|кошти)$/.test(x.key);
+    return `<div class="card pur-block pur-miss"><div class="card__head"><div class="card__title">Чого бракує</div>
+        <span class="panel__count">${list.length || 'нічого'}</span></div>
+      ${list.length ? `<ul style="padding:6px 18px 10px 34px">${list.map((x) => `<li>${esc(x.text)} ${notMissed(x) ? '' : rowBtn('pd-miss', 'не було…',
+    `data-key="${esc(x.key)}" data-text="${esc(x.text)}"`, { title: 'Позначити, що такого документа не було' })}</li>`).join('')}</ul>` : ''}
+      ${marks.size ? `<details class="fold" style="padding:0 18px 10px"${state.pdMarksOpen ? ' open' : ''}><summary><span class="card__title">Позначено «не було» · ${marks.size}</span></summary>
+        <ul style="padding:4px 0 0 16px">${[...marks].map(([k, why]) => `<li>${esc(why)} ${rowBtn('pd-unmiss', 'зняти', `data-key="${esc(k)}"`)}</li>`).join('')}</ul></details>` : ''}</div>`;
+  }
+
+  // Розгорнутий перелік позначок «не було» лишається розгорнутим після перемальовування (зняли позначку, додали іншу), як «Версії й історія».
+  PUR_BINDS.push((sc) => {
+    sc.querySelector('.pur-miss details')?.addEventListener('toggle', (e) => { state.pdMarksOpen = e.target.open; });
+  });
+
+  /** Дії документів закупівель. Наступні задачі дописують свої `case` перед `default:`. */
+  function pdAction(act, d) {
+    const pu = state.view === 'purch' && state.purId ? purById(state.purId) : null;
+    switch (act) {
+      case 'pd-new': return pdKindDialog(pu ? pu.id : '');
+      case 'pd-add': return pdAdd(d.kind, pu ? pu.id : '', d.parent || '');
+      case 'pd-open': return pdOpen(pdById(d.id));
+      case 'pd-xls': return pdXls();
+      case 'pd-reg': return pdRegDialog(d.key);
+      case 'pd-fes-register': return fesRegDialog();
+      case 'pd-miss': return pu ? pdMiss(pu, d.key, d.text) : null;
+      case 'pd-unmiss': return pu ? pdUnmiss(pu, d.key) : null;
+      default: return null;
+    }
+  }
+
+  // ---------------------------------------------------------------- поставки закупівель: прийняти поставку, акт введення в експлуатацію
+  /** «ВН №0000 від 01.01.2026»: вид, номер (немає — «б/н») і дата документа, коли вона є. */
+  const purRef = (word, no, date) => [word, no ? numNo(no) : 'б/н', date ? `від ${fmtDate(date)}` : ''].filter(Boolean).join(' ');
+
+  /** Чернетка акта приймання з ВН (чи договору): від кого, наступний номер року з літерою фонду, підстава й рядки — ВН, а коли їх нема,
+   *  договору чи погодженої версії пакета. Рядок без коду довідника (коду нема або його в довіднику нема) у чернетку не йде, а названий у
+   *  повідомленні: його обирають у формі. Книга чернетки — книга позиції першого рядка, а без рядків — відкрита зараз. Рух майна робить
+   *  лише звичайне «Провести документ»: статусу ФЕС приймання не перевіряє. */
+  function purReceive(doc) {
+    if (!doc) return;
+    const pu = purById(doc.purchase);
+    const first = pu && pu.funds && pu.funds.length ? budById(pu.funds[0].line) : null;
+    const up = pdById(doc.parent);
+    const appr = pu ? purVersion(pu, 'approved') : null;
+    const src = doc.lines.length ? doc.lines : up && up.lines.length ? up.lines
+      : appr ? appr.positions.map((p) => ({ code: p.code, name: p.name, qty: p.qty, priceKop: p.priceKop })) : [];
+    const known = (l) => !!l.code && itemBy.has(String(l.code));
+    const lines = src.filter(known).map((l) => Object.assign(emptyLine(), { code: String(l.code), qty: String(l.qty || ''),
+      price: l.priceKop ? kopStr(l.priceKop) : '' }));
+    const nameless = src.filter((l) => !known(l)).map((l) => `${l.name || l.code} × ${fmtNum(l.qty)} по ${grnOf(l.priceKop)}`);
+    const book = lines.length ? bookOf(lines[0].code) : state.book;
+    if (!leaveEditing()) return;
+    if (!freeDraftSlot('in', book, 'Замінити незавершену чернетку «Прихід»?\n\nНаписане в ній буде втрачено.')) return;
+    state.editing = null;
+    state.moveKind = 'in';
+    const date = today();                                         // дата чернетки й рік її номера — з одного виклику: опівночі на Новий рік два розвели б їх
+    state.draft = { kind: 'in', book, src: { kind: 'pur', doc: doc.id },
+      head: { type: 'Акт приймання', no: nextAp(docs.filter((r) => r.kind === 'in').map((r) => r.no), +date.slice(0, 4), apLetter(first ? first.fund : '')),
+        date, from: doc.party || (up && up.party) || '', to: 'склад', basis: purRef(doc.kind, doc.no, doc.date),
+        report: '', reportDate: '', act: '', note: '' },
+      lines: lines.concat([emptyLine()]) };
+    state.flash = `Чернетка акта приймання за ${PD_UNDER[doc.kind] || doc.kind} ${doc.no ? numNo(doc.no) : 'б/н'}: перевірте рядки й проведіть.${nameless.length
+      ? ` Без коду: ${nameless.join('; ')}. Оберіть позицію або «+ Нова позиція».` : ''}`;
+    go('moves', { q: '', formOpen: true, book });
+  }
+
+  /** Картка «Закупівля» в документі приходу: з якою закупівлею, ВН і договором пов'язано, акт введення. */
+  function purRcptCard(r0) {
+    if (r0.kind !== 'in' || !r0.id) return '';
+    const ctx = purCtx();
+    const text = purRcptText(r0.id, ctx);
+    const linked = (d) => (d.receipts || []).some((l) => rcptId(l, ctx) === r0.id);
+    const av = ctx.purDocs.find((d) => d.kind === 'акт введення' && linked(d));
+    const pus = [...new Set(ctx.purDocs.filter((d) => d.kind !== 'акт введення' && linked(d)).map((d) => d.purchase))].map(purById).filter(Boolean);
+    return `<div class="card pur-rcpt" style="margin-bottom:12px"><div class="card__head"><div class="card__title">Закупівля</div>
+        <div class="panel__spacer"></div>${text ? '' : `<button class="btn btn--sm" data-act="pur-link" data-doc="${r0.id}">Прив’язати до закупівлі…</button>`}
+        ${av ? `<button class="btn btn--sm" data-act="pd-open" data-id="${esc(av.id)}">${esc(pdLabel(av))}</button>`
+    : `<button class="btn btn--sm btn--primary" data-act="pur-av-new" data-doc="${r0.id}">Скласти акт введення</button>`}</div>
+      <div style="padding:10px 18px;font:400 12.5px var(--sans);color:var(--ink-2)">${text ? `${esc(text)} ${pus.map((pu) => `<a class="lnk" data-act="pur-open" data-id="${esc(pu.id)}">відкрити</a>`).join(' ')}`
+    : 'Не з закупівлі або ще не прив’язано.'}</div></div>`;
+  }
+
+  /** Прив'язати прихід до ВН чи договору: з картки приходу (rid) або з картки закупівлі (pu — тоді приходи ще без зв'язку й документи
+   *  цієї закупівлі). */
+  function purLinkDialog(rid, pu) {
+    const ctx = purCtx();
+    const linked = new Set(ctx.purDocs.filter((d) => d.kind !== 'акт введення')                   // акт введення — папір після поставки, а не зв'язок
+      .flatMap((d) => (d.receipts || []).map((l) => rcptId(l, ctx))));
+    const rcpts = rid ? [ctx.rcpt.get(rid)].filter(Boolean)
+      : [...ctx.rcpt.values()].filter((r) => !linked.has(r.id)).sort((a, b) => (a.d < b.d ? 1 : a.d > b.d ? -1 : b.id - a.id)).slice(0, 200);
+    const targets = purDocsList().filter((d) => ['ВН', 'договір'].includes(d.kind) && (!pu || d.purchase === pu.id));
+    if (!rcpts.length || !targets.length) {
+      toast(rcpts.length ? 'Немає ВН чи договору, до яких прив’язати.' : 'Неприв’язаних приходів немає.', true);
+      return;
+    }
+    const el = modalOpen('Прив’язати прихід до закупівлі', `<form class="pad"><div class="form__grid">
+      <div class="field field--span"><label>Прихід</label><select name="rcpt">${rcpts.map((r) =>
+    `<option value="${r.id}">${esc(`${numNo(r.no)} від ${fmtDate(r.d)} · ${r.from} · ${grnOf(r.kop)} грн`)}</option>`).join('')}</select></div>
+      <div class="field field--span"><label>ВН чи договір</label><select name="doc">${targets.map((d) =>
+    `<option value="${esc(d.id)}">${esc(`${(purById(d.purchase) || {}).title || '—'}: ${pdLabel(d)}`)}</option>`).join('')}</select></div></div>
+      <div style="padding-top:12px"><button class="btn btn--primary" type="submit">Прив’язати</button>
+        <button class="btn" type="button" data-md="close">Скасувати</button></div></form>`);
+    el.querySelector('form').addEventListener('submit', (e) => {
+      e.preventDefault();
+      const f = new FormData(e.target);
+      const d = pdById(f.get('doc'));
+      const r = ctx.rcpt.get(+f.get('rcpt'));
+      if (!d || !r) return;
+      if (!(d.receipts || []).some((l) => rcptId(l, ctx) === r.id)) {
+        d.receipts = (d.receipts || []).concat([{ doc: r.id, key: r.key }]);
+        logChange('прихід прив’язано до закупівлі', `purdoc|${d.id}`, `${pdLabel(d)} ← ${r.no}`);
+        save();
+      }
+      modalClose();
+      render();
+    });
+  }
+
+  /** Блок «Поставки»: акти приймання закупівлі, статус ФЕС, акт введення. */
+  PUR_BLOCKS.push((pu, ctx) => {
+    const rows = purRcpts(pu, ctx).map((id) => ctx.rcpt.get(id)).filter(Boolean)
+      .sort((a, b) => (a.d < b.d ? -1 : a.d > b.d ? 1 : a.id - b.id)).map((r) => {
+        const av = ctx.purDocs.find((d) => d.kind === 'акт введення' && (d.receipts || []).some((l) => rcptId(l, ctx) === r.id));
+        return `<div class="tbl__row tbl__row--plain"><div class="c-name c-name--stack" style="flex:2 1 220px">
+          <b class="lnk" data-act="pur-rcpt" data-key="${esc(r.key)}">Акт приймання ${esc(numNo(r.no))}</b>
+          <small>${esc([fmtDate(r.d), r.from].filter(Boolean).join(' · '))}</small></div>
+        <div class="c-num" style="width:110px">${grnOf(r.kop)}</div>
+        <div class="c-txt" style="width:110px">${esc(r.fes || 'ФЕС: —')}</div>
+        <div class="c-acts" style="flex-basis:260px">${av ? `<button class="btn btn--sm" data-act="pd-open" data-id="${esc(av.id)}">${esc(pdLabel(av))}</button>`
+    : `<button class="btn btn--sm btn--primary" data-act="pur-av-new" data-doc="${r.id}">Скласти акт введення</button>`}</div></div>`;
+      });
+    return `<div class="card pur-block pur-deliv"><div class="card__head"><div class="card__title">Поставки</div>
+        <button class="btn btn--sm" data-act="pur-link">Прив’язати прихід…</button></div>
+      <div class="tbl">${rows.join('') || '<div class="tbl__row tbl__row--plain"><div class="c-txt">Поставок ще немає.</div></div>'}</div></div>`;
+  });
+
+  /** Строк корисного використання — як у попередньому акті введення того самого коду. */
+  function lastLife(code) {
+    for (const d of purDocsList().slice().reverse()) {
+      if (d.kind !== 'акт введення') continue;
+      const ln = d.lines.find((l) => l.code === code && l.life);
+      if (ln) return ln.life;
+    }
+    return '';
+  }
+
+  /** Новий акт введення з акта приймання: номер АВ<рр>-nnn за номером АП, позиції з первісною вартістю, інв. № — номер ФЕС позиції
+   *  (своїх номерів у паперах немає), підписанти — з «Люди й МВО» на дату. Місце складання порожнє: поки його не вписано, папір бере
+   *  дислокацію на дату акта. Акт цього приходу вже є — відкривається він, а не другий. */
+  function purAvNew(docId) {
+    const ctx = purCtx();
+    const rc = ctx.rcpt.get(+docId);
+    if (!rc) { toast('Акта приймання вже немає.', true); return; }
+    const linked = (d) => (d.receipts || []).some((l) => rcptId(l, ctx) === rc.id);
+    const had = ctx.purDocs.find((d) => d.kind === 'акт введення' && linked(d));
+    if (had) { go('purdocs', { purDocId: had.id }); return; }
+    const links = ctx.purDocs.filter((d) => d.kind !== 'акт введення' && linked(d));
+    const vn = links.find((d) => d.kind === 'ВН');
+    const year = +String(rc.d).slice(0, 4);
+    const av = docBlank('акт введення', (vn || links[0] || {}).purchase || '');
+    Object.assign(av, { no: avNo(rc.no, year, purDocsList().filter((d) => d.kind === 'акт введення').map((d) => d.no)),
+      date: rc.d, party: rc.from, kop: rc.kop, receipts: [{ doc: rc.id, key: rc.key }] });
+    av.lines = rc.lines.map((l) => {
+      const it = itemBy.get(l.code) || {};
+      return { id: uid(), name: cleanName(it.name || l.code), code: l.code, uom: it.unit || '', qty: l.q, priceKop: kopOf(l.price),
+        fesNo: fesInvNo(it), year: '', passport: '', life: lastLife(l.code) };
+    });
+    av.extra = { approver: sgOf(officialAt('командир', av.date), av.date), head: sgOf(null), members: [],
+      accountant: sgOf(officialAt('начальник ФЕС', av.date), av.date), place: '', supplier: rc.from,
+      location: rc.to, seen: [...new Set(av.lines.map((l) => l.name))].join(', '),
+      docs: [vn ? purRef('ВН', vn.no, vn.date) : '', purRef('АКТ ПП', rc.no, rc.d)].filter(Boolean).join(' / '),
+      versions: [] };
+    purDocsList().push(av);
+    logChange('акт введення складено', `purdoc|${av.id}`, `${av.no} до ${rc.no}`);
+    save();
+    go('purdocs', { purDocId: av.id });
+  }
+
+  /** Специфікація акта для сервера (форма наказу Мінфіну № 818). Рік — з дати акта (без дати він 0, і сервер скаже слово); місце
+   *  складання — вписане в акті, а за його відсутності дислокація на дату акта; гроші — цілі копійки. */
+  function avSpec(av) {
+    const u = unitInfo();
+    const ex = av.extra || {};
+    const place = locationAt(av.date);
+    return { paper: 'akt', no: av.no, date: av.date, year: /^\d{4}-\d{2}-\d{2}$/.test(av.date || '') ? +av.date.slice(0, 4) : 0,
+      unit: { name: u.legalName || '', code: unitCode(), edrpou: u.edrpou || '', place },
+      approver: sgPlain(ex.approver), head: sgPlain(ex.head), members: (ex.members || []).map(sgPlain), accountant: sgPlain(ex.accountant),
+      place: ex.place || place, location: ex.location || '', seen: ex.seen || '', supplier: ex.supplier || av.party || '',
+      docs: ex.docs || '', lines: av.lines.map((l) => ({ name: l.name, fesNo: l.fesNo || '', qty: l.qty, priceKop: l.priceKop,
+        kop: lineKop(l.qty, l.priceKop), life: l.life || '', year: l.year || '', passport: l.passport || '' })) };
+  }
+
+  /** Скласти акт у Word. Файл, змінений руками, програма без згоди не перезаписує: сервер відповідає 409, сторінка питає, і лише «так»
+   *  шле запит ще раз із `force`; відкритий у Word — слово. Друге натискання, поки перше в дорозі, нічого не робить. */
+  async function avFile(av, force = false) {
+    const fk = `purdoc|${av.id}`;
+    if (purComposing.has(fk)) return;
+    // Файл зветься за номером акта: без номера він був би «Акт введення в експлуатацію.docx», а з номером іншого акта — тим самим файлом.
+    const no = String(av.no || '').trim();
+    if (!no) { toast('Вкажіть номер акта: за ним складається файл.', true); return; }
+    const twin = purDocsList().find((x) => x.kind === 'акт введення' && x.id !== av.id && normNo(x.no) === normNo(no));
+    if (twin) { toast(`Номер ${no} уже має інший акт введення${twin.date ? ` від ${fmtDate(twin.date)}` : ''}: впишіть інший.`, true); return; }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(av.date || '')) { toast('Вкажіть дату акта: за нею складається тека акта.', true); return; }
+    // Кнопка — саме цього акта: людина могла відкрити інший, і чужа кнопка не міняється.
+    const mark = () => {
+      const b = [...document.querySelectorAll('[data-act="av-file"]')].find((x) => x.dataset.id === av.id);
+      if (!b) return;
+      b.textContent = purComposing.has(fk) ? 'Складається…' : 'У Word';
+      b.classList.toggle('is-busy', purComposing.has(fk));
+    };
+    try {
+      purComposing.add(fk);                                                       // усе, що може впасти, — у `try`: `finally` завжди знімає захист
+      mark();
+      let ask = await avSend(av, fk, force);
+      if (ask && !force) {
+        if (!confirm(`${ask}\n\nЗміни, внесені у файл руками, буде втрачено.`)) return;
+        ask = await avSend(av, fk, true);                                         // «так»: той самий запит, але з «force»
+      }
+      if (ask) toast(ask, true);                                                  // «force» був, а сервер питає знову, — це відмова, а не коло питань
+    } catch (e) {
+      toast(`Не вдалося скласти: ${e.message || e}`, true);
+    } finally {
+      purComposing.delete(fk);
+      try { mark(); } catch (e) { /* екран змінився: кнопки вже нема */ }
+    }
+  }
+  /** Один запит `api/pur-paper` для акта. Повертає питання сервера, коли файл змінено руками (409 `changed`); в усіх інших випадках —
+   *  порожньо: складено, або слово про відмову вже показано. Запис про файл несе теку й відбиток сервера. */
+  async function avSend(av, fk, force) {
+    const prev = (store.scans || []).find((f) => f.key === fk && f.made);
+    let r;
+    let j = {};
+    try {
+      const spec = Object.assign(avSpec(av), { prevSha: prev ? prev.sha || '' : '', force });
+      r = await fetch('api/pur-paper', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(spec) });
+      const text = await r.text();
+      try { j = JSON.parse(text); } catch (e) { j = { error: text }; }
+    } catch (e) {
+      toast(`Не вдалося скласти: ${e.message}`, true);
+      return '';
+    }
+    if (r.status === 409 && j.changed) return j.error || 'Файл змінено після програми — перезаписати?';
+    if (!r.ok || !j.ok) { toast(j.error || `помилка ${r.status}`, true); return ''; }        // 409 «відкрито в Excel чи Word» теж тут
+    store.scans = (store.scans || []).filter((f) => !(f.key === fk && f.made));
+    store.scans.push({ key: fk, date: av.date, no: av.no, file: j.file, path: j.path, mime: '', size: j.size, added: today(),
+      folder: j.folder, sha: j.sha, made: true });
+    logChange('папір складено', fk, `${av.no}: ${j.file}`);
+    save(true);
+    render();
+    if (j.download) {                                           // з іншого ПК файл віддається завантаженням
+      const a = document.createElement('a');
+      a.href = j.download;
+      a.download = j.file;
+      document.body.appendChild(a);                             // не всі браузери завантажують за кліком по елементу поза сторінкою
+      a.click();
+      a.remove();
+    }
+    toast(`${j.opened ? 'Відкрито у Word' : 'Складено'}: ${j.file}`);
+    return '';
+  }
+
+  /** Що не дає вважати акт підготовленим. */
+  function avCheck(av) {
+    const ex = av.extra || {};
+    return [!av.no && 'немає номера', !av.date && 'немає дати', !av.lines.length && 'немає позицій',
+      !(ex.approver || {}).name && 'немає, хто затверджує', !(ex.head || {}).name && 'немає голови комісії'].filter(Boolean);
+  }
+  /** Стан акта (порожній — чернетка, як у запису з книги) і куди з нього можна перейти: затверджений правиться лише через «Виправити…». */
+  const avSt = (av) => av.state || 'чернетка';
+  const AV_NEXT = { 'чернетка': ['підготовлено'], 'підготовлено': ['затверджено', 'чернетка'], 'затверджено': [] };
+  function avState(av, st, what) {
+    if (!(AV_NEXT[avSt(av)] || []).includes(st)) { toast('Акт уже в іншому стані: оновіть екран.', true); render(); return; }
+    const bad = st === 'чернетка' ? [] : avCheck(av);
+    if (bad.length) { toast(`Акт ще не готовий: ${bad.join(', ')}.`, true); return; }
+    av.state = st;
+    if (st === 'затверджено') {                                  // місце, не вписане руками, стає місцем дня затвердження: «Дислокація» його потім не посуне
+      const ex = av.extra || (av.extra = {});
+      if (!String(ex.place || '').trim()) ex.place = locationAt(av.date) || '';
+    }
+    logChange(what, `purdoc|${av.id}`, av.no);
+    save();
+    render();
+  }
+  /** «Виправити…»: попередній вміст затвердженого акта лишається в його записі, сам акт вертається в чернетку. */
+  function avFix(av) {
+    if (avSt(av) !== 'затверджено') return;
+    const reason = String(prompt('Причина виправлення', '') || '').trim();
+    if (!reason) return;
+    const body = JSON.parse(JSON.stringify({ no: av.no, date: av.date, lines: av.lines, extra: Object.assign({}, av.extra, { versions: [] }) }));
+    av.extra.versions = (av.extra.versions || []).concat([{ at: today(), reason, body }]);
+    av.state = 'чернетка';
+    logChange('акт введення виправляють', `purdoc|${av.id}`, `${av.no}: ${reason}`);
+    save();
+    render();
+  }
+  /** Члени комісії: рядок додають і прибирають лише в чернетці. */
+  function avMember(av) {
+    if (avSt(av) !== 'чернетка') return;
+    av.extra.members = (av.extra.members || []).concat([sgOf(null)]);
+    save();
+    render();
+  }
+  function avMemberDel(av, i) {
+    const list = av.extra.members || [];
+    if (avSt(av) !== 'чернетка' || !Number.isInteger(i) || i < 0 || i >= list.length) return;
+    av.extra.members = list.filter((_, k) => k !== i);
+    save();
+    render();
+  }
+  /** Чернетку акта можна видалити (помилково складений); записи про його файли йдуть із ним, самі файли лишаються в теці. */
+  function avDelete(av) {
+    if (avSt(av) !== 'чернетка') return;
+    if (!confirm(`Видалити акт введення ${av.no ? numNo(av.no) : 'б/н'}?\n\nФайли в теці лишаться.`)) return;
+    store.purDocs = purDocsList().filter((x) => x.id !== av.id);
+    store.scans = (store.scans || []).filter((s) => s.key !== `purdoc|${av.id}`);
+    logChange('документ закупівлі видалено', `purdoc|${av.id}`, pdLabel(av));
+    save(true, true);
+    go('purdocs', { purDocId: null });
+  }
+
+  /** Дії акта введення в експлуатацію. */
+  function avAction(act, d) {
+    const av = state.purDocId ? pdById(state.purDocId) : null;
+    switch (act) {
+      case 'av-close': return go('purdocs', { purDocId: null });
+      case 'av-file': return av ? avFile(av) : null;
+      case 'av-member': return av ? avMember(av) : null;
+      case 'av-member-del': return av ? avMemberDel(av, +d.i) : null;
+      case 'av-ready': return av ? avState(av, 'підготовлено', 'акт введення підготовлено') : null;
+      case 'av-draft': return av ? avState(av, 'чернетка', 'акт введення повернуто в чернетку') : null;
+      case 'av-approve': return av && (avSt(av) !== 'підготовлено' || confirm(`Затвердити акт ${av.no}?\n\nЗатверджений акт правиться лише через «Виправити…».`))
+        ? avState(av, 'затверджено', 'акт введення затверджено') : null;
+      case 'av-fix': return av ? avFix(av) : null;
+      case 'av-del': return av ? avDelete(av) : null;
+      default: return null;
+    }
+  }
+
+  /** Назва картки акта введення. */
+  const avTitle = (av) => `Акт введення в експлуатацію ${av.no ? numNo(av.no) : 'б/н'}`;
+  /** Рядок під назвою картки: за яким актом приймання складено й на яку суму; акта приймання вже нема — форма акта. */
+  function avSubtitle(av) {
+    const ctx = purCtx();
+    const rc = (av.receipts || []).map((l) => ctx.rcpt.get(rcptId(l, ctx))).find(Boolean);
+    return rc ? `За актом приймання ${numNo(rc.no)} від ${fmtDate(rc.d)} на ${grnOf(rc.kop)} грн` : 'Форма наказу Мінфіну № 818';
+  }
+  /** Після правки реквізитів на місці оновлюється те, що від них залежить: назва (номер) і підказка місця складання (дата). Картку
+   *  не перемальовують: людина вже перейшла до наступного поля, і фокус зник би. */
+  function avTouch(av, sc) {
+    const title = document.querySelector('#head .title');
+    if (title) title.textContent = avTitle(av);
+    const place = sc.querySelector('[data-av="place"]');
+    if (place) place.placeholder = locationAt(av.date);
+  }
+
+  /** Графи акта, які вписують руками: номер ФЕС (інв. № у папері), строк корисного використання, рік випуску, номер паспорта. */
+  const AV_COLS = { fesNo: 'інв. № ФЕС', life: 'строк, років', year: 'рік випуску', passport: '№ паспорта' };
+  function renderAvCard(av) {
+    const st = avSt(av);
+    const ro = st !== 'чернетка';
+    const ex = av.extra || (av.extra = {});
+    const dis = ro ? ' disabled' : '';
+    const busy = purComposing.has(`purdoc|${av.id}`);
+    const fld = (k, label, val, o = {}) => `<div class="field${o.span || ''}"><label>${label}</label><input data-av="${k}"${o.date ? ' type="date"' : ''}
+      value="${esc(val || '')}"${o.ph ? ` placeholder="${esc(o.ph)}"` : ''}${o.tip ? ` title="${esc(o.tip)}"` : ''} aria-label="${esc(label)}" autocomplete="off"${dis}></div>`;
+    const sgr = (key, label) => {
+      const member = key.startsWith('m:');
+      const s = (member ? (ex.members || [])[+key.slice(2)] : ex[key]) || {};
+      return `<div class="tbl__row tbl__row--plain"><div class="c-txt" style="flex:0 0 130px"><b>${esc(label)}</b></div>
+        ${['pos', 'rank', 'name'].map((k) => `<div class="c-txt" style="flex:1 1 150px"><input class="rc-in rc-in--wide" style="width:100%;text-align:left"
+          data-avsg="${key}" data-k="${k}" value="${esc(s[k] || '')}" placeholder="${{ pos: 'посада', rank: 'звання', name: 'Ім’я ПРІЗВИЩЕ' }[k]}"
+          aria-label="${esc(label)}: ${{ pos: 'посада', rank: 'звання', name: 'ім’я' }[k]}" autocomplete="off"${dis}></div>`).join('')}
+        <div class="c-acts" style="flex-basis:210px">${ro ? '' : `<select data-avsg-pick="${key}" aria-label="${esc(label)}: людина з довідника" style="max-width:140px">
+          ${personOptions('', av.date || today(), 'з довідника…')}</select>${member
+    ? rowBtn('av-member-del', '✕ Прибрати', `data-i="${key.slice(2)}"`, { bad: true, title: 'Прибрати члена комісії' }) : ''}`}</div></div>`;
+    };
+    const lines = av.lines.map((l, i) => `<div class="tbl__row tbl__row--plain"><div class="c-name c-name--stack" style="flex:2 1 200px">
+        <b>${esc(l.name)}</b><small>${esc(l.code)}</small></div>
+        <div class="c-num" style="width:60px">${fmtNum(l.qty)}</div><div class="c-num" style="width:110px">${grnOf(l.priceKop)}</div>
+        ${Object.entries(AV_COLS).map(([k, ph]) => `<div class="c-txt" style="width:110px"><input class="rc-in rc-in--wide" data-avl="${i}" data-k="${k}"
+          value="${esc(l[k] || '')}" placeholder="${ph}" aria-label="${esc(l.name)}: ${ph}" autocomplete="off"${dis}></div>`).join('')}</div>`).join('');
+    const bar = { 'чернетка': '<button class="btn btn--primary" data-act="av-ready">Підготовлено</button><button class="btn btn--danger" data-act="av-del">Видалити</button>',
+      'підготовлено': '<button class="btn btn--primary" data-act="av-approve">Затвердити…</button><button class="btn" data-act="av-draft">Повернути в чернетку</button>',
+      'затверджено': '<button class="btn" data-act="av-fix">Виправити…</button>' }[st] || '';
+    const fes = av.fes || {};
+    const versions = (ex.versions || []).filter((x) => x && typeof x === 'object');
+    return {
+      head: head('закупівлі / акти введення', avTitle(av),
+        `<button class="btn" data-act="av-close">← До переліку</button><span class="tag ${PAPER_TAG[st] || ''}">${esc(st)}</span>
+        ${bar}<button class="btn${busy ? ' is-busy' : ''}" data-act="av-file" data-id="${esc(av.id)}">${busy ? 'Складається…' : 'У Word'}</button>`),
+      body: `${flashBlock()}<div class="av-card pur-card">
+        <div class="card pur-block"><div class="card__head"><div class="card__title">Реквізити</div></div>
+          <div class="form__grid pad">${fld('no', '№', av.no)}${fld('date', 'Дата', av.date, { date: true })}
+          ${fld('place', 'Місце складання', ex.place, { ph: locationAt(av.date), tip: 'Порожньо: місце складання береться з дислокації на дату акта' })}
+          ${fld('location', 'Де знаходиться', ex.location)}${fld('supplier', 'Постачальник', ex.supplier, { span: ' field--span2' })}
+          ${fld('docs', 'Перелік документації', ex.docs, { span: ' field--span2' })}${fld('seen', 'Проведено огляд', ex.seen, { span: ' field--span' })}</div></div>
+        <div class="card pur-block"><div class="card__head"><div class="card__title">ФЕС</div>
+          ${fes.date ? `<span class="panel__count">${esc(fmtDate(fes.date))}</span>` : ''}</div>
+          <div class="form__grid pad"><div class="field"><label>Статус ФЕС</label>
+            <select data-av-fes aria-label="Статус ФЕС"><option value="">—</option>${FES_STATUSES.map((s) =>
+    `<option${s === fes.status ? ' selected' : ''}>${s}</option>`).join('')}</select></div>
+            <div class="field"><label>Реєстр</label><input data-avfes="register" value="${esc(fes.register || '')}" aria-label="Реєстр" autocomplete="off"></div>
+            <div class="field"><label>№ проводки ФЕС</label><input data-avfes="ref" value="${esc(fes.ref || '')}" aria-label="№ проводки ФЕС" autocomplete="off"></div></div></div>
+        <div class="card pur-block"><div class="card__head"><div class="card__title">Позиції</div></div><div class="tbl">
+          <div class="tbl__head"><div class="tbl__h c-name" style="flex:2 1 200px">найменування</div><div class="tbl__h c-num" style="width:60px">к-сть</div>
+            <div class="tbl__h c-num" style="width:110px">ціна, грн</div>${Object.values(AV_COLS).map((ph) =>
+    `<div class="tbl__h c-txt" style="width:110px">${ph}</div>`).join('')}</div>${lines}</div></div>
+        <div class="card pur-block"><div class="card__head"><div class="card__title">Комісія й підписи</div>
+          ${ro ? '' : '<button class="btn btn--sm" data-act="av-member">+ Член комісії</button>'}</div><div class="tbl">
+          ${sgr('approver', 'Затверджує')}${sgr('head', 'Голова комісії')}${(ex.members || []).map((_, i) => sgr(`m:${i}`, `Член ${i + 1}`)).join('')}
+          ${sgr('accountant', 'Бухгалтерія')}</div></div>
+        ${versions.length ? `<div class="card pur-block"><div class="card__head"><div class="card__title">Попередні редакції</div></div>
+          <ul style="padding:6px 18px 10px 34px">${versions.map((x) => `<li>${fmtDate(x.at)}: ${esc(x.reason)}</li>`).join('')}</ul></div>` : ''}
+        ${filesCard(`purdoc|${av.id}`, 'Складений і підписаний акт', 'скан підписаного акта')}</div>`,
+    };
+  }
+
+  PUR_BINDS.push((sc) => {
+    if (state.view !== 'purdocs' || !state.purDocId) return;
+    const av = pdById(state.purDocId);
+    if (!av || av.kind !== 'акт введення') return;
+    sc.querySelector('[data-av-fes]')?.addEventListener('change', (e) => {
+      const st = e.target.value;
+      const was = av.fes || {};
+      av.fes = { status: st, date: st !== (was.status || '') ? (st ? today() : '') : was.date || '', register: was.register || '', ref: was.ref || '' };
+      logChange('статус ФЕС', `purdoc|${av.id}`, `${av.no}: ${st || 'статус знято'}`);
+      save();
+      render();
+    });
+    // Реєстр і № проводки приходять після підписання: їх вписують і в підготовленого, і в затвердженого акта.
+    sc.querySelectorAll('[data-avfes]').forEach((el) => el.addEventListener('change', () => {
+      const k = el.dataset.avfes;
+      av.fes = Object.assign({ status: '', date: '', register: '', ref: '' }, av.fes, { [k]: el.value.trim() });
+      logChange('реквізити ФЕС', `purdoc|${av.id}`, `${av.no}: ${k === 'register' ? 'реєстр' : '№ проводки'} ${av.fes[k] ? `«${av.fes[k]}»` : 'знято'}`);
+      save();
+    }));
+    if (avSt(av) !== 'чернетка') return;
+    const ex = av.extra;
+    sc.querySelectorAll('[data-av]').forEach((el) => el.addEventListener('change', () => {
+      const k = el.dataset.av;
+      if (k === 'no' || k === 'date') av[k] = el.value.trim(); else ex[k] = el.value.trim();
+      save();
+      avTouch(av, sc);
+    }));
+    sc.querySelectorAll('[data-avl]').forEach((el) => el.addEventListener('change', () => {
+      av.lines[+el.dataset.avl][el.dataset.k] = el.value.trim();
+      save();
+    }));
+    const put = (key, sg) => {
+      if (key.startsWith('m:')) ex.members[+key.slice(2)] = sg; else ex[key] = sg;
+    };
+    sc.querySelectorAll('[data-avsg]').forEach((el) => el.addEventListener('change', () => {
+      const key = el.dataset.avsg;
+      const cur = (key.startsWith('m:') ? ex.members[+key.slice(2)] : ex[key]) || {};
+      put(key, Object.assign({}, cur, { [el.dataset.k]: el.value.trim() }));
+      save();
+    }));
+    sc.querySelectorAll('[data-avsg-pick]').forEach((el) => el.addEventListener('change', () => {
+      const person = personBy(el.value);
+      if (!person) return;
+      put(el.dataset.avsgPick, sgOf(person, av.date || today()));
+      save();
+      render();
+    }));
+  });
+
+  /** Прихід виправили, і його ключ змінився: зв'язки документів закупівель, поставлені за ключем (id ще не прийшов з бази), йдуть за
+   *  новим ключем. Зв'язок за id від ключа не залежить. */
+  function rekeyPurLinks(oldKey, newKey) {
+    if (oldKey === newKey) return;
+    for (const d of store.purDocs || []) for (const l of d.receipts || []) if (!l.doc && l.key === oldKey) l.key = newKey;
+  }
+
+  // ---------------------------------------------------------------- кошти
+  /** Чи посилається на рядок коштів хоч щось: гроші закупівлі, позиція пакета чи частка документа (рівно ті три посилання,
+   *  які знає сервер): такий рядок не видаляють — сервер відмовив би всьому запису, і вікно не зберегло б нічого далі. */
+  const budUsed = (id) => purList().some((p) => (p.funds || []).some((f) => f.line === id)
+    || (p.versions || []).some((v) => (v.positions || []).some((x) => x.line === id)))
+    || purDocsList().some((d) => (d.parts || []).some((p) => p.line === id));
+  /** Дата першого запису «затверджено» за роком рядка: поточний рік — сьогодні, інший — 1 січня того року. */
+  const budDayOf = (year) => (+year === +today().slice(0, 4) ? today() : `${String(year).padStart(4, '0')}-01-01`);
+  const BUD_FIELDS = [['year', 'рік'], ['label', 'назва'], ['fund', 'фонд'], ['kpkv', 'КПКВ'], ['kekv', 'КЕКВ'], ['exp', 'код видатків'],
+    ['purpose', 'призначення'], ['community', 'громада'], ['agreeNo', 'угода №'], ['agreeDate', 'угода від'], ['decisionNo', 'рішення №'],
+    ['decisionDate', 'рішення від'], ['returnBy', 'повернути залишок до'], ['reportBy', 'звіт громаді до'], ['note', 'примітка']];
+  const BUD_MOVE_FIELDS = [['kind', 'вид'], ['date', 'дата'], ['kop', 'сума'], ['basis', 'підстава'], ['note', 'примітка']];
+  /** Значення поля в журналі змін: дата — по-людськи, сума — з «грн», текст — у лапках, порожнє — «—». */
+  const budShow = (k, v) => (v === '' || v == null ? '—' : k === 'date' || /(Date|By)$/.test(k) ? fmtDate(v)
+    : k === 'kop' ? `${grnOf(v)} грн` : k === 'year' ? String(v) : `«${v}»`);
+  /** «поле: було → стало» для змінених полів запису — для журналу змін. */
+  const budChanges = (before, after, fields) => fields.filter(([k]) => String(before[k] ?? '') !== String(after[k] ?? ''))
+    .map(([k, name]) => `${name}: ${budShow(k, before[k])} → ${budShow(k, after[k])}`).join('; ');
+
+  /** Реєстр «Кошти»: рядок на рядок коштів вибраного року, показники за формулами штабу (`budNums`). */
+  function budSpec(ctx) {
+    const rows = purBudget().filter((l) => +l.year === purYear()).map((l) => ({ l, n: budNums(l, ctx) }));
+    const opts = (f) => [...new Set(rows.map(f).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'uk')).map((v) => [v, v]);
+    const money = (key, label, title, get, w = 104) => ({ key, label, title, cls: 'c-num', style: `width:${w}px`,
+      sort: (x) => get(x.n), cell: (x) => grnOf(get(x.n)) });
+    return {
+      id: 'bud', rows, minWidth: '1000px', limit: REG_LIMIT,
+      placeholder: 'Пошук: назва, фонд, громада, коди',
+      search: (x) => [x.l.label, x.l.fund, x.l.community, x.l.kpkv, x.l.kekv, x.l.exp, x.l.purpose],
+      filters: [
+        { type: 'select', key: 'fund', label: 'фонд', all: 'усі', options: opts((x) => x.l.fund), test: (x, v) => x.l.fund === v },
+        { type: 'select', key: 'com', label: 'громада', all: 'усі', options: opts((x) => x.l.community), test: (x, v) => x.l.community === v },
+      ],
+      columns: [
+        { key: 'label', label: 'рядок коштів', cls: 'c-name c-name--stack', style: 'flex:2 1 200px', first: 1, sort: (x) => x.l.label,
+          cell: (x) => `<b>${esc(x.l.label)}</b><small>${esc([x.l.fund, x.l.community, [x.l.kekv, x.l.exp].filter(Boolean).join('/')]
+            .filter(Boolean).join(' · '))}</small>` },
+        money('appr', 'затверджено', 'затверджено і зміни', (n) => n.approved),
+        money('fin', 'профінансовано', 'профінансовано без повернутого', (n) => n.financed, 116),
+        money('com', 'зобов’язання', 'суми договорів', (n) => n.committed),
+        money('got', 'поставлено', 'вартість прийнятого за актами приймання', (n) => n.delivered),
+        money('used', 'використано', 'суми оплат', (n) => n.used),
+        money('cash', 'залишок коштів', 'профінансовано без використаного', (n) => n.cashLeft),
+        money('noc', 'без договору', 'профінансовано без суми договорів', (n) => n.noContract),
+        money('free', 'не розплановано', 'затверджено без того, що взяли закупівлі', (n) => n.unplanned),
+      ],
+      row: (x) => ({ attrs: `data-act="bud-open" data-id="${esc(x.l.id)}"` }),
+      total: (shown) => {
+        const s = (f) => grnOf(shown.reduce((a, x) => a + f(x.n), 0));
+        return { label: '<b>Разом</b>', appr: s((n) => n.approved), fin: s((n) => n.financed), com: s((n) => n.committed),
+          got: s((n) => n.delivered), used: s((n) => n.used), cash: s((n) => n.cashLeft), noc: s((n) => n.noContract), free: s((n) => n.unplanned) };
+      },
+      count: (shown, all) => (shown.length === all.length ? String(all.length) : `${shown.length} із ${all.length}`),
+      empty: 'Рядків коштів ще немає.', emptyFiltered: 'За цими фільтрами рядків немає.',
+    };
+  }
+
+  function renderBudget() {
+    const ctx = purCtx();
+    const l = state.budId ? budById(state.budId) : null;
+    if (l) return renderBudCard(l, ctx);
+    const reg = registry(budSpec(ctx));
+    return {
+      fill: true,
+      head: head(`закупівлі / кошти ${purYear()}`, 'Кошти', `${purSeg('purbud')}${purYearSel()}
+        <button class="btn" data-act="bud-reports">Звіти…</button>
+        <button class="btn" data-act="bud-xls">В Excel</button>
+        <button class="btn btn--primary" data-act="bud-new">+ Рядок коштів</button>`),
+      body: `${flashBlock()}${reg.panel}<div class="card card--scroll card--fill">${reg.table}</div>`,
+    };
+  }
+
+  function renderBudCard(l, ctx) {
+    const n = budNums(l, ctx);
+    const dated = (no, date) => [no && `№${no}`, date && `від ${fmtDate(date)}`].filter(Boolean).join(' ');
+    const spec = [['Фонд', l.fund], ['КПКВ', l.kpkv], ['КЕКВ / код', [l.kekv, l.exp].filter(Boolean).join(' / ')],
+      ['Громада', l.community], ['Призначення', l.purpose], ['Угода', dated(l.agreeNo, l.agreeDate)],
+      ['Рішення', dated(l.decisionNo, l.decisionDate)], ['Повернути залишок до', l.returnBy ? fmtDate(l.returnBy) : ''],
+      ['Звіт громаді до', l.reportBy ? fmtDate(l.reportBy) : ''], ['Примітка', l.note]].filter(([, v]) => v)
+      .map(([k, v]) => `<div><div class="spec__k">${esc(k)}</div><div class="spec__v">${esc(v)}</div></div>`).join('');
+    const tile = (label, kop, hint = '') => `<div class="tile"><div class="tile__label">${esc(label)}</div>
+      <div class="tile__value">${grnOf(kop)} <small>грн</small></div>${hint ? `<div class="tile__hint">${esc(hint)}</div>` : ''}</div>`;
+    // За датою (стале сортування: записи одного дня лишаються в порядку внесення).
+    const moves = [...(l.moves || [])].sort((a, b) => String(a.date || '').localeCompare(String(b.date || ''))).map((m) =>
+      `<div class="tbl__row tbl__row--plain"><div class="c-date">${fmtDate(m.date)}</div>
+        <div class="c-txt" style="flex:0 0 140px">${esc(m.kind)}</div><div class="c-num" style="width:130px">${grnOf(m.kop)}</div>
+        <div class="c-txt">${esc([m.basis, m.note].filter(Boolean).join(' · '))}</div>
+        <div class="c-acts">${rowBtn('bud-move', '✎ Виправити', `data-m="${esc(m.id)}"`, { title: 'Виправити запис руху' })}${
+  rowBtn('bud-move-del', '✕ Прибрати', `data-m="${esc(m.id)}"`, { bad: true, title: 'Прибрати запис руху' })}</div></div>`).join('');
+    const users = purList().filter((p) => (p.funds || []).some((f) => f.line === l.id)).map((p) =>
+      `<div class="tbl__row tbl__row--plain"><div class="c-name"><b><a class="lnk" data-act="pur-open" data-id="${esc(p.id)}">${esc(p.title)}</a></b></div>
+        <div class="c-num" style="width:150px">${grnOf(p.funds.find((f) => f.line === l.id).kop)}</div></div>`).join('');
+    const files = l.fund === 'Субвенція' ? ['угода', 'рішення', 'звіт'] : ['інше'];
+    return {
+      head: head(`закупівлі / кошти ${l.year}`, l.label, `<button class="btn" data-act="bud-close">← До переліку</button>
+        <button class="btn" data-act="bud-edit" data-id="${esc(l.id)}">Виправити</button>
+        <button class="btn btn--primary" data-act="bud-move">+ Запис руху</button>`),
+      body: `${flashBlock()}<div class="bud-card pur-card">
+        <div class="tiles">${tile('Затверджено', n.approved)}${tile('Профінансовано', n.financed)}${tile('Зобов’язання', n.committed)}${tile('Поставлено', n.delivered)}
+          ${tile('Використано', n.used)}${tile('Залишок коштів', n.cashLeft)}${tile('Без договору', n.noContract)}${tile('Не розплановано', n.unplanned)}
+          ${l.fund === 'Субвенція' ? tile('До повернення', n.toReturn, l.returnBy ? `до ${fmtDate(l.returnBy)}` : '') : ''}</div>
+        <div class="card pur-block"><div class="card__head"><div class="card__title">Реквізити</div></div>
+          <div style="padding:18px"><div class="spec">${spec}</div></div></div>
+        <div class="card pur-block"><div class="card__head"><div class="card__title">Рух коштів</div></div>
+          <div class="tbl bud-moves">${moves || '<div class="tbl__row tbl__row--plain"><div class="c-txt">Записів ще немає.</div></div>'}</div></div>
+        <div class="card pur-block"><div class="card__head"><div class="card__title">Закупівлі з цього рядка</div></div>
+          <div class="tbl">${users || '<div class="tbl__row tbl__row--plain"><div class="c-txt">Закупівель ще немає.</div></div>'}</div></div>
+        ${files.map((what) => filesCard(`bud|${l.id}|${what}`, { 'угода': 'Угода з громадою', 'рішення': 'Рішення громади',
+    'звіт': 'Звіт громаді', 'інше': 'Підстави' }[what], 'скан, лист, витяг')).join('')}</div>`,
+    };
+  }
+
+  /** Вікно рядка коштів: новий (`l` порожній — з полем «Затверджено», яке стає першим записом руху) чи виправлення. */
+  function budDialog(l) {
+    const fresh = !l;
+    const rec = l || budBlank(purYear());
+    const el = modalOpen(fresh ? 'Новий рядок коштів' : `Рядок коштів · ${rec.label}`, `<form id="bud-form" class="pad"><div class="form__grid">
+        <div class="field"><label>Рік</label><input name="year" type="number" value="${rec.year}" min="2000" max="2100"></div>
+        <div class="field field--span"><label>Назва (унікальна в році)</label><input name="label" value="${esc(rec.label)}" required placeholder="ПДФО 3110/040" autocomplete="off"></div>
+        <div class="field"><label>Фонд</label><select name="fund" required><option value="">—</option>${PUR_FUNDS.concat(rec.fund && !PUR_FUNDS.includes(rec.fund) ? [rec.fund] : []).map((v) =>
+    `<option${v === rec.fund ? ' selected' : ''}>${esc(v)}</option>`).join('')}</select></div>
+        <div class="field"><label>КПКВ</label><input name="kpkv" value="${esc(rec.kpkv)}" placeholder="2101020" autocomplete="off"></div>
+        <div class="field"><label>КЕКВ</label><input name="kekv" value="${esc(rec.kekv)}" autocomplete="off"></div>
+        <div class="field"><label>Код видатків</label><input name="exp" value="${esc(rec.exp)}" autocomplete="off"></div>
+        ${fresh ? `<div class="field"><label>Затверджено, грн</label><input name="approved" inputmode="decimal" autocomplete="off"></div>
+        <div class="field"><label>Затверджено від</label><input name="approvedOn" type="date" value="${esc(budDayOf(rec.year))}"></div>` : ''}
+        <div class="field field--span"><label>Призначення</label><input name="purpose" value="${esc(rec.purpose)}" autocomplete="off"></div>
+        <div class="field"><label>Громада</label><input name="community" value="${esc(rec.community)}" autocomplete="off"></div>
+        <div class="field"><label>Угода №</label><input name="agreeNo" value="${esc(rec.agreeNo)}" autocomplete="off"></div>
+        <div class="field"><label>Угода від</label><input name="agreeDate" type="date" value="${esc(rec.agreeDate)}"></div>
+        <div class="field"><label>Рішення №</label><input name="decisionNo" value="${esc(rec.decisionNo)}" autocomplete="off"></div>
+        <div class="field"><label>Рішення від</label><input name="decisionDate" type="date" value="${esc(rec.decisionDate)}"></div>
+        <div class="field"><label>Повернути залишок до</label><input name="returnBy" type="date" value="${esc(rec.returnBy)}"></div>
+        <div class="field"><label>Звіт громаді до</label><input name="reportBy" type="date" value="${esc(rec.reportBy)}"></div>
+        <div class="field field--span"><label>Примітка</label><input name="note" value="${esc(rec.note)}" autocomplete="off"></div></div>
+      <div class="pad" data-pur-msg hidden style="color:var(--bad)"></div>
+      <div style="padding-top:12px"><button class="btn btn--primary" type="submit">Зберегти</button>
+        <button class="btn" type="button" data-md="close">Скасувати</button>
+        ${!fresh && !budUsed(rec.id) ? '<button class="btn btn--danger" type="button" data-bud-del>Видалити рядок</button>' : ''}</div></form>`);
+    const form = el.querySelector('form');
+    const msg = el.querySelector('[data-pur-msg]');
+    const fail = (text) => { msg.hidden = false; msg.textContent = text; };
+    const on = form.elements.approvedOn;                                  // лише в новому рядку
+    if (on) {
+      let typed = false;                                                  // дату вписано руками — рік її вже не веде
+      on.addEventListener('input', () => { typed = true; });
+      form.elements.year.addEventListener('input', () => {
+        const y = form.elements.year.value;
+        if (!typed && /^[0-9]{4}$/.test(y)) on.value = budDayOf(y);
+      });
+    }
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      msg.hidden = true;
+      const f = new FormData(form);
+      const g = (k) => String(f.get(k) || '').trim();
+      const year = +g('year') || purYear();
+      const label = g('label').replace(/\s+/g, ' ');
+      if (!label) { fail('Назву рядка не вказано.'); return; }
+      if (purBudget().some((x) => x.id !== rec.id && +x.year === year && x.label.toLowerCase() === label.toLowerCase())) {
+        fail(`Рядок «${label}» за ${year} рік уже є.`);
+        return;
+      }
+      // Затверджено — сума, не менша за нуль; текст, що не число, нулем не пишеться.
+      const approved = fresh ? moneyIn(form.elements.approved, fail) : 0;
+      if (approved == null) return;
+      const before = { ...rec };
+      Object.assign(rec, { year, label, fund: g('fund'), kpkv: g('kpkv'), kekv: g('kekv'), exp: g('exp'), purpose: g('purpose'),
+        community: g('community'), agreeNo: g('agreeNo'), agreeDate: g('agreeDate'), decisionNo: g('decisionNo'),
+        decisionDate: g('decisionDate'), returnBy: g('returnBy'), reportBy: g('reportBy'), note: g('note') });
+      if (fresh) {
+        if (approved) rec.moves.push({ id: uid(), kind: 'затверджено', date: g('approvedOn') || budDayOf(year), kop: approved, basis: '', note: '' });
+        purBudget().push(rec);
+      }
+      state.purYear = year;
+      const changes = fresh ? '' : budChanges(before, rec, BUD_FIELDS);
+      if (fresh || changes) {
+        logChange(fresh ? 'рядок коштів заведено' : 'рядок коштів виправлено', `bud|${rec.id}`, `${year} · ${label}${changes ? `: ${changes}` : ''}`);
+      }
+      modalClose();
+      save();
+      go('purbud', { budId: rec.id });
+    });
+    el.querySelector('[data-bud-del]')?.addEventListener('click', () => {
+      const gone = (rec.moves || []).length;
+      const sums = budNums(rec, purCtx());
+      const what = gone ? `\n\nРазом із ним зникне ${cnt(gone, 'запис руху', 'записи руху', 'записів руху')}: затверджено ${
+        grnOf(sums.approved)} грн, профінансовано ${grnOf(sums.financed)} грн.` : '';
+      if (!confirm(`Видалити рядок коштів «${rec.label}»?${what}\n\nФайли в теці лишаться.`)) return;
+      store.budget = purBudget().filter((x) => x.id !== rec.id);
+      // Записи про файли рядка (`bud|<id>|…`) йдуть разом із ним; самі файли лишаються в теці служби.
+      store.scans = (store.scans || []).filter((x) => !String(x.key).startsWith(`bud|${rec.id}|`));
+      logChange('рядок коштів видалено', `bud|${rec.id}`, rec.label);
+      modalClose();
+      save(true, true);
+      go('purbud', { budId: null });
+    });
+  }
+
+  /** Вікно запису руху коштів: новий (`m` порожній) чи виправлення. Сума не нуль (нульовий запис нічого не міняє) і від'ємна лише в «зміні». */
+  function budMoveDialog(l, m) {
+    if (!Array.isArray(l.moves)) l.moves = [];
+    const rec = m || { id: uid(), kind: 'профінансовано', date: today(), kop: 0, basis: '', note: '' };
+    const el = modalOpen(`${l.label} · рух коштів`, `<form id="bud-move" class="pad"><div class="form__grid">
+        <div class="field"><label>Вид</label><select name="kind">${PUR_MOVE_KINDS.map((k) => `<option${k === rec.kind ? ' selected' : ''}>${k}</option>`).join('')}</select></div>
+        <div class="field"><label>Дата</label><input name="date" type="date" value="${esc(rec.date)}" required></div>
+        <div class="field"><label>Сума, грн (зміна зі знаком)</label><input name="sum" inputmode="decimal" autocomplete="off" value="${m ? esc(kopStr(rec.kop)) : ''}" required></div>
+        <div class="field field--span"><label>Підстава</label><input name="basis" value="${esc(rec.basis)}" placeholder="лист, розподіл, виписка" autocomplete="off"></div>
+        <div class="field field--span"><label>Примітка</label><input name="note" value="${esc(rec.note)}" autocomplete="off"></div></div>
+      <div class="pad" data-pur-msg hidden style="color:var(--bad)"></div>
+      <div style="padding-top:12px"><button class="btn btn--primary" type="submit">Зберегти</button>
+        <button class="btn" type="button" data-md="close">Скасувати</button></div></form>`);
+    const form = el.querySelector('form');
+    const msg = el.querySelector('[data-pur-msg]');
+    const fail = (text) => { msg.hidden = false; msg.textContent = text; };
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      msg.hidden = true;
+      const f = new FormData(form);
+      const kind = String(f.get('kind'));
+      const field = form.elements.sum;
+      if (!field.value.trim()) { field.classList.add('is-bad'); fail('Суму не вказано.'); return; }
+      const kop = moneyIn(field, fail, kind === 'зміна');
+      if (kop == null) return;
+      if (kop === 0) { field.classList.add('is-bad'); fail('Сума руху не може бути нулем.'); return; }       // нуль нічого не міняє
+      const before = { ...rec };
+      Object.assign(rec, { kind, date: String(f.get('date')), kop,
+        basis: String(f.get('basis') || '').trim(), note: String(f.get('note') || '').trim() });
+      if (!m) l.moves.push(rec);
+      const changes = m ? budChanges(before, rec, BUD_MOVE_FIELDS) : '';
+      if (!m || changes) {
+        logChange('рух коштів', `bud|${l.id}`, `${l.label}: ${m ? changes : `${rec.kind} ${grnOf(rec.kop)} від ${fmtDate(rec.date)}`}`);
+      }
+      modalClose();
+      saveThen('Запис руху збережено.');
+      render();
+    });
+  }
+
+  /** Дії вкладки «Кошти». Наступні задачі дописують свої `case` перед `default:`: статична перевірка
+   *  tests/test_app_js.py шукає саме `case '…'`, а маршрут `startsWith('bud-')` пускає сюди лише дії `bud-…`. */
+  function budAction(act, d) {
+    const l = state.budId ? budById(state.budId) : null;
+    const move = l && d.m ? (l.moves || []).find((m) => m.id === d.m) : null;
+    switch (act) {
+      case 'bud-new': return budDialog(null);
+      case 'bud-open': return go('purbud', { budId: d.id });
+      case 'bud-close': return go('purbud', { budId: null });
+      case 'bud-edit': return budById(d.id) ? budDialog(budById(d.id)) : null;
+      case 'bud-move': return l && (!d.m || move) ? budMoveDialog(l, move) : null;
+      case 'bud-move-del': return l && move ? budMoveDel(l, move) : null;
+      case 'bud-xls': return budXls();
+      case 'bud-reports': return purReportsDialog();
+      case 'bud-rep-use': modalClose(); return purReportUse();
+      case 'bud-rep-table': modalClose(); return purReportTable();
+      case 'bud-rep-where': modalClose(); return purReportWhere();
+      case 'bud-rep-pivot': modalClose(); return purPivotDialog();
+      case 'bud-rep-in': modalClose(); return purReportIn();
+      default: return null;
+    }
+  }
+  function budMoveDel(l, m) {
+    if (!confirm(`Прибрати запис руху «${m.kind} ${grnOf(m.kop)} грн від ${fmtDate(m.date)}»?`)) return;
+    l.moves = (l.moves || []).filter((x) => x.id !== m.id);
+    logChange('рух коштів прибрано', `bud|${l.id}`, `${l.label}: ${m.kind} ${grnOf(m.kop)} від ${fmtDate(m.date)}`);
+    save(true, true);
+    render();
+  }
+
+  // ЗВІТИ КОШТІВ: ПОЧАТОК — звіти по грошах закупівель в Excel, зведення за розрізами, відомість МТЗ з рядка коштів і тексти карток
+  // (функції над станом сторінки, їх перевіряють у node). Гроші скрізь — цілі копійки з моделі; у клітинки Excel вони йдуть у гривнях (÷ 100).
+  /** Частка a від b для клітинки Excel: шість знаків, а там, де b нуль, — нуль (відсоток від нічого). */
+  const ratio = (a, b) => (b ? Math.round(a / b * 1e6) / 1e6 : 0);
+
+  /** «В Excel» у «Справах»: показані рядки (з пошуком, фільтрами й сортуванням реєстру) і ті самі стовпці. */
+  function purXls() {
+    const shown = regRows(purSpec(purCtx()));
+    const sum = (key) => shown.reduce((s, x) => s + x.n[key], 0) / 100;       // «Разом» екрана: копійки складаються цілими, у гривні — раз
+    return toExcel({ file: `Закупівлі ${purYear()}`, sheets: [Object.assign({ name: 'Закупівлі', orientation: 'landscape', top: [unitTop()],
+      title: `Закупівлі ${purYear()} року`, head: [['Закупівля', 'Що купуємо', 'Рядки коштів', 'Пакет', 'Договори', 'Поставлено',
+        'Оплачено', 'Стан', 'Бракує']], widths: [28, 36, 28, 14, 14, 14, 14, 14, 8],
+      rows: shown.map((x) => [x.pu.title, x.pu.what || '', x.lines.map((l) => l.label).join(', '), x.n.pack / 100, x.n.contracts / 100,
+        x.n.delivered / 100, x.n.paid / 100, x.st, x.miss]), money: [3, 4, 5, 6], num: [8] },
+      shown.length ? { total: ['Разом', '', '', sum('pack'), sum('contracts'), sum('delivered'), sum('paid'), '', ''] } : {})] });
+  }
+  /** «В Excel» у «Коштах»: показані рядки коштів і всі показники штабу. */
+  function budXls() {
+    const shown = regRows(budSpec(purCtx()));
+    const KEYS = ['approved', 'financed', 'committed', 'delivered', 'used', 'cashLeft', 'noContract', 'unplanned'];
+    return toExcel({ file: `Кошти ${purYear()}`, sheets: [Object.assign({ name: 'Кошти', orientation: 'landscape', top: [unitTop()],
+      title: `Кошти ${purYear()} року`, head: [['Рядок коштів', 'Фонд', 'Громада', 'КЕКВ/код', 'Затверджено', 'Профінансовано',
+        'Зобов’язання', 'Поставлено', 'Використано', 'Залишок коштів', 'Без договору', 'Не розплановано']],
+      widths: [28, 18, 18, 10, 14, 14, 14, 14, 14, 14, 14, 14],
+      rows: shown.map((x) => [x.l.label, x.l.fund, x.l.community, [x.l.kekv, x.l.exp].filter(Boolean).join('/')]
+        .concat(KEYS.map((k) => x.n[k] / 100))), money: [4, 5, 6, 7, 8, 9, 10, 11] },
+      shown.length ? { total: ['Разом', '', '', ''].concat(KEYS.map((k) => shown.reduce((s, x) => s + x.n[k], 0) / 100)) } : {})] });
+  }
+  /** «Звіти…» у «Коштах»: п'ять звітів року, кожен — кнопкою (дії `bud-rep-…`). */
+  function purReportsDialog() {
+    modalOpen(`Звіти ${purYear()}`, `<div class="pad" style="display:flex;flex-wrap:wrap;gap:8px">
+      <button class="btn" data-act="bud-rep-use">Використання коштів</button>
+      <button class="btn" data-act="bud-rep-table">Таблиця закупівель</button>
+      <button class="btn" data-act="bud-rep-where">Куди пішли кошти</button>
+      <button class="btn" data-act="bud-rep-pivot">Зведення коштів…</button>
+      <button class="btn" data-act="bud-rep-in">Що надійшло</button></div>`, 'modal__box--form');
+  }
+  /** «Використання коштів» у графах і формулах штабу; відсотки лежать у клітинках частками й показуються відсотком («pct» вивантаження). */
+  function purReportUse() {
+    const ctx = purCtx();
+    const year = purYear();
+    const on = fmtDate(today());
+    const rows = purUseRows(ctx, year).map((r) => (r.group ? [r.text].concat(Array(12).fill(''))
+      : [r.label, [r.kekv, r.exp].filter(Boolean).join('/'), r.approved / 100, r.committed / 100, r.budgetLeft / 100,
+        ratio(r.committed, r.approved), ratio(r.committed, r.financed), r.financed / 100, r.used / 100, ratio(r.used, r.financed),
+        r.cashLeft / 100, r.noContract / 100, r.note]));
+    return toExcel({ file: `Використання коштів ${year} станом на ${on}`, sheets: [{
+      name: 'Використання коштів', orientation: 'landscape', top: [unitTop()], title: `Використання коштів ${year} року`,
+      subtitle: `станом на ${on}`,
+      head: [['Рядок коштів', 'КЕКВ/код', 'Затверджено на рік', 'Взято зобов’язань', 'Залишок бюджетних зобов’язань',
+        '% взяття зобов’язань', '% від фінансування', 'Профінансовано', 'Використано', '% використання', 'Залишок коштів',
+        'Без договору', `Станом на ${on}`]],
+      widths: [28, 10, 15, 15, 15, 11, 11, 15, 15, 11, 15, 15, 48], rows, money: [2, 3, 4, 7, 8, 10, 11], pct: [5, 6, 9] }] });
+  }
+  /** «Таблиця закупівель» служби за колонками штабу. */
+  function purReportTable() {
+    const year = purYear();
+    const rows = purTableRows(purCtx(), year).map((r) => [unitInfo().serviceFull || 'Продовольча служба', r.kpkv, r.kekv, r.exp,
+      r.status, r.fund, r.sum / 100, r.used / 100, r.left / 100, [r.purchase, r.note].filter(Boolean).join('; ')]);
+    return toExcel({ file: `Таблиця закупівель ${year}`, sheets: [{ name: 'Лист1', orientation: 'landscape', top: [unitTop()],
+      title: `Таблиця закупівель ${year}`, head: [['Служба', 'КПКВ', 'КЕКВ', 'КОД ВИДАТКІВ', 'СТАТУС ПОГОДЖЕННЯ', 'ДЖЕРЕЛО НАДХОДЖЕНЬ',
+        'СУМА', 'ВИКОРИСТАНО', 'ЗАЛИШОК', 'ПРИМІТКА']], widths: [22, 16, 8, 10, 18, 26, 14, 14, 14, 44], rows, money: [6, 7, 8] }] });
+  }
+  /** «Куди пішли кошти»: рядок → закупівлі → договори, ВН і оплати → акти приймання → позиції й де вони зараз. Рядок бере закупівлі, що мають
+   *  на ньому гроші, документ із часткою чи поставку; сума документа — його частка на цьому рядку, акта — частка приходу на ньому, розкладена
+   *  по позиціях цілими копійками. Тож сума «Договір» рядка коштів — його «Взято зобов’язань», «Оплата» — «Використано», «акт приймання» —
+   *  «Поставлено». Акт введення — не поставка: рядків не додає. */
+  function purReportWhere() {
+    const ctx = purCtx();
+    const year = purYear();
+    const shares = rcptShares(ctx);
+    const stock = [...balances().map];
+    const nowOf = new Map();
+    const where = (code) => {
+      if (!nowOf.has(code)) {
+        nowOf.set(code, stock.filter(([k, v]) => k.startsWith(`${code}|`) && v > 0)
+          .map(([k, v]) => `${k.slice(k.indexOf('|') + 1)}: ${fmtNum(v)}`).join('; '));
+      }
+      return nowOf.get(code);
+    };
+    const KINDS = ['договір', 'ВН', 'оплата'];
+    const rows = [];
+    for (const l of ctx.budget.filter((x) => +x.year === year)) {
+      for (const pu of ctx.purchases) {
+        const mine = ctx.purDocs.filter((d) => d.purchase === pu.id && KINDS.includes(d.kind) && docParts(d, ctx).some((p) => p.line === l.id))
+          .sort((a, b) => KINDS.indexOf(a.kind) - KINDS.indexOf(b.kind) || String(a.date || '').localeCompare(String(b.date || '')));
+        const got = new Map();                                  // прихід → його частка на рядку (документи ділять прихід між собою)
+        for (const s of shares) if (s.purchase === pu.id && s.line === l.id) got.set(s.rid, (got.get(s.rid) || 0) + s.kop);
+        for (const d of mine) {
+          rows.push([l.label, pu.title, PD_WORD[d.kind], d.no, d.date ? fmtDate(d.date) : '', purPartyOf(d, ctx),
+            docParts(d, ctx).filter((p) => p.line === l.id).reduce((s, p) => s + p.kop, 0) / 100, '', '', '', '', '']);
+        }
+        const rcpts = [...got].map(([rid, kop]) => ({ r: ctx.rcpt.get(rid), kop })).filter((x) => x.r)
+          .sort((a, b) => (a.r.d < b.r.d ? -1 : a.r.d > b.r.d ? 1 : a.r.id - b.r.id));
+        for (const { r, kop } of rcpts) {
+          const lines = r.lines || [];
+          const split = new Map(scaleParts(lines.map((ln, i) => ({ line: i, kop: lineKop(ln.q, kopOf(ln.price)) })), kop).map((p) => [p.line, p.kop]));
+          const lead = [l.label, pu.title, 'акт приймання', r.no, fmtDate(r.d), r.from];
+          if (!lines.length) rows.push(lead.concat([kop / 100, '', '', '', '', '']));
+          lines.forEach((ln, i) => {
+            const it = itemBy.get(ln.code) || {};
+            // «Ціна» — та, з якої рахується сума позиції (до копійки): кількість × ціна = «Сума» (а коли прихід ділять рядки, «Сума» — частка)
+            rows.push(lead.concat([(split.get(i) || 0) / 100, ln.code, cleanName(it.name || ln.code), ln.q, kopOf(ln.price) / 100, where(ln.code)]));
+          });
+        }
+      }
+    }
+    return toExcel({ file: `Куди пішли кошти ${year}`, sheets: [{ name: 'Куди пішли кошти', orientation: 'landscape', top: [unitTop()],
+      title: `Куди пішли кошти ${year} року`, head: [['Рядок коштів', 'Закупівля', 'Документ', '№', 'Дата', 'Контрагент', 'Сума, грн',
+        'Код', 'Найменування', 'К-сть', 'Ціна, грн', 'Де зараз']], widths: [24, 24, 14, 14, 11, 24, 14, 8, 36, 8, 12, 40], rows, money: [6, 10],
+      num: [9] }] });
+  }
+  /** «Що надійшло»: позиції надходжень ззовні за рік із реквізитами відомості МТЗ і закупівлею. КЕКВ, КПКВ і джерело — указані в позиції
+   *  (відомість МТЗ), а де їх нема, — з рядка коштів закупівлі, з якої прийшов прихід. */
+  function purReportIn() {
+    const year = String(purYear());
+    const ctx = purCtx();
+    const list = purRows(`${year}-01-01`, `${year}-12-31`);
+    const rows = list.map((x, i) => {
+      const l = purRcptLine(x.id, ctx);
+      return [i + 1, fmtDate(x.d), [x.t, numNo(x.no)].filter(Boolean).join(' '), x.from, x.code, x.name, x.uom, x.q, x.price, x.sum,
+        x.kekv || (l ? l.kekv : ''), x.kpkv || (l ? kpkvShort(l.kpkv) : ''), x.fund || (l ? l.fund : ''), purRcptText(x.id, ctx)];
+    });
+    const t = purTotal(list);
+    return toExcel({ file: `Що надійшло ${year}`, sheets: [Object.assign({ name: 'Що надійшло', orientation: 'landscape', top: [unitTop()],
+      title: `Надходження ззовні ${year} року`, head: [['№', 'Дата', 'Документ', 'Від кого', 'Код', 'Найменування', 'Од.', 'К-сть',
+        'Ціна, грн', 'Сума, грн', 'КЕКВ', 'КПКВ', 'Джерело', 'Закупівля']], widths: [5, 11, 20, 24, 8, 40, 6, 8, 12, 14, 8, 13, 22, 34],
+      rows, num: [7], money: [8, 9] },
+    list.length ? { total: ['', '', '', '', '', `Разом: документів ${t.docs}, позицій ${t.items}`, '', '', '', t.sum, '', '', '', ''] } : {})] });
+  }
+
+  const PIVOT_CUTS = [['fund', 'фонд'], ['community', 'громада'], ['kpkv', 'КПКВ'], ['kekv', 'КЕКВ'], ['exp', 'код видатків'],
+    ['purchase', 'закупівля'], ['party', 'постачальник'], ['month', 'місяць']];
+  const PIVOT_HEAD = ['Затверджено', 'Профінансовано', 'Зобов’язання', 'Поставлено', 'Використано', 'Залишок коштів', 'Без договору'];
+  const pivotNums = (g) => [g.approved, g.financed, g.committed, g.delivered, g.used, g.cashLeft, g.noContract];
+  const cutName = (k) => PIVOT_CUTS.find((c) => c[0] === k)[1];
+  /** Аркуш Excel зведення: розрізи, далі сім показників у гривнях (порожній розріз — «не вказано», показник, якого розріз не рахує, — «—»). */
+  function pivotSheet(groups, by) {
+    return { name: 'Зведення', orientation: 'landscape', top: [unitTop()], title: `Зведення коштів ${purYear()} року`,
+      subtitle: by.map(cutName).join(' · '), head: [by.map(cutName).concat(PIVOT_HEAD)],
+      widths: by.map(() => 24).concat(PIVOT_HEAD.map(() => 15)),
+      rows: groups.map((g) => g.vals.map((v) => v || 'не вказано').concat(pivotNums(g).map((x) => (x == null ? '—' : x / 100)))),
+      money: PIVOT_HEAD.map((_, i) => i + by.length) };
+  }
+  /** «Зведення коштів…»: розрізи на вибір, таблиця на екрані й та сама в Excel. */
+  function purPivotDialog() {
+    const facts = purPivotFacts(purCtx(), purYear());
+    let by = ['fund'];
+    const el = modalOpen(`Зведення коштів ${purYear()}`, `<div class="pad"><div data-pivot-cuts style="display:flex;flex-wrap:wrap;gap:6px">${PIVOT_CUTS.map(([k, label]) =>
+      `<label class="chip"><input type="checkbox" value="${k}"${by.includes(k) ? ' checked' : ''}> <span class="chip__value">${esc(label)}</span></label>`).join('')}</div>
+      <div data-pivot-table style="margin-top:10px;overflow:auto"></div>
+      <div style="padding-top:12px"><button class="btn btn--primary" type="button" data-pivot-xls>В Excel</button>
+        <button class="btn" type="button" data-md="close">Закрити</button></div></div>`);
+    const box = el.querySelector('.modal__box');
+    if (box) box.style.maxWidth = '1240px';                       // сім показників і кілька розрізів у 980 px не вмістяться
+    const draw = () => {
+      const groups = purPivot(facts, by);
+      const cut = (html, cls = '') => `<div class="${cls}c-txt" style="flex:1 0 110px;white-space:normal">${html}</div>`;
+      const num = (html, cls = '') => `<div class="${cls}c-num" style="width:112px">${html}</div>`;
+      const rows = groups.map((g) => `<div class="tbl__row tbl__row--plain">${g.vals.map((v) => cut(esc(v || 'не вказано'))).join('')}${
+        pivotNums(g).map((v) => num(v == null ? '—' : grnOf(v))).join('')}</div>`).join('')
+        || '<div class="tbl__row tbl__row--plain"><div class="c-txt">Даних за рік немає.</div></div>';
+      el.querySelector('[data-pivot-table]').innerHTML = `<div class="tbl" style="--tbl-min:${by.length * 110 + PIVOT_HEAD.length * 112 + 16}px">
+        <div class="tbl__head">${by.map((k) => cut(esc(cutName(k)), 'tbl__h ')).join('')}${PIVOT_HEAD.map((h) => num(esc(h), 'tbl__h ')).join('')}</div>${rows}</div>`;
+    };
+    el.querySelectorAll('[data-pivot-cuts] input').forEach((x) => x.addEventListener('change', () => {
+      by = PIVOT_CUTS.map((c) => c[0]).filter((k) => el.querySelector(`[data-pivot-cuts] input[value="${k}"]`).checked);
+      draw();
+    }));
+    el.querySelector('[data-pivot-xls]').addEventListener('click', () => toExcel({ file: `Зведення коштів ${purYear()}`,
+      sheets: [pivotSheet(purPivot(facts, by), by)] }));
+    draw();
+  }
+
+  // Відомість МТЗ бере джерело, КПКВ і КЕКВ приходу з рядка коштів його закупівлі (указане руками — першим). Поки жоден документ закупівель
+  // не пов'язаний з приходом, функція нічого не дає й відомість така, якою була. Значок меню рахує відомість на кожному показі, тож контекст
+  // закупівель, з якого вона бере рядок коштів, будується раз на показ (`renderSeq`) і лише знову, коли змінилося, скільки в стані приходів,
+  // документів, справ чи рядків коштів.
+  let mtzCtxMemo = { key: '', ctx: null };
+  mtzPurOf = () => {
+    if (!(store.purDocs || []).some((d) => (d.receipts || []).length)) return () => null;
+    const key = [renderSeq, docs.length, (store.purDocs || []).length, (store.purchases || []).length, (store.budget || []).length].join('|');
+    if (mtzCtxMemo.key !== key) mtzCtxMemo = { key, ctx: purCtx() };
+    const ctx = mtzCtxMemo.ctx;
+    return (id) => {
+      const l = purRcptLine(id, ctx);
+      return l ? { src: MTZ_SRC_OF_PUR[l.fund] || '', kpkv: kpkvShort(l.kpkv), kekv: l.kekv || '' } : null;
+    };
+  };
+
+  /** «з закупівлі …» для позиції: за кожним її приходом із закупівлі. */
+  function itemPurText(code) {
+    const ctx = purCtx();
+    const ids = [...new Set(docs.filter((r) => r.kind === 'in' && r.code === code && r.id).map((r) => r.id))];
+    return [...new Set(ids.map((id) => purRcptText(id, ctx)).filter(Boolean))].join('; ');
+  }
+  /** Закупівля одиниці: її власний прихід або єдиний прихід коду ззовні; кілька приходів із закупівель без власного — «закупівля не визначена». */
+  function unitPurText(u, code, ctx) {
+    const own = (unitMoves().get(String(u.id)) || []).filter((r) => r.kind === 'in' && r.id).sort((a, b) => (a.d < b.d ? -1 : 1))[0];
+    const ins = [...new Set(docs.filter((r) => r.kind === 'in' && r.code === code && r.id && !purCarry(r)).map((r) => r.id))];
+    const rid = own ? own.id : ins.length === 1 ? ins[0] : 0;
+    if (rid) return purRcptText(rid, ctx);
+    return ins.some((id) => purRcptText(id, ctx)) ? 'закупівля не визначена' : '';
+  }
+
+  /** Блок «Одиниці»: що прийшло за закупівлею (за її документами поставки, не за актами введення) і де воно зараз. */
+  PUR_BLOCKS.push((pu, ctx) => {
+    const bal = balances().map;
+    const delivered = new Set(rcptShares(ctx).filter((s) => s.purchase === pu.id).map((s) => s.rid));
+    const rows = [];
+    const rcpts = purRcpts(pu, ctx).filter((id) => delivered.has(id)).map((id) => ctx.rcpt.get(id)).filter(Boolean)
+      .sort((a, b) => (a.d < b.d ? -1 : a.d > b.d ? 1 : a.id - b.id));
+    for (const r of rcpts) {
+      for (const ln of r.lines) {
+        const it = itemBy.get(ln.code) || {};
+        const where = [...bal].filter(([k, v]) => k.startsWith(`${ln.code}|`) && v > 0)
+          .map(([k, v]) => `${k.slice(k.indexOf('|') + 1)} — ${fmtNum(v)}`).join('; ');
+        const shared = docs.some((x) => x.kind === 'in' && x.code === ln.code && x.id && x.id !== r.id && !purCarry(x));
+        rows.push(`<div class="tbl__row tbl__row--plain"><div class="c-code" style="width:80px"><a class="lnk" data-code="${esc(ln.code)}">${esc(ln.code)}</a></div>
+          <div class="c-name c-name--stack" style="flex:2 1 220px"><b>${esc(cleanName(it.name || ln.code))}</b><small>${esc(`${numNo(r.no)} від ${fmtDate(r.d)}`)}</small></div>
+          <div class="c-num" style="width:60px">${fmtNum(ln.q)}</div>
+          <div class="c-name c-name--stack" style="flex:2 1 220px"><b>${esc(where || 'немає на обліку')}</b>
+            <small>${shared ? 'разом з іншими надходженнями коду' : ''}</small></div></div>`);
+      }
+    }
+    return rows.length ? `<div class="card pur-block"><div class="card__head"><div class="card__title">Одиниці</div>
+        <span class="panel__count">де зараз</span></div><div class="tbl">${rows.join('')}</div></div>` : '';
+  });
+  // ЗВІТИ КОШТІВ: КІНЕЦЬ
 
   // ============================================================== ТОЧНІ ЧИСЛА
   /** Гроші й коефіцієнти відомості залишкової вартості рахуються точно, без двійкових дробів:
@@ -12829,6 +16385,8 @@
     reconId: state.reconId, docBack: state.docBack, stId: state.stId, stSub: state.stSub,
     peopleTab: state.peopleTab, personId: state.personId, subName: state.subName,
     paperId: state.paperId || null, paperVer: state.paperVer || 0,
+    purId: state.purId || null, purVer: state.purVer || null, budId: state.budId || null, purDocId: state.purDocId || null,
+    purYear: state.purYear || null,
     idx: (history.state && history.state.idx) || 0 });
   const canBack = () => !!(history.state && history.state.idx > 0);
 
@@ -12938,7 +16496,7 @@
       if (d.nav) {
         // Пункт книги ОП чи ТЗ відкриває свою книгу; фільтри іншої книги до неї не переходять.
         const book = d.book && d.book !== state.book
-          ? { book: d.book, group: '', assetF: '', onlyShort: false, movesKindF: '' } : d.book ? { book: d.book } : {};
+          ? Object.assign({ book: d.book }, BOOK_FILTERS_OFF) : d.book ? { book: d.book } : {};
         return go(d.nav, Object.assign({ q: '' }, NAV_ROOT[d.nav] || {}, book));
       }
       if (d.vw != null && !d.act) return openViewer(d.vwKey, d.vw);
@@ -12955,6 +16513,9 @@
       if (d.act && d.act.startsWith('mtz-')) return mtzAction(d.act, d);
       if (d.act && d.act.startsWith('f2-')) return form2Action(d.act, d);
       if (d.act && d.act.startsWith('pur-')) return purAction(d.act, d);
+      if (d.act && d.act.startsWith('bud-')) return budAction(d.act, d);
+      if (d.act && d.act.startsWith('pd-')) return pdAction(d.act, d);
+      if (d.act && d.act.startsWith('av-')) return avAction(d.act, d);
       if (d.act && /^(paper|val|yats)-/.test(d.act)) return paperAction(d.act, d);
       if (d.act && d.act.startsWith('imp-')) return impAction(d.act, d);
       if (d.act && /^(pp|ph|as|mvo|cmdr|off|loc)-|^file-add$/.test(d.act)) return peopleAction(d.act, d);
@@ -12964,7 +16525,7 @@
       if (d.act === 'dz-wr') return writeoffFromAct(d.id);
       // Назад до записів «Знищене майно», уже відібраних за номером рапорту.
       if (d.act === 'dz-open') return go('destroyed', { q: d.v || '' });
-      if (d.act === 'scan-del') return unlinkScan(d.path);
+      if (d.act === 'scan-del') return unlinkScan(d.path, d.folder || '');
       if (d.act === 'rc-new') return reconNew(d.sub);
       if (d.act === 'rc-open') return reconOpen(d.id);
       if (d.act === 'rc-xls') return reconExcel([reconById(d.id)]);
@@ -13050,6 +16611,7 @@
         if (!leaveEditing()) return null;
         state.formOpen = true;
         if (d.v) state.moveKind = d.v;
+        if (d.book && d.book !== state.book) Object.assign(state, { book: d.book }, BOOK_FILTERS_OFF);   // «Дописати» чернетку іншої книги: її книга, а фільтри — як у меню
         if (state.view !== 'moves') return go('moves', { formOpen: true });
         render();
         $('#doc-form')?.scrollIntoView({ block: 'start' });
@@ -13571,10 +17133,39 @@
 
   /** Незавершену чернетку — у бік, перш ніж форма отримає інший документ. */
   function stashDraft() {
-    if (!state.editing && state.draft && hasContent(state.draft)) {
+    if (!state.editing && !state.editingReport && state.draft && hasContent(state.draft)) {
       state.drafts = state.drafts || {};
       state.drafts[slotOf(state.draft.kind, state.draft.book || 'ТЗ')] = state.draft;
     }
+  }
+
+  /** «Зберегти чернетку»: чернетка лишається — просто прибираємо бланк з очей. Записуємо її одразу, а не за таймером: вікно можуть
+   *  закрити наступної миті. Відкладена чернетка вже не відкрита: `stashDraft` лишає її й у `state.draft`, а якби так лишилося, після
+   *  «Дописати» й проведення (`state.draft = null`) комірка віддала б проведену чернетку наступною формою — і в налаштуваннях вікна
+   *  вона лягала б знову (провести її можна було б удруге). Порожню чернетку (нічого вписати) не чіпаємо: її шапку підставила програма. */
+  function draftLater() {
+    stashDraft();
+    const d = state.draft;
+    if (d && (state.drafts || {})[slotOf(d.kind, d.book || 'ТЗ')] === d) state.draft = null;
+    keepDrafts();
+    state.formOpen = false;
+    render();
+  }
+
+  /** Місце під нову чернетку документа `kind` у книзі `book`. Незавершена чернетка тієї самої комірки (відкрита у формі чи вже
+   *  відкладена) замінюється лише за згодою (`ask` — питання); відкрита у формі чернетка іншої комірки лягає у свою. Питання — ДО
+   *  того, як щось відкладається: після «Скасувати» відкрита чернетка лишається лише у формі, а не ще й у комірці, звідки після
+   *  проведення вона поверталась би наступною чернеткою (і її можна було б провести вдруге, подвоївши залишок). false — людина
+   *  відмовилась, нічого не змінено. */
+  function freeDraftSlot(kind, book, ask) {
+    state.drafts = state.drafts || {};
+    const slot = slotOf(kind, book);
+    const open = !state.editing && !state.editingReport && state.draft && hasContent(state.draft) ? state.draft : null;
+    const clash = open && slotOf(open.kind, open.book || 'ТЗ') === slot ? open : state.drafts[slot];
+    if (clash && hasContent(clash) && !confirm(ask)) return false;
+    stashDraft();
+    delete state.drafts[slot];
+    return true;
   }
 
   /** Примітка рядка в обліку: підстава документа, його примітка й примітка рядка
@@ -13986,10 +17577,22 @@
   // ------------------------------------------------ власні позиції номенклатури
   /** Позиції, заведені в програмі. Прийшло нове обладнання — його треба мати в
    *  довіднику до того, як оприбуткувати: інакше в накладній його просто нема
-   *  чого обрати. Зберігаються разом з іншими внесеними даними. */
-  const ownItem = (r) => ({ code: String(r.code), name: r.name, group: r.group, unit: r.unit,
-    price: +r.price || 0, cat: 0, serial: '', chassis: '', year: 0, nonrev: r.nonrev ? 1 : 0, own: true,
+   *  чого обрати. Зберігаються разом з іншими внесеними даними.
+   *  Позиція будується із запису цілою: що він несе (номер ФЕС, примітка, старі коди,
+   *  архів, дободач, заводські дані й будь-яке майбутнє поле), те й лишається; вибраний
+   *  перелік полів губив решту, а правка картки записала б утрачене порожнім. */
+  const ownItem = (r) => Object.assign({ cat: 0, serial: '', chassis: '', year: 0, perRation: null }, r, {
+    code: String(r.code), price: +r.price || 0, nonrev: r.nonrev ? 1 : 0, own: true,
     fes: r.fes || '', note: r.note || '', old: r.old || '', archived: r.archived || '' });
+
+  /** Запис стану з позиції програми, що прийшла з довідником: усі її поля, крім службових полів сторінки
+   *  (`own`, `basePrice`); ціна — довідникова, а не обчислена з останнього приходу. */
+  const ownRecord = (i) => {
+    const rec = Object.assign({}, i, { price: i.basePrice ?? i.price, nonrev: !!i.nonrev });
+    delete rec.own;
+    delete rec.basePrice;
+    return rec;
+  };
 
   /** Позиції, заведені в програмі, приходять із бази разом з усіма іншими; тут
    *  лише підтримується робочий перелік між збереженнями — щойно заведену
@@ -14003,11 +17606,9 @@
     if (!itemsReady.has(store)) {
       itemsReady.add(store);
       const had = new Map((Array.isArray(store.items) ? store.items : []).map((r) => [String(r.code), r]));
+      // Запис береться з довідника цілим: номер ФЕС, примітка, старі коди, архів і дободач не губляться.
       for (const i of items) {
-        if (i.own && !had.has(i.code)) {
-          had.set(i.code, { code: i.code, name: i.name, group: i.group, unit: i.unit, price: i.price,
-                            nonrev: !!i.nonrev });
-        }
+        if (i.own && !had.has(i.code)) had.set(i.code, ownRecord(i));
       }
       store.items = [...had.values()];
     }
@@ -14290,12 +17891,12 @@ ${r.other ? r.name : it ? it.name : r.code} — ${fmtNum(r.qty)}, `
     const own = recs.every((x) => x.circ != null);
     const circ = own ? String(recs[0].circ || '') : '';
     const basis = circ.startsWith('підстава: ') ? circ.split('; ')[0].slice(10) : '';
-    stashDraft();
+    if (!freeDraftSlot('dz', 'ТЗ', 'Замінити незавершену чернетку рапорту?\n\nНаписане в ній буде втрачено.')) return;
     state.moveKind = 'dz';
     state.editing = null;
     state.editingReport = { docId: r.docId || 0, origin: r.origin || 'program', no: r.report || '', act0,
       ids: recs.map((x) => String(x.id).replace(/~w$/, '')), old: recs.map((x) => Object.assign({}, x)) };
-    state.draft = { kind: 'dz',
+    state.draft = { kind: 'dz', book: 'ТЗ',
       head: { type: 'Рапорт', no: r.report || '', date: r.date, from: r.sub, to: '', basis,
               note: basis ? circ.split('; ').slice(1).join('; ') : circ,
               report: '', reportDate: r.reportDate || '', act: act0 },
@@ -14305,7 +17906,7 @@ ${r.other ? r.name : it ? it.name : r.code} — ${fmtNum(r.qty)}, `
             offNo: x.offNo || '', offDate: x.offDate || '' }
         : { code: x.code, qty: String(x.qty), price: x.price != null ? String(x.price) : '',
             note: own ? x.lnote || '' : x.note || '', lot: '', unit: x.unit ? String(x.unit) : '' })).concat([emptyLine()]) };
-    go('moves', { q: '', formOpen: true });
+    go('moves', { q: '', formOpen: true, book: 'ТЗ' });
     $('#doc-form')?.scrollIntoView({ block: 'start' });
   }
 
@@ -14466,11 +18067,12 @@ ${r.other ? r.name : it ? it.name : r.code} — ${fmtNum(r.qty)}, `
     const mine = byCode.get(r.code + '|' + (r.unit || '')) || { qty: +r.qty || 0 };
     const holder = holderOf(r.code, r.sub, mine.qty, r.unit ? String(r.unit) : '');
     if (!leaveEditing()) return;
-    stashDraft();
+    if (!freeDraftSlot('wr', 'ТЗ', `Замінити незавершену чернетку «${KIND_NAME.wr}»?\n\nНаписане в ній буде втрачено.`)) return;
     state.moveKind = 'wr';
     state.editing = null;
     state.draft = {
       kind: 'wr',
+      book: 'ТЗ',
       head: {
         no: r.act, date: today(), from: holder.sub, to: '',
         basis: reports.length ? (reports.length > 1 ? 'рапорти №' : 'рапорт №') + reports.join(', №') : '',
@@ -14486,7 +18088,7 @@ ${r.other ? r.name : it ? it.name : r.code} — ${fmtNum(r.qty)}, `
         report: r.report || '', reportDate: r.reportDate || '', date: r.date, sub: r.sub, qty: total, n: same.length,
         moved: holder.why ? { was: r.sub, to: holder.sub, why: holder.why, stayed: holder.sub === r.sub } : null },
     };
-    go('moves', { q: '', formOpen: true });
+    go('moves', { q: '', formOpen: true, book: 'ТЗ' });
     $('#doc-form')?.scrollIntoView({ block: 'start' });
   }
 
@@ -14873,6 +18475,13 @@ ${r.other ? r.name : it ? it.name : r.code} — ${fmtNum(r.qty)}, `
     // Акт із чернетки «Списати актом…»: записи «Знищене майно» — за ним, як його провели.
     const src = k === 'wr' && !state.editing && d.src && d.src.kind === 'dz' ? d.src : null;
     if (src) linkDraftRecords(src, h);
+    // Акт приймання з «Прийняти поставку»: прихід пов'язується з ВН, а через неї — із закупівлею. Id документа прийде з відповіді сервера,
+    // тож зв'язок — за ключем документа (сервер знайде id сам).
+    const pur = k === 'in' && !state.editing && d.src && d.src.kind === 'pur' ? pdById(d.src.doc) : null;
+    if (pur) {
+      pur.receipts = (pur.receipts || []).concat([{ doc: 0, key: docKey('in', h.date, h.no, h.from, h.to || 'склад') }]);
+      logChange('поставку прийнято', `purdoc|${pur.id}`, `${h.no} від ${fmtDate(h.date)}`);
+    }
     const wasEditing = !!state.editing;
     const editedKey = state.editing;
     state.editing = null;
@@ -14885,6 +18494,7 @@ ${r.other ? r.name : it ? it.name : r.code} — ${fmtNum(r.qty)}, `
     }
     logDoc(k, h, lines, oldRows, editedKey, lock);
     if (editedKey && k !== 'dz') rekeyScans(editedKey, docKey(k, h.date, h.no, h.from, h.to || ''));
+    if (editedKey && k === 'in') rekeyPurLinks(editedKey, docKey('in', h.date, h.no, h.from, h.to || 'склад'));
     if (actLinked.length) relinkActs(actLinked, h.no);
     const kinds = cnt(lines.length, 'найменування', 'найменування', 'найменувань');
     const units = fmtNum(lines.reduce((a, x) => a + (x.other ? 0 : +x.qty || 0), 0));
@@ -14910,6 +18520,7 @@ ${r.other ? r.name : it ? it.name : r.code} — ${fmtNum(r.qty)}, `
       const posted = docKey(k, h.date, h.no, h.from, h.to);
       state.draft = {
         kind: k,
+        book: state.book,
         head: { type: h.type || '', no: nextDocNo(h.no), date: h.date, from: h.from, to: h.to,
                 basis: h.basis, report: '', reportDate: '', act: '', note: '', auto: true },
         lines: [emptyLine()],
@@ -14929,6 +18540,12 @@ ${r.other ? r.name : it ? it.name : r.code} — ${fmtNum(r.qty)}, `
     state.docBack = 'moves';
     state.docKey = docKey(k, h.date, h.no, h.from, h.to);
     go('doc');
+    // Поставка з ВН: картка «Закупівля» з'являється, щойно база дала id приходу (до того в картки приходу його нема); слово про проведення
+    // повертається разом із нею: перший показ його вже зняв.
+    if (pur) {
+      const shown = state.docKey;
+      flush().then(() => { if (state.view === 'doc' && state.docKey === shown) { state.flash = said; render(); } });
+    }
   }
 
   /** Наступний номер: остання група цифр +1 зі збереженням нулів попереду —
@@ -14988,14 +18605,7 @@ ${r.other ? r.name : it ? it.name : r.code} — ${fmtNum(r.qty)}, `
         if (back != null && state.draft) go('moves'); else render();
         break;
       }
-      case 'doc-later':
-        // Чернетка лишається — просто прибираємо бланк з очей. Записуємо її
-        // одразу, а не за таймером: вікно можуть закрити наступної миті.
-        stashDraft();
-        keepDrafts();
-        state.formOpen = false;
-        render();
-        break;
+      case 'doc-later': draftLater(); break;
       case 'only-mine': state.onlyMine = !state.onlyMine; state.movesLimit = 200; render(); break;
       case 'no-scan': state.noScan = !state.noScan; state.movesLimit = 200; render(); break;
       case 'more': state.movesLimit = (state.movesLimit || 200) + 200; render(); break;
@@ -15165,7 +18775,8 @@ ${r.other ? r.name : it ? it.name : r.code} — ${fmtNum(r.qty)}, `
         // довідники бази), тож лишаються: раніше скидання видаляло всі норми,
         // разом із табелями 21/Прод і 3/Прод із паперів.
         if (confirm('Видалити все внесене в програмі: документи, рапорти про знищення, нові позиції номенклатури, '
-          + 'звірки, інвентаризації, заміни в штаті, відомості залишкової вартості, акти ЯТС і підшиті скани?\n\n'
+          + 'звірки, інвентаризації, заміни в штаті, відомості залишкової вартості, акти ЯТС, закупівлі з коштами й '
+          + 'документами та підшиті скани?\n\n'
           + 'Документи й рапорти з паперових журналів служби (разом із виправленнями), норми штату, люди, МВО, '
           + 'дислокація й підрозділи лишаться як є. Поточний стан перед цим ляже в копії.')) {
           const base = (kind, arr) => (arr || []).filter((r) => rowOrigin(kind, r) === 'seed');
@@ -15174,9 +18785,10 @@ ${r.other ? r.name : it ? it.name : r.code} — ${fmtNum(r.qty)}, `
           store.destroyed = (store.destroyed || []).filter((x) => x.origin === 'seed');
           store.items = []; store.recon = []; store.subst = [];
           store.scans = []; store.inventories = []; store.papers = [];
+          store.budget = []; store.purchases = []; store.purDocs = [];
           mtzPrune();
           logChange('скинуто', '', 'внесене в програмі: документи, знищення, нові позиції, звірки, '
-            + 'інвентаризації, заміни й скани');
+            + 'інвентаризації, заміни, закупівлі й скани');
           mergeOwnItems(); save(true, true); refresh();
         }
         break;
@@ -15248,11 +18860,20 @@ ${r.other ? r.name : it ? it.name : r.code} — ${fmtNum(r.qty)}, `
       if (Array.isArray(j.items)) store.items = j.items;
       store.recon = Array.isArray(j.recon) ? j.recon : [];
       store.subst = Array.isArray(j.subst) ? j.subst : [];
-      store.scans = Array.isArray(j.scans) ? j.scans : [];
+      // Копія попередніх версій не знає закупівель (і лишає їх, див. нижче), а з ними — записів про їхні файли: самі файли
+      // лежать у теках служби й нікуди не ділися.
+      const copyScans = Array.isArray(j.scans) ? j.scans : [];
+      const knowsPurchases = ['budget', 'purchases', 'purDocs'].some((k) => Array.isArray(j[k]));
+      const kept = knowsPurchases ? [] : (store.scans || []).filter((f) => PUR_FILE_KEY.test(f.key)
+        && !copyScans.some((c) => c.key === f.key && c.path === f.path && (c.folder || '') === (f.folder || '')));
+      store.scans = copyScans.concat(kept);
       store.inventories = Array.isArray(j.inventories) ? j.inventories : [];
       // Відомості й акти: копія, що їх знає, повертає їх разом із затвердженими версіями; копія
       // попередніх версій програми їх не має — тоді теперішні лишаються як є.
       if (Array.isArray(j.papers)) { store.papers = j.papers; saving.papers = true; }
+      // Закупівлі так само: копія, що їх знає, повертає їх такими, якими вони були; копія попередніх версій їх не має —
+      // тоді теперішні лишаються (прибраний розділ порожнім зник би з бази за першим же записом).
+      for (const k of ['budget', 'purchases', 'purDocs']) if (Array.isArray(j[k])) store[k] = j[k];
       mtzPrune();
       for (const k of ['people', 'mvo', 'officials', 'locations', 'subs']) {
         if (Array.isArray(j[k])) store[k] = j[k]; else delete store[k];
@@ -16011,10 +19632,7 @@ ${r.other ? r.name : it ? it.name : r.code} — ${fmtNum(r.qty)}, `
     // store.ui, а тут вони повертаються — без цього вони «зберігалися», але
     // після перезапуску їх ніхто не показував.
     if (store.ui.drafts && typeof store.ui.drafts === 'object') {
-      state.drafts = {};
-      for (const [k, v] of Object.entries(store.ui.drafts)) {
-        if (v && v.head && Array.isArray(v.lines)) state.drafts[k] = JSON.parse(JSON.stringify(v));
-      }
+      state.drafts = restoreDrafts(store.ui.drafts);
       draftsSaved = JSON.stringify(state.drafts);
     }
     mergeOwnItems();
@@ -16031,11 +19649,8 @@ ${r.other ? r.name : it ? it.name : r.code} — ${fmtNum(r.qty)}, `
     checkFiles();                              // тихо: результат з'явиться в «Потребує уваги»
     // Незавершені документи з минулого разу — назад у форму.
     const kept = store.ui.drafts || {};
-    draftsSaved = JSON.stringify(kept);
-    state.drafts = {};
-    for (const [k, v] of Object.entries(kept)) {
-      if (v && v.lines && v.head) state.drafts[k] = JSON.parse(JSON.stringify(v));   // копія, не спільний об'єкт
-    }
+    draftsSaved = JSON.stringify(kept);                // що записано: розбіжність із відновленим (старий запис) перепишеться першим keepDrafts
+    state.drafts = restoreDrafts(kept);
     const nKept = Object.keys(state.drafts).length;
     window.addEventListener('beforeunload', (e) => {
       // Чернетка, що чекає на таймер, теж має піти в базу перед закриттям.
@@ -16081,11 +19696,11 @@ ${r.other ? r.name : it ? it.name : r.code} — ${fmtNum(r.qty)}, `
     } else if (sync.note) {
       toast(sync.note);
     } else if (nKept && !sync.fresh) {
-      const KIND_OF = { in: 'приходу', mv: 'переміщення', wr: 'списання', dz: 'рапорту про знищення' };
-      const kinds = Object.keys(state.drafts);
+      const list = Object.values(state.drafts);       // вид і книга — з чернетки: ключ комірки («in@ОП») видом документа не є
+      const kinds = list.map((v) => v.kind);
       state.moveKind = kinds.includes(state.moveKind) ? state.moveKind : kinds[0];
       toast(`Відновлено незавершен${nKept > 1 ? 'і чернетки' : 'у чернетку'} `
-        + `${kinds.map((k) => KIND_OF[k] || k).join(', ')}. Відкрийте «+ Новий документ».`);
+        + `${draftsWord(list)}. Відкрийте «+ Новий документ».`);
     }
   }
 

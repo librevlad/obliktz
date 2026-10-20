@@ -853,7 +853,7 @@ SIMPLE = {
                                     ("status", "status"), ("note", "note")]),
     "scans": ("app_file", [("id", "id"), ("key", "target"), ("date", "doc_date"), ("no", "doc_no"),
                            ("file", "file_name"), ("path", "rel_path"), ("mime", "mime"),
-                           ("size", "size_bytes")]),
+                           ("size", "size_bytes"), ("folder", "folder"), ("sha", "sha256")]),
 }
 
 
@@ -2408,9 +2408,9 @@ def _load_papers(con):
 
 # «mtz» — відомість МТЗ: джерело, КПКВ і КЕКВ надходжень, відмітки про подання.
 SETTINGS = ["ui", "unit", "baseSeen", "baseSig", "mtz", "fesPlaces"]
-# Налаштування, які веде сам сервер (теки ручного шляху, дата вивантаження книги ОП): у стан
-# вікна вони не йдуть, і запис вікна їх не стирає.
-SERVER_SETTINGS = ("folders", "op_book_export")
+# Налаштування, які веде сам сервер (теки ручного шляху, дата вивантаження книги ОП, відбитки книги
+# «Закупівлі», яку програма сама записала чи прийняла): у стан вікна вони не йдуть, і запис вікна їх не стирає.
+SERVER_SETTINGS = ("folders", "op_book_export", "pur_book_sha")
 # Розділи старих версій, які запис приймає й відкидає: номери актів до рапортів
 # і виправлення рапортів із бази тепер лежать у самих документах.
 RETIRED = {"dzActs", "reportFix"}
@@ -2473,8 +2473,10 @@ DIRECTORIES = {"people", "mvo", "cmdrs", "officials", "locations", "subs", "norm
 # Книга ОП і 2/Прод: статус ФЕС і поля документів, клітинки й записки 2/прод — свої таблиці;
 # прив'язки кодів, власні рядки 2/Прод і види контрагентів — правки довідників.
 OP_SECTIONS = {"docFes", "docMeta", "form2Cells", "form2Notes", "form2Map", "form2Own", "parties", "fesMap"}
-KNOWN = set(SIMPLE) | set(SETTINGS) | DIRECTORIES | RETIRED | OP_SECTIONS | {"docs", "recon", "inventories",
-                                                                             "subst", "log", "papers"}
+# Закупівлі: рядки коштів, закупівлі з версіями й документи до них — свої таблиці (purchases_db.py).
+PUR_SECTIONS = {"budget", "purchases", "purDocs"}
+KNOWN = (set(SIMPLE) | set(SETTINGS) | DIRECTORIES | RETIRED | OP_SECTIONS | PUR_SECTIONS
+         | {"docs", "recon", "inventories", "subst", "log", "papers"})
 
 
 # ------------------------------------------------------------------ публічне
@@ -2706,7 +2708,8 @@ SECTION_WORDS = {"docs": "документи", "people": "люди", "mvo": "М�
                  "cmdrs": "командири", "locations": "дислокація", "norms": "штат", "items": "номенклатура",
                  "units": "одиниці", "subs": "підрозділи", "destroyed": "знищене майно", "recon": "звірки",
                  "reconBase": "звірки", "inventories": "інвентаризації", "papers": "документи служби",
-                 "subst": "заміни", "scans": "файли", "mtz": "відомість МТЗ"}
+                 "subst": "заміни", "scans": "файли", "mtz": "відомість МТЗ", "budget": "кошти",
+                 "purchases": "закупівлі", "purDocs": "документи закупівель"}
 # Поля, де рядок «рррр-мм-дд» може бути номером чи назвою з паперу, а не датою.
 NOT_A_DATE = {"no", "offNo", "report", "act", "name", "tname", "note", "pnote", "text", "basis", "title",
               "file", "path", "id", "key"}
@@ -2809,6 +2812,10 @@ def _save_state(con, state, replace_papers=False, ui_key="ui"):
         # на які посилалися документи, щойно видалені цим самим записом.
         _save_subdivisions(con, state.get("subs"))
         _save_people(con, state.get("people"))
+        # Закупівлі — після документів і людей: приходи прив'язуються до вже записаних актів приймання,
+        # відповідальні — до людей, заведених цим самим записом.
+        import purchases_db                                 # noqa: PLC0415 — модуль сам імпортує state_db
+        purchases_db.save(con, state)
         _save_responsible(con, state.get("mvo"), state.get("officials"), state.get("cmdrs"))
         _save_locations(con, state.get("locations"))
         _save_items(con, state.get("items"))
@@ -2874,6 +2881,8 @@ def load_state(con, ui_key="ui"):
     state["form2Cells"] = _load_form2_cells(con)
     state["form2Notes"] = _load_form2_notes(con)
     state["fesMap"] = _load_fes_map(con)
+    import purchases_db                                     # noqa: PLC0415
+    state.update(purchases_db.load(con))
     state.update(_load_settings(con, ui_key))
     state = _legacy_reports(state)
     if not any(state["docs"].values()):
@@ -2887,7 +2896,8 @@ def is_empty(con):
     if n:
         return False
     for table in ("app_destroyed", "app_subst", "app_recon", "app_inventory",
-                  "app_file", "app_log", "app_setting", "app_paper"):
+                  "app_file", "app_log", "app_setting", "app_paper",
+                  "fund_line", "purchase", "pur_doc"):
         if con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]:
             return False
     return True

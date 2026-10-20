@@ -810,8 +810,10 @@ def _ensure_subs(con, model):
             else (d["src"],)
         unknown |= {n for n in names if n and n not in have and n not in aliases}
     if unknown:
-        raise BookError([f"невідоме місце «{n}»: додайте його в аркуш «Підрозділи» чи зіставте"
-                         for n in sorted(unknown)])
+        # У старій книзі аркуша «Підрозділи» немає: місце заводять у програмі чи зіставляють у вікні перенесення.
+        how = ("додайте його в аркуш «Підрозділи» книги чи заведіть у програмі («Підрозділи» → «+ Підрозділ»)"
+               if model["subs"] else "заведіть такий підрозділ («Підрозділи» → «+ Підрозділ») або зіставте його з наявним")
+        raise BookError([f"невідоме місце «{n}»: {how}" for n in sorted(unknown)])
 
 
 def _ensure_items(con, model):

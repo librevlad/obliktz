@@ -235,9 +235,11 @@ def migrate(extract_path, db_path) -> MigrationReport:
         _load_live(con, live, subs, nomen, cps, rep, price_of, keys)
         _apply_seed(con, rep, LATE_SEEDS)
         _apply_rules(con)
-        # Звірка з 3.0 бере на облік майно інших служб — позиції й вузли рахуємо після неї.
+        # Звірка з 3.0 бере на облік майно інших служб, а виправлення переносів заводять справжніх
+        # відправників — позиції, вузли й контрагентів рахуємо після них.
         rep.nomen = con.execute("SELECT COUNT(*) FROM nomen").fetchone()[0]
         rep.subdivisions = con.execute("SELECT COUNT(*) FROM subdivision").fetchone()[0]
+        rep.counterparties = con.execute("SELECT COUNT(*) FROM counterparty").fetchone()[0]
         _link_destroyed_to_writeoffs(con, rep)
         _collect_negatives(con, rep)
         con.commit()
@@ -261,6 +263,7 @@ CORRECTIONS = [
     "report_22509_1.sql",      # рапорт 22509/1: 4 термоси ТВН-12 у ВМТЗ 2 б ТрО, без списання
     "price_codes.sql",         # інша ціна — інший код: згорнуті коди з різними цінами знову окремі
     "fes_numbers_2026_09_28.sql",  # номери ФЕС позиціям без номера й нові назви місць ФЕС (28.09.2026)
+    "carryover_senders.sql",   # переноси 2022–2024 зі справжнім відправником за сканом (за переліком власника)
 ]
 
 

@@ -16,7 +16,7 @@ def _migrations_dir() -> Path:
 
 
 MIGRATIONS_DIR = _migrations_dir()
-APP_SCHEMA_VERSION = 26
+APP_SCHEMA_VERSION = 28
 
 
 class SchemaTooNewError(Exception):

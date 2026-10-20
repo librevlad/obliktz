@@ -55,6 +55,10 @@ def command(version_file):
             # Книга «Облік ОП», заявка на посуд і миючі, звірка з ФЕС.
             "--hidden-import", "op_book", "--hidden-import", "op_request",
             "--hidden-import", "op_fes", "--hidden-import", "fes_read",
+            # Закупівлі: папери пакета з коду, запис закупівель у базу, книга закупівель; відбиток файлів, який
+            # рахують і лаунчер, і папери (контейнер .xls без міток часу).
+            "--hidden-import", "purchase_papers", "--hidden-import", "purchases_db",
+            "--hidden-import", "purchases_book", "--hidden-import", "stable_hash",
             # Акт ЯТС складає python-docx: йому потрібні його шаблони документа.
             "--collect-data", "docx",
             "--hidden-import", "reports.form21", "--hidden-import", "reports.form2",

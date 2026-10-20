@@ -18,7 +18,7 @@
         "head": [["№", "Найменування", {"t": "Рух", "span": 3}], [...]],
         "widths": [6, 42, 10],
         "rows": [[1, "Термос ТВН-12", 2]],
-        "num": [2], "money": [], "total": ["Разом", "", 2],
+        "num": [2], "money": [], "pct": [], "total": ["Разом", "", 2],
         "after": ["Усього найменувань: 1."],
         "signs": ["Відпустив", "Прийняв"]}]}
 """
@@ -45,6 +45,8 @@ FMT_QTY = "#,##0.###"
 # Ціле — окремим форматом: «#,##0.###» в українському Excel показує 1 як «1,».
 FMT_QTY_INT = "#,##0"
 FMT_MONEY = "#,##0.00"
+# Частка (0,8092) у клітинці — відсотком: «80,92%». Значення лишається часткою, Excel лише показує її так, і формули над нею працюють.
+FMT_PCT = "0.00%"
 FMT_DATE = "dd.mm.yyyy"
 ISO_DATE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
 
@@ -116,6 +118,7 @@ def _fill_sheet(ws, sh: dict) -> None:
                 + [len(r) for r in sh.get("rows") or []] + [1])
     num = set(sh.get("num") or [])
     money = set(sh.get("money") or [])
+    pct = set(sh.get("pct") or [])
     r = 1
 
     def full_width(text, font, align, height=None):
@@ -171,6 +174,8 @@ def _fill_sheet(ws, sh: dict) -> None:
             cell.number_format, cell.alignment = FMT_DATE, A_TOP
         elif (c - 1) in money:
             cell.number_format, cell.alignment = FMT_MONEY, A_RIGHT
+        elif (c - 1) in pct:
+            cell.number_format, cell.alignment = FMT_PCT, A_RIGHT
         elif (c - 1) in num:
             cell.number_format, cell.alignment = qty_format(v), A_RIGHT
         else:
