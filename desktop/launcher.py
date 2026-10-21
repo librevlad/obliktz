@@ -152,10 +152,10 @@ _NET = {"cfg": None, "data": None}
 GATE = network.Gate()
 LAST_WRITE = {"who": "", "at": ""}
 # Що можна зробити лише на самому основному ПК: відновити базу з копії чи файла, зберегти
-# копію діалогом Windows, відкрити файл чи теку програмою цього ПК, змінити налаштування мережі,
-# шукати файли в теках служби за вмістом.
+# копію діалогом Windows, відкрити файл чи теку програмою цього ПК (і теку акта), змінити
+# налаштування мережі, шукати файли в теках служби за вмістом.
 HOST_ONLY = {"/api/restore", "/api/restore-file", "/api/copy", "/api/reveal", "/api/open", "/api/network",
-             "/api/folders", "/api/files-find"}
+             "/api/folders", "/api/files-find", "/api/op-act/reveal"}
 
 
 def net_cfg() -> dict:
@@ -518,7 +518,17 @@ FOLDERS = [
     ("purchases", "Закупівлі", "Закупівлі"),
     ("receipts", "Прибутково-видаткові документи", "Прибутково-видаткові документи"),
     ("fesRegisters", "Реєстри на ФЕС", "Реєстри на ФЕС"),
+    ("opActs", "Акти списання ОП", os.path.join("вивантаження", "Акти списання")),
+    ("dobovka", "Добовка", None),            # лише читання; типового значення немає — «Налаштування» → «Теки»
 ]
+# Теки, у які програма лише дивиться: Добовку читають інші програми служби за сталим шляхом, тож ні файла (/api/scan), ні
+# каталогу («Показати в теці» з `make`) там не створюється. Значення — відповідь на спробу.
+READ_ONLY_FOLDERS = {"dobovka": "Теку Добовки програма лише читає"}
+
+
+def _default_folder(default):
+    """Типова тека ключа: у «Дані обліку»; `None` — типового значення немає (порожній шлях, не «Дані обліку»)."""
+    return os.path.join(DATA, default) if default is not None else ""
 
 
 def _folders_set():
@@ -536,13 +546,13 @@ def folders() -> dict:
     out = {}
     for key, _label, default in FOLDERS:
         v = mine.get(key)
-        out[key] = v.strip() if isinstance(v, str) and v.strip() else os.path.join(DATA, default)
+        out[key] = v.strip() if isinstance(v, str) and v.strip() else _default_folder(default)
     return out
 
 
 def folders_listing() -> list:
     mine, have = _folders_set(), folders()
-    return [{"key": key, "label": label, "path": have[key], "default": os.path.join(DATA, default),
+    return [{"key": key, "label": label, "path": have[key], "default": _default_folder(default),
              "set": bool(isinstance(mine.get(key), str) and mine[key].strip())}
             for key, label, default in FOLDERS]
 
@@ -951,6 +961,17 @@ def app_data() -> bytes:
         raise StateBroken(f"не вдалося прочитати базу: {e}") from e
     _DATA_JS.update(version=version, body=body)
     return body
+
+
+ACT_WITHOUT_WAS = "У запиті немає даних акта з вікна. Оновіть сторінку."
+
+
+def _names_act(req):
+    """Запит називає наявний акт: `docId` не нуль і не порожнє. Те, що не число, — теж (op_acts відмовить словами)."""
+    try:
+        return bool(int(req.get("docId") or 0))
+    except (TypeError, ValueError, OverflowError):
+        return True
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1442,18 +1463,27 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(200, json.dumps(got, ensure_ascii=False).encode("utf-8"), MIME[".json"])
 
     def _op_export(self):
-        """Книга «Облік ОП» — у теку з налаштувань. Файл, у якому є внесене руками, чого немає в
-        базі, не перезаписується: спершу «Прийняти книгу…»."""
+        """Книга «Облік ОП» — у теку з налаштувань. Книгу, яку програма сама записала чи прийняла
+        (її відбиток байтів або вмісту запам'ятано: op_book.own_book — вміст пізнає її й після
+        «Зберегти» в Excel), перезаписує без звірки, хоч би облік у програмі за цей час змінився.
+        Іншу — лише коли в ній немає внесеного руками, чого немає в базі: нових і змінених
+        документів, нових позицій, нових актів, нових пунктів харчування, днів, яких у базі немає
+        такими (інакше 409: спершу «Прийняти книгу…»). Наявні акти й пункти, змінені в книзі,
+        бере «Прийняти книгу…»."""
         import op_book                                           # noqa: PLC0415
         path = os.path.join(folders()["opBook"], "Облік ОП.xlsx")
         with STATE_LOCK:
             con = db()
             if os.path.exists(path):
                 try:
-                    with open(path, "rb") as f:
-                        have = op_book.read_book(f.read())
-                    plan = op_book.diff(con, have)
-                    extra = plan["docs"]["new"] + plan["docs"]["changed"] + plan["items"]["new"]
+                    own, have = op_book.own_book(con, path)      # своя — за байтами, а після Excel — за вмістом
+                    extra = []
+                    if not own:
+                        plan = op_book.diff(con, have)
+                        days = plan["rations"]["fromBook"]
+                        extra = (plan["docs"]["new"] + plan["docs"]["changed"] + plan["items"]["new"] + plan["acts"]["new"]
+                                 + [f"Довідка · пункт харчування «{p}»" for p in plan["points"]["new"]]
+                                 + ([f"Дободачі · записів, яких немає в програмі: {days}"] if days else []))
                 except op_book.BookError as e:
                     extra = e.problems
                 except OSError as e:
@@ -1483,7 +1513,9 @@ class Handler(BaseHTTPRequestHandler):
         return d
 
     def _op_preview(self):
-        """Перегляд змін книги проти бази; файл лежить до «Прийняти» під своїм sha."""
+        """Перегляд змін книги проти бази; файл лежить до «Прийняти» під своїм sha, а поруч (<sha>.json) — відмінності,
+        які людина побачила: «Прийняти» звіряє з ними те, що прийом зробив би тепер (`_op_apply`). Sha — від вмісту
+        файла й показаних відмінностей разом, як у книги закупівель."""
         import hashlib                                           # noqa: PLC0415
         import op_book                                           # noqa: PLC0415
         n = int(self.headers.get("Content-Length", 0) or 0)
@@ -1497,18 +1529,27 @@ class Handler(BaseHTTPRequestHandler):
         except op_book.BookError as e:
             body = {"error": "книга не приймається", "problems": e.problems[:200]}
             return self._send(422, json.dumps(body, ensure_ascii=False).encode("utf-8"), MIME[".json"])
-        sha = hashlib.sha256(data).hexdigest()
-        with open(os.path.join(self._op_upload_dir(), sha + ".xlsx"), "wb") as f:
-            f.write(data)
         with STATE_LOCK:
             plan = op_book.diff(db(), model)
+        seen = _plan_text(plan)
+        sha = hashlib.sha256(data + b"\0" + seen.encode("utf-8")).hexdigest()
+        folder = self._op_upload_dir()
+        for name, content in ((sha + ".json", seen.encode("utf-8")), (sha + ".xlsx", data)):
+            with open(os.path.join(folder, name), "wb") as f:
+                f.write(content)
         body = {"ok": True, "sha": sha, "diff": plan, "places": op_book.legacy_places(model) if legacy else [],
                 "report": model.get("report", [])}
         return self._send(200, json.dumps(body, ensure_ascii=False).encode("utf-8"), MIME[".json"])
 
     def _op_apply(self):
         """Прийняти книгу: копія бази «перед прийомом книги ОП» (чи «перед перенесенням…»), тоді
-        книга ОП у базі стає такою, як у файлі. Усе або нічого."""
+        книга ОП у базі стає такою, як у файлі. Усе або нічого.
+
+        Книга лягає на базу, якою та стала після перегляду: інше вікно могло за цей час змінити облік
+        ОП, і прийом мовчки переписав би його. Тож під тим самим замком, що й прийом, відмінності
+        рахуються знову: не ті, що людина бачила (<sha>.json), — 409 з новими відмінностями, і нічого
+        не змінено (ні копії, ні прийому); файли застарілого перегляду прибираються. Прийнята книга
+        далі — своя (op_book.remember_sha): вивантаження перезапише її без звірки."""
         import op_book                                           # noqa: PLC0415
         try:
             n = int(self.headers.get("Content-Length", 0) or 0)
@@ -1516,27 +1557,48 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             req = {}
         sha = re.sub(r"[^0-9a-f]", "", str(req.get("sha") or ""))
-        path = os.path.join(self._op_upload_dir(), sha + ".xlsx")
-        if not sha or not os.path.exists(path):
+        folder = self._op_upload_dir()
+        path, seen_path = os.path.join(folder, sha + ".xlsx"), os.path.join(folder, sha + ".json")
+        seen = None
+        if sha and os.path.exists(path):
+            try:
+                with open(seen_path, encoding="utf-8") as f:
+                    seen = _plan_text(json.loads(f.read()))
+            except (OSError, ValueError):            # немає того, що бачили при перегляді, — звіряти нема з чим
+                seen = None
+        if seen is None:
             return self._send(400, "оберіть книгу ще раз: перегляд застарів".encode("utf-8"))
         with open(path, "rb") as f:
             data = f.read()
         legacy = bool(req.get("legacy"))
+        stale = None
         try:
             model = op_book.read_book(data, legacy=legacy)
-            if legacy:
-                model = op_book.normalize_legacy(model, req.get("mapping") or {})
             with STATE_LOCK:
                 con = db()
-                backup = named_backup(con, "перед перенесенням книги ОП" if legacy else "перед прийомом книги ОП")
-                plan = op_book.apply(con, model)
-                bump_state_version()
-                LAST_WRITE.update(who=self.who, at=time.strftime("%H:%M"))
+                now = op_book.diff(con, model)               # той самий перегляд: чим база стала тепер
+                if _plan_text(now) != seen:
+                    stale = now
+                else:
+                    mark = None if legacy else op_book.fingerprint(model)       # стара книга програмі своєю не стає
+                    if legacy:
+                        model = op_book.normalize_legacy(model, req.get("mapping") or {})
+                    backup = named_backup(con, "перед перенесенням книги ОП" if legacy else "перед прийомом книги ОП")
+                    plan = op_book.apply(con, model)
+                    if mark:
+                        with contextlib.suppress(sqlite3.Error):     # прийняту книгу далі вважаємо своєю: вона вся в базі
+                            op_book.remember_sha(con, stable_hash.stable_sha_bytes(data), mark)
+                    bump_state_version()
+                    LAST_WRITE.update(who=self.who, at=time.strftime("%H:%M"))
         except op_book.BookError as e:
             body = {"error": "книгу не прийнято", "problems": e.problems[:200]}
             return self._send(422, json.dumps(body, ensure_ascii=False).encode("utf-8"), MIME[".json"])
-        with contextlib.suppress(OSError):
-            os.remove(path)
+        for done in (path, seen_path):                       # прийнято чи застаріло — цей перегляд більше не потрібен
+            with contextlib.suppress(OSError):
+                os.remove(done)
+        if stale is not None:
+            body = {"error": "З часу перегляду облік ОП у програмі змінився. Перегляньте книгу ще раз.", "diff": stale}
+            return self._send(409, json.dumps(body, ensure_ascii=False).encode("utf-8"), MIME[".json"])
         body = {"ok": True, "diff": plan, "backup": os.path.basename(backup), "report": model.get("report", [])}
         return self._send(200, json.dumps(body, ensure_ascii=False).encode("utf-8"), MIME[".json"])
 
@@ -1753,7 +1815,8 @@ class Handler(BaseHTTPRequestHandler):
         «Показати в теці» показує й каталог: теку справи відкривають саму, а не за її першим файлом. Шлях — усередині кореня теки
         (ті самі перевірки, що й для файла: угору, диск, мережеве ім'я й посилання — відмова). У теці служби (з ключем) каталог за
         проханням `make` створюється, якщо його ще немає, — і показується; у «Дані обліку/скани» нічого не створюється. Створення
-        не залежить від OBLIK_NO_OPEN: той лише не дає Провіднику відкритися."""
+        не залежить від OBLIK_NO_OPEN: той лише не дає Провіднику відкритися. Теки з READ_ONLY_FOLDERS (Добовка) лише
+        показуються, якщо вони є: `make` для них ігнорується."""
         try:
             n = max(0, int(self.headers.get("Content-Length", 0)))
             spec = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
@@ -1767,7 +1830,7 @@ class Handler(BaseHTTPRequestHandler):
             root = folders().get(key) if key else os.path.join(DATA, "скани")
             if root:
                 try:
-                    full = dir_path(spec.get("path"), root, make=bool(key and spec.get("make")))
+                    full = dir_path(spec.get("path"), root, make=bool(key and key not in READ_ONLY_FOLDERS and spec.get("make")))
                 except OSError as e:
                     return self._send(500, f"теку не створено: {e}".encode("utf-8"))
                 is_dir = bool(full)
@@ -1804,7 +1867,8 @@ class Handler(BaseHTTPRequestHandler):
 
         З X-Folder-Key (ключ із FOLDERS) файл лягає в теку служби з налаштувань: у підтеку
         X-Folder (до чотирьох рівнів; без неї — у саму теку) під ім'ям X-Name, якщо воно дане.
-        Відповідь повертає ще й теку та відбиток вмісту (sha): за ним файл знаходять після перекладки."""
+        Відповідь повертає ще й теку та відбиток вмісту (sha): за ним файл знаходять після перекладки.
+        Теки з READ_ONLY_FOLDERS (Добовка) файлів не приймають: 403, і нічого не створюється."""
         n = int(self.headers.get("Content-Length", 0))
         if n <= 0 or n > MAX_SCAN:
             self._drain()
@@ -1822,10 +1886,12 @@ class Handler(BaseHTTPRequestHandler):
         if len(body) != n:
             # Браузер обірвав завантаження: обрізаний файл не зберігається.
             return self._send(400, "файл надійшов не повністю: завантаження перервано".encode("utf-8"))
+        key = unquote(self.headers.get("X-Folder-Key", "") or "").strip()
+        if key in READ_ONLY_FOLDERS:
+            return self._send(403, READ_ONLY_FOLDERS[key].encode("utf-8"))      # Добовка: ні файла, ні каталогу
         if ext not in SCAN_EXT:
             return self._send(415, BAD_TYPE.encode("utf-8"))
         year = date[:4] if re.match(r"\d{4}-\d{2}-\d{2}$", date) else time.strftime("%Y")
-        key = unquote(self.headers.get("X-Folder-Key", "") or "").strip()
         root = folders().get(key) if key else os.path.join(DATA, "скани")
         if key and not root:
             return self._send(400, f"невідома тека «{key}»".encode("utf-8"))
@@ -1873,22 +1939,30 @@ class Handler(BaseHTTPRequestHandler):
                   "sha": stable_hash.stable_sha_bytes(body)}
         self._send(200, json.dumps(answer, ensure_ascii=False).encode("utf-8"), MIME[".json"])
 
-    def _json_body(self, limit=MAX_JSON):
-        """Тіло запиту — об'єкт JSON; усе інше (порожнє, зіпсоване, не об'єкт) дає порожній об'єкт.
-        None — тіло понад `limit`: його вичитано й відкинуто, а відповідь 413 уже надіслано."""
+    def _read_json(self, limit):
+        """Тіло запиту, прочитане як JSON: (код, значення). 413 — тіло понад `limit` (його вичитано й відкинуто),
+        400 — не JSON чи не об'єкт, 200 — об'єкт (порожнє тіло — порожній об'єкт)."""
         try:
             n = int(self.headers.get("Content-Length", 0) or 0)
         except ValueError:
             n = 0
         if n > limit:
             self._drain()
-            self._send(413, "запит завеликий".encode("utf-8"))
-            return None
+            return 413, None
         try:
             got = json.loads(self.rfile.read(n).decode("utf-8") or "{}") if n > 0 else {}
         except (ValueError, RecursionError):                      # RecursionError: тисячі вкладених дужок
-            return {}
-        return got if isinstance(got, dict) else {}
+            return 400, None
+        return (200, got) if isinstance(got, dict) else (400, None)
+
+    def _json_body(self, limit=MAX_JSON):
+        """Тіло запиту — об'єкт JSON; усе інше (порожнє, зіпсоване, не об'єкт) дає порожній об'єкт.
+        None — тіло понад `limit`: його вичитано й відкинуто, а відповідь 413 уже надіслано."""
+        code, got = self._read_json(limit)
+        if code == 413:
+            self._send(413, "запит завеликий".encode("utf-8"))
+            return None
+        return got if code == 200 else {}
 
     def _folder_link(self, req):
         """Файл, покладений у теку служби руками: його розмір, відбиток і тип — для запису про нього.
@@ -1982,6 +2056,201 @@ class Handler(BaseHTTPRequestHandler):
         got["ok"] = True
         got["opened"] = False if self.remote else (open_file(full) if spec.get("open", True) else False)
         return self._send(200, json.dumps(got, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+
+    def _send_json(self, code, obj):
+        return self._send(code, json.dumps(obj, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+
+    def _object_body(self, limit=MAX_JSON):
+        """Тіло запиту — об'єкт JSON (той самий `_read_json`, що й у `_json_body`, але суворо). Не JSON чи не об'єкт — 400,
+        понад `limit` — 413: відповідь (JSON зі словами) тоді вже надіслано, а повертається None."""
+        code, got = self._read_json(limit)
+        if code != 200:
+            self._send_json(code, {"ok": False, "error": "Запит завеликий." if code == 413 else "Запит не прочитано."})
+            return None
+        return got
+
+    def _op_act(self, what):
+        """Акти списання за нормами: пропозиція (`preview`), складання й виправлення (`save`), файли пакета (`files`),
+        видалення (`delete`).
+
+        Виправлення (`save` з `docId`) і видалення вимагають `was` — яким акт був у вікні, коли його відкрили (номер і дата
+        не порожні): без нього 400. Інший акт під тим самим id чи акт, виправлений деінде, — 422 (op_acts).
+
+        Пакет паперів пише в базу записи про файли акта, тож версія стану змінюється після пакета, а не до нього. Акт уже
+        записано, а пакет не склався, — версія змінюється теж, а відповідь 500 каже, що акт збережено: файли добираються
+        «Перескласти файли». Для пропозиції, яку складено за типовим періодом (його не названо в запиті), період, що не
+        складається, — не відмова: вікно відкривається з типовими значеннями, без рядків і з причиною в `warnings`.
+
+        Файл пакета в теці правили чи склали руками (op_act_export.conflicts) — 409 з `changed`: «Зберегти» не записує
+        нічого (ні акта, ні файлів), «Перескласти файли» — файлів; `force: true` — людина погодилась переписати.
+        Видалення — як будь-якого документа: спершу копія бази (backup_state(force=True)); без копії акт не видаляється."""
+        import op_act_export                                     # noqa: PLC0415
+        import op_acts                                           # noqa: PLC0415
+        req = self._object_body()
+        if req is None:
+            return                                   # відповідь (400 чи 413) уже надіслано
+        if what == "delete" or (what == "save" and _names_act(req)):
+            was = req.get("was")
+            if not (isinstance(was, dict) and all(str(was.get(k) or "").strip() for k in ("number", "date"))):
+                return self._send_json(400, {"ok": False, "error": ACT_WITHOUT_WAS})
+        force = req.get("force") is True
+        out, saved = {"ok": True}, False
+        try:
+            with STATE_LOCK:
+                try:
+                    con = db()
+                except StateBroken as e:
+                    return self._send_json(500, {"ok": False, "error": str(e)})
+                if what == "preview":
+                    spec = dict(req)
+                    filled = not spec.get("from") or not spec.get("to")
+                    if filled:                           # період не названо: типовий — з дня після попереднього акта
+                        spec.update(op_acts.defaults(con, spec.get("series"), spec.get("point"),
+                                                     spec.get("date") or time.strftime("%Y-%m-%d")))
+                        issue = op_acts.point(con, spec["point"])["sub_kind"] == "склад"
+                        out.update(defaults={k: spec[k] for k in ("from", "to", "date", "number")},
+                                   signers=op_acts.default_signers(con, spec["point"], spec["date"]),
+                                   papers=op_acts.default_papers(spec["number"], spec["from"], spec["to"], spec["date"], issue))
+                    try:
+                        out.update(op_acts.compute(con, spec))
+                    except state_db.SaveError as e:
+                        if not filled:
+                            raise
+                        out.update(lines=[], warnings=[str(e)])      # напр. попередній акт уже сягає за дату нового
+                    return self._send_json(200, out)
+                if what == "delete":
+                    try:                                 # видалене — лише з копією бази, де воно ще є
+                        backup_state(force=True)
+                    except (OSError, sqlite3.Error) as e:            # людині — слова, текст помилки — у консоль
+                        print(f"Акт ОП/МЗ: копію бази перед видаленням не зроблено — {e!r}")
+                        return self._send_json(500, {"ok": False, "error": "Копію бази перед видаленням не зроблено: "
+                                                                          "перевірте місце на диску й доступ до теки копій. "
+                                                                          "Акт не видалено."})
+                    out["number"] = op_acts.delete(con, req.get("docId"), who=self.who, was=req.get("was"),
+                                                   locked=req.get("locked") is True)
+                    bump_state_version()
+                    LAST_WRITE.update(who=self.who, at=time.strftime("%H:%M"))
+                    return self._send_json(200, out)
+                if what == "save":
+                    if not force:                        # файл пакета правили руками — питання, перш ніж щось записати
+                        try:
+                            changed = op_act_export.conflicts(con, folders()["opActs"], str(req.get("series") or ""),
+                                                              str(req.get("date") or "")[:4],
+                                                              " ".join(str(req.get("number") or "").split()))
+                        except (KeyError, ValueError, OSError):
+                            changed = []                 # серія чи дата не ті — відмовить сам op_acts.save
+                        if changed:
+                            raise op_act_export.PackageConflict(changed)
+                    doc = op_acts.save(con, req, who=self.who)
+                    saved = True
+                    out.update(docId=doc, number=" ".join(str(req.get("number") or "").split()), sig=op_acts.sig_of(con, doc))
+                else:
+                    doc = req.get("docId")
+                try:
+                    out.update(op_act_export.write_package(con, doc, folders()["opActs"], force=force))
+                    saved = True                         # записи про файли пакета теж лягли в базу
+                finally:
+                    if saved:
+                        bump_state_version()
+                        LAST_WRITE.update(who=self.who, at=time.strftime("%H:%M"))
+        except op_act_export.PackageConflict as e:
+            body = {"ok": False, "error": str(e), "changed": e.changed}
+            if saved and "docId" in out:                 # акт записано, а файли — ні: вікно стає цим актом
+                body.update(docId=out["docId"], number=out["number"], sig=out["sig"],
+                            error=f"Акт {out['number']} збережено, а файли не переписано: {e}")
+            return self._send_json(409, body)
+        except state_db.SaveError as e:
+            if saved and "docId" in out:
+                return self._send_json(422, {"ok": False, "docId": out["docId"], "number": out["number"], "sig": out["sig"],
+                                             "error": f"Акт {out['number']} збережено, а файли не складено: {e}"})
+            return self._send_json(422, {"ok": False, "error": str(e)})
+        except Exception as e:                           # noqa: BLE001 — диск, права, шаблон, база: слова, а не обрив зв'язку
+            if not isinstance(e, (OSError, sqlite3.Error)):
+                traceback.print_exc()
+            why = str(e) if isinstance(e, (OSError, sqlite3.Error)) else f"{type(e).__name__}: {e}"
+            if saved and "docId" in out:                 # акт у базі лишився
+                return self._send_json(500, {"ok": False, "docId": out["docId"], "number": out["number"], "sig": out["sig"],
+                                             "error": f"Акт {out['number']} збережено, а файли не складено: {why}"})
+            return self._send_json(500, {"ok": False, "error": why})
+        if self.remote:
+            try:
+                out.update(remote_package(out["files"], os.path.basename(out["folder"])))
+            except OSError as e:
+                return self._send_json(500, {"ok": False, "docId": out.get("docId"), "number": out.get("number"),
+                                             "error": f"Файли складено, а для завантаження не підготовлено: {e}"})
+        return self._send_json(200, out)
+
+    def _op_act_reveal(self):
+        """«Відкрити теку» акта — на основному ПК; тека має лежати в теці актів із налаштувань."""
+        import op_act_export                                     # noqa: PLC0415
+        import op_acts                                           # noqa: PLC0415
+        req = self._object_body()
+        if req is None:
+            return
+        try:
+            with STATE_LOCK:
+                a = op_acts.act_of(db(), req.get("docId"))
+            root = folders()["opActs"]
+            folder = op_act_export.act_dir(root, a["series"], a["date"][:4], a["number"])
+            if not os.path.isdir(folder) or not _inside(os.path.realpath(root), os.path.realpath(folder)):
+                return self._send(404, "Теки акта ще немає: «Перескласти файли».".encode("utf-8"))
+            return self._send_json(200, {"ok": True, "opened": open_file(folder)})
+        except StateBroken as e:
+            return self._send(500, str(e).encode("utf-8"))
+        except state_db.SaveError as e:
+            return self._send(404, str(e).encode("utf-8"))
+        except Exception:                                # noqa: BLE001 — відповідь словами, а не обрив зв'язку
+            traceback.print_exc()                        # подробиці — у консоль
+            return self._send(500, "Теку акта не відкрито.".encode("utf-8"))
+
+    def _dobovka(self, what):
+        """Добовка — лише читання: вставка (текст із табуляціями) чи книга — найсвіжіша з теки «Добовка» або передана
+        в тілі запиту. Ні в Добовку, ні в базу нічого не пишеться: відповідь — що прочитано і чого не вдалося."""
+        import dobovka                                           # noqa: PLC0415
+        query = parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+        arg = lambda k: (query.get(k) or [""])[0]                # noqa: E731
+        out = {"ok": True}
+        try:
+            if what == "paste":
+                req = self._object_body(MAX_SCAN)
+                if req is None:
+                    return
+                # `end` — кінець періоду акта: стовпець чисел не пише днів після нього.
+                got = dobovka.parse_paste(str(req.get("text") or ""), req.get("start"), req.get("end"))
+                day, point = str(req.get("date") or ""), str(req.get("point") or "")
+            else:
+                try:
+                    n = int(self.headers.get("Content-Length", 0) or 0)
+                except ValueError:
+                    n = 0
+                if n > MAX_SCAN:
+                    self._drain()
+                    return self._send_json(413, {"ok": False, "error": "Файл завеликий (понад 40 МБ)."})
+                data = self.rfile.read(n) if n > 0 else b""
+                day, point = arg("date"), arg("point")
+                if not data:
+                    path = dobovka.newest(folders()["dobovka"])
+                    if not path:
+                        return self._send_json(404, {"ok": False, "error": "Теку Добовки не задано або в ній немає «Добовка*.xlsx»: "
+                                                                            "«Налаштування» → «Теки» → «Добовка»."})
+                    try:
+                        with open(path, "rb") as f:
+                            data = f.read()
+                        saved = time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(path)))
+                    except OSError as e:                     # тримає інша програма, немає доступу: слова — людині, шлях — у консоль
+                        print(f"Добовка: {path} не прочитано — {e}")
+                        return self._send_json(422, {"ok": False, "error": f"Файл «{os.path.basename(path)}» не прочитано: "
+                                                                            "його тримає інша програма чи немає доступу."})
+                    out.update(file=os.path.basename(path), saved=saved)
+                got = dobovka.read_file(data)
+            signers = got.pop("signers")
+            if day and point:
+                out["signersDate"], out["signersAt"] = dobovka.signers_for(signers, day, point)
+            out.update(got)
+        except Exception:                                # noqa: BLE001 — відповідь словами, а не обрив зв'язку
+            traceback.print_exc()                        # подробиці — у консоль
+            return self._send_json(400, {"ok": False, "error": "Добовку не прочитано."})
+        return self._send_json(200, out)
 
     def _ui_key(self):
         """Налаштування вікна (оформлення, чернетки) — свої в кожної людини."""
@@ -2087,6 +2356,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._folder_link(req) if route == "/api/folder-link" else self._files_find(req)
         if route == "/api/pur-paper":
             return self._pur_paper()
+        if route in ("/api/op-act/preview", "/api/op-act/save", "/api/op-act/files", "/api/op-act/delete"):
+            return self._op_act(route.rsplit("/", 1)[-1])
+        if route == "/api/op-act/reveal":
+            return self._op_act_reveal()
+        if route in ("/api/dobovka/read", "/api/dobovka/paste"):
+            return self._dobovka(route.rsplit("/", 1)[-1])
         if route != "/api/excel":
             return self._send(404, b"not found")
         try:
@@ -2202,7 +2477,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def _plan_text(plan):
-    """Відмінності книги «Закупівлі» від бази (`purchases_book.diff`) одним рядком JSON із відсортованими ключами: так
+    """Відмінності книги від бази (`purchases_book.diff`, `op_book.diff`) одним рядком JSON із відсортованими ключами: так
     порівнюються «що людина бачила при перегляді» й «що прийом зробив би тепер»."""
     return json.dumps(plan, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
 
@@ -2217,6 +2492,16 @@ def remote_any(path):
         shutil.copy2(path, copy)
         path = copy
     return remote_export(base, path)
+
+
+def remote_package(files, name):
+    """Файли акта для іншого ПК: копія в «вивантаження/<назва теки акта>» і zip цієї теки на завантаження."""
+    base = os.path.join(DATA, "вивантаження")
+    pkg = os.path.join(base, name)
+    os.makedirs(pkg, exist_ok=True)
+    for f in files:
+        shutil.copy2(f, os.path.join(pkg, os.path.basename(f)))
+    return remote_export(base, os.path.join(pkg, os.path.basename(files[0])))
 
 
 def remote_export(folder, path):

@@ -39,6 +39,7 @@ from openpyxl import Workbook, load_workbook                     # noqa: E402
 from openpyxl.styles import Alignment, Border, Font, Side        # noqa: E402
 from openpyxl.utils import get_column_letter                     # noqa: E402
 
+from desktop.excel_export import clean_workbook                  # noqa: E402
 from desktop.excel_names import save_book                        # noqa: E402
 
 FORM_CODE = "21/Прод"
@@ -383,7 +384,8 @@ def _root_id(con) -> int:
 
 def build_form21(con, subdivision_id: int, as_of: str, out_path) -> Report:
     rep = collect(con, subdivision_id, as_of)
-    wb = load_workbook(TEMPLATE)
+    # Автор бланка, хто його зберігав і коли друкував, — властивості файла штабу, а не форми частини.
+    wb = clean_workbook(load_workbook(TEMPLATE))
     ws = wb.active
     _fill(ws, rep)
     unit = _unit_code(con)
@@ -481,7 +483,7 @@ def save_form21_set(con, spec: dict, folder) -> str:
     save_breakdown(con, as_of, notes)
     taken = {path.name.lower(), notes.name.lower()}
     for title, rep in parts:
-        wb = load_workbook(TEMPLATE)
+        wb = clean_workbook(load_workbook(TEMPLATE))
         _fill(wb.active, rep)
         _name_sheet(wb.active, title, unit)
         name, n = (base if not title else base.replace(".xlsx", f" — {_file_part(title)}.xlsx")), 1
@@ -490,7 +492,7 @@ def save_form21_set(con, spec: dict, folder) -> str:
             name = base.replace(".xlsx", f" — {_file_part(title)} ({n}).xlsx")
         taken.add(name.lower())
         save_book(wb, out / name)
-    wb = load_workbook(TEMPLATE)
+    wb = clean_workbook(load_workbook(TEMPLATE))
     first = wb.active
     sheets = [first] + [_blank_copy(wb, first) for _ in parts[1:]]     # копії — поки бланк чистий
     for ws, (title, rep) in zip(sheets, parts):

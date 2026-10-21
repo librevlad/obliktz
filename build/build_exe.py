@@ -52,9 +52,13 @@ def command(version_file):
             "--hidden-import", "book47_export", "--hidden-import", "mtz_export",
             "--hidden-import", "history_import", "--hidden-import", "excel_names",
             "--hidden-import", "valuation_export", "--hidden-import", "techact_export",
-            # Книга «Облік ОП», заявка на посуд і миючі, звірка з ФЕС.
+            # Книга «Облік ОП», заявка на посуд і миючі, звірка з ФЕС; норми наказу №390 — одні для заявки й сторінки.
             "--hidden-import", "op_book", "--hidden-import", "op_request",
             "--hidden-import", "op_fes", "--hidden-import", "fes_read",
+            "--hidden-import", "op_norms",
+            "--hidden-import", "dobovka",
+            "--hidden-import", "op_acts",
+            "--hidden-import", "op_act_export",
             # Закупівлі: папери пакета з коду, запис закупівель у базу, книга закупівель; відбиток файлів, який
             # рахують і лаунчер, і папери (контейнер .xls без міток часу).
             "--hidden-import", "purchase_papers", "--hidden-import", "purchases_db",

@@ -1337,3 +1337,57 @@ details.fold > summary .fold__hint { font: 400 11px var(--sans); color: var(--mu
 .av-card .tbl__h { padding: 0 var(--gut) 9px; font: 600 9px var(--mono); }
 /* Поле закупівель, у якому не число (чи не обрано закупівлю): рамка червона, поки це не виправлять. */
 .pur-card input.is-bad, #pur-new input.is-bad, #modal input.is-bad, #modal select.is-bad { border-color: var(--bad); background: rgba(176, 58, 46, .06); }
+/* Рядок без даних (день без дободач): приглушений, але читається. */
+.tbl__row.is-dim { background: var(--card-2); }
+.is-dim, .tbl__row.is-dim > div { color: var(--mut-3); }
+/* Широке вікно (вікно акта: рядки й підписанти): ширше за вікно форми й не вище за екран — прокручується тіло вікна,
+   а смуга з назвою й ✕ лишається на місці. */
+.modal__box.modal__box--wide { max-width: min(1180px, 100%); max-height: 100%; }
+.viewer:has(.modal__box--wide) { padding-top: 22px; }
+/* Вікно акта списання за нормами. */
+.oa .form__grid { padding: 14px 0; }
+.oa .oa-head { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
+.oa .oa-rations { display: flex; align-items: center; gap: 10px; margin: 12px 0 10px; flex-wrap: wrap;
+  font: 400 12.5px var(--sans); color: var(--ink-3); }
+.oa .oa-rations b { font: 600 13px var(--sans); color: var(--ink); }
+.oa .oa-rations textarea { flex: 1 1 220px; min-width: 160px; height: 30px; resize: none; padding: 6px 9px;
+  border: 1px dashed var(--hover-bd); border-radius: 3px; font: 400 12px var(--sans); color: var(--ink); background: var(--card-2); }
+.oa .oa-rations textarea:focus { outline: none; border-color: var(--accent); background: var(--card); }
+.oa .oa-warn { margin: 0 0 10px; }
+.oa .oa-nonorm { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 0 0 10px; font: 400 12px var(--sans); color: var(--ink-3); }
+.oa .oa-lines { margin: 0 0 12px; }
+.oa .oa-lines .tbl__h { font: 600 9px var(--mono); }
+.oa .oa-lines .c-name { flex: 2 1 220px; }
+.oa .oa-sig { margin: 0 0 12px; border: 1px solid var(--bd); border-radius: 4px; }
+.oa .oa-sig > summary { padding: 10px 14px; }
+.oa-sig__body { padding: 4px 14px 12px; border-top: 1px solid var(--bd-2); }
+.oa .oa-row { display: grid; grid-template-columns: 190px minmax(0, 2fr) minmax(0, 1fr) minmax(0, 1.4fr); gap: 6px 8px;
+  align-items: center; margin-top: 6px; font: 500 12px var(--sans); color: var(--ink-2); }
+.oa .oa-row--paper { grid-template-columns: 190px 200px 170px; }
+.oa .oa-row--note { grid-template-columns: 190px minmax(0, 1fr); margin-top: 12px; }
+.oa .oa-row--h { margin-top: 10px; font: 600 9px var(--mono); letter-spacing: .5px; color: var(--mut-2); text-transform: uppercase; }
+.oa .oa-acts { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding-top: 12px; border-top: 1px solid var(--bd-2); }
+.oa .oa-msg { flex: 1 1 200px; min-width: 0; font: 400 12px/1.4 var(--sans); color: var(--ink-3); }
+.oa .oa-msg.num-bad { color: var(--bad); }
+/* Слово з дією (після оновлення сторінки): «Відкрити теку», посилання на файли акта. */
+.toast--act { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
+.toast a, .oa .oa-msg a { color: var(--accent); font-weight: 600; }
+/* «Дободачі»: поле вставки з Добовки, місяці з даними, таблиця «дата × пункти» (рядок «Разом» видно й над кінцем місяця). */
+.panel textarea[data-oa-paste] { flex: 1 1 260px; min-width: 200px; height: 30px; resize: none; padding: 6px 9px;
+  border: 1px dashed var(--hover-bd); border-radius: 3px; font: 400 12px var(--sans); color: var(--ink); background: var(--card-2); }
+.panel textarea[data-oa-paste]:focus { outline: none; border-color: var(--accent); background: var(--card); }
+.oa-months button.oa-has { font-weight: 700; }
+.oa-days .c-num { width: 86px; }
+.oa-days .tbl__h { font: 600 9px var(--mono); }
+.oa-days .tbl__h.c-num { overflow-wrap: break-word; }
+.oa-days .c-num input { width: 72px; text-align: right; }
+.oa-days .tbl__row.oa-manual .c-date::after { content: " ✎"; color: var(--mut-3); }
+.oa-days .tbl__row--total { position: sticky; bottom: 0; z-index: 2; }
+/* Під мишею рядок «Разом» лишається суцільним: правило «рядок без дії під мишею прозорий» сильніше за фон підсумку, і дні
+   таблиці просвічували б крізь прилиплий рядок. */
+.oa-days .tbl__row--total, .oa-days .tbl__row--total:hover, .oa-days .tbl__row--total:active { background: #f6f8f2; }
+/* Що впізнано в Добовці — перед «Прийняти». */
+.oa-dob > p { margin: 14px 0 10px; font: 400 12.5px/1.45 var(--sans); color: var(--ink-2); }
+.oa-dob > p small { color: var(--mut-2); }
+.oa-dob .field { margin-top: 10px; }
+.oa-dob .set-form__acts { gap: 8px; padding-top: 14px; }

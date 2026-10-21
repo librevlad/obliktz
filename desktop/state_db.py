@@ -14,6 +14,7 @@
 Поля, яких схема ще не знає, зберігаються в колонці `extra` — і не губляться.
 """
 import datetime
+import hashlib
 import json
 import re
 import sqlite3
@@ -1201,6 +1202,7 @@ def _save_items(con, rows):
     if rows is None:
         return
     groups = dict(con.execute("SELECT code, id FROM nomen_group"))
+    group_of = {row[0]: (row[1], row[2]) for row in con.execute("SELECT id, code, name FROM nomen_group")}      # id → (код, назва)
     # Група, якої немає, — перша група книги ТЗ: групи книги ОП теж у довіднику, і позиція
     # з невідомою групою не має опинитися серед посуду одноразового використання.
     tz = con.execute("SELECT id FROM nomen_group WHERE book = 'ТЗ' ORDER BY sort, code LIMIT 1").fetchone()
@@ -1228,12 +1230,27 @@ def _save_items(con, rows):
         for field, col in (("fes", "fes_code"), ("note", "note"), ("old", "old_code"), ("archived", "archived_at")):
             if field in rec:
                 cols[col] = str(rec.get(field) or "").strip() or None
-        # «Дободач» книги ОП — скільки добових видач покриває одиниця позиції.
+        # Норма на д/д позиції книги ОП — кількість одиниці позиції на одну добову видачу (порожньо — не задано).
         if "perRation" in rec:
             try:
                 cols["per_ration"] = float(rec["perRation"]) if rec["perRation"] not in (None, "") else None
             except (TypeError, ValueError):
                 cols["per_ration"] = None
+        # Рядок норми наказу 390, вибраний у картці (ключ op_norms.PER_RATION; порожньо — не вибрано): за ним акт ділить
+        # межу між кодами, а однакові числа різних рядків (тарілка мілка й виделка — по 3 шт) — різні межі.
+        if "normLine" in rec:
+            import op_norms                                 # noqa: PLC0415
+            try:
+                cols["norm_line"] = op_norms.line_key(rec["normLine"])
+            except ValueError:
+                raise SaveError(f"Позиція {code}: рядка норми «{rec['normLine']}» немає серед норм наказу 390.") from None
+            # Рядок норми — рядок групи позиції (посуд — ОП.1, серветки — ОП.2, миючі — ОП.3): позиція, групу якої змінили, а рядок
+            # лишився, і рядок чужої групи не приймаються — акт ділив би межу за рядком, якого в її групі немає. Пара, що вже
+            # лежить у базі такою (записана книгою чи старою сторінкою), не зупиняє інших записів: сторінка шле весь перелік.
+            line, (grp_code, grp_name) = op_norms.LINES.get(cols["norm_line"]), group_of.get(grp, ("", ""))
+            stored = con.execute("SELECT group_id, norm_line FROM nomen WHERE code = ?", (code,)).fetchone()
+            if line and line["group"] != grp_code and (stored is None or tuple(stored) != (grp, cols["norm_line"])):
+                raise SaveError(f"Позиція {code}: рядок норми «{line['name']}» не з групи «{grp_name}».")
         got = con.execute("SELECT id FROM nomen WHERE code = ?", (code,)).fetchone()
         if got:
             # Правка позиції з паперів служби (вид обліку, назва, одиниця) не
@@ -1329,6 +1346,269 @@ def _load_doc_fes(con):
                                     "register": r["register"] or "", "ref": r["fes_ref"] or "",
                                     "note": r["note"] or ""}
             for r in con.execute("SELECT * FROM document_fes ORDER BY document_id")}
+
+
+# ----------------------------------------------- пункти харчування й дободачі
+#
+# Пункт харчування — колонка аркуша «Пункти харчування» Добовки: з якого підрозділу списується майно
+# акта, як назвати їдальню в накладній і пункт у звірці. Дободачі — д/д пункту за день; номер витягу
+# й джерело дня (файл Добовки чи «вручну») — один на день для всієї частини.
+
+
+def _sub_by_app_id(con, app_id):
+    """Рядок підрозділу за ідентифікатором сторінки: «b12» — рядок бази 12, інакше `ext_id` заведеного в програмі."""
+    row_id = _row_id(app_id)
+    if row_id is not None:
+        got = con.execute("SELECT id FROM subdivision WHERE id = ?", (row_id,)).fetchone()
+        if got:
+            return got[0]
+    got = con.execute("SELECT id FROM subdivision WHERE ext_id = ?", (str(app_id),)).fetchone()
+    return got[0] if got else None
+
+
+def _point_place(con, rec, name, stored):
+    """Підрозділ пункту харчування (рядок `subdivision`). `subId` — ідентифікатор підрозділу на сторінці: за ним пункт іде
+    за своїм підрозділом, хоч би той змінив назву («Виправити назву», правка в рядку) — нічого більше перейменовувати не
+    треба. Запис без `subId` (вікно ще не перезавантажувалось, стан попередньої версії) — за назвою `sub`; назва, якої вже
+    немає, — колишня назва підрозділу (`subdivision_alias`): того, на якому пункт уже лежить (`stored`), чи єдиного такого."""
+    sid = str(rec.get("subId") or "").strip()
+    label = str(rec.get("sub") or "").strip()
+    if sid:
+        got = _sub_by_app_id(con, sid)
+        if got is None:
+            raise SaveError(f"Пункт харчування «{name}»: немає підрозділу «{label or sid}».")
+        return got
+    got = con.execute("SELECT id FROM subdivision WHERE name = ?", (label,)).fetchone()
+    if got:
+        return got[0]
+    was = {r[0] for r in con.execute("SELECT subdivision_id FROM subdivision_alias WHERE name = ?", (label,))} if label else set()
+    if stored in was:
+        return stored
+    if len(was) == 1:
+        return was.pop()
+    raise SaveError(f"Пункт харчування «{name}»: немає підрозділу «{label}».")
+
+
+def _save_points(con, recs):
+    """Пункти харчування ([{id, name, sub, subId, hall, title, closed}]): перелік повний. Рядок без id
+    пропускається; пункт з id, але без назви — відмова, а не тихе видалення разом з історією дободач;
+    назви не повторюються (без різниці регістру й зайвих пробілів). Підрозділ — за `subId` (_point_place): пункт іде за
+    підрозділом, хоч би той змінив назву. Назви й підрозділи перевіряються до першого запису."""
+    if recs is None:
+        return
+    if not isinstance(recs, list):
+        raise SaveError("Пункти харчування мають прийти переліком.")
+    stored = dict(con.execute("SELECT ext_id, subdivision_id FROM food_point"))
+    want, names = [], set()
+    for rec in recs:
+        if not isinstance(rec, dict):
+            continue
+        ext = str(rec.get("id") or "").strip()
+        if not ext:
+            continue
+        name = " ".join(str(rec.get("name") or "").split())
+        if not name:
+            raise SaveError("Пункт харчування без назви: впишіть назву.")
+        sub = _point_place(con, rec, name, stored.get(ext))
+        if name.lower() in names:
+            raise SaveError(f"Пункт харчування «{name}» уже є: назви пунктів не повторюються.")
+        names.add(name.lower())
+        want.append((ext, name, sub, rec.get("hall") or None, rec.get("title") or None, rec.get("closed") or None))
+    keep = {row[0] for row in want}
+    # Зайве — геть ДО запису: назву прибраного пункту новий може взяти в тому ж записі.
+    for ext, pid in con.execute("SELECT ext_id, id FROM food_point").fetchall():
+        if ext in keep:
+            continue
+        if con.execute("SELECT 1 FROM act WHERE point_id = ?", (pid,)).fetchone():
+            raise SaveError("Пункт харчування, за яким складено акти, не видаляють — його закривають.")
+        con.execute("DELETE FROM food_point WHERE id = ?", (pid,))
+    # Наявні пункти — на тимчасові назви однією командою: так назви двох пунктів можна поміняти місцями.
+    con.execute("UPDATE food_point SET name = char(1) || ext_id WHERE ext_id IN (SELECT value FROM json_each(?))",
+                (json.dumps(sorted(keep)),))
+    for row in want:
+        con.execute("""INSERT INTO food_point(ext_id, name, subdivision_id, hall, title, closed_at)
+                       VALUES(?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(ext_id) DO UPDATE SET name = excluded.name, subdivision_id = excluded.subdivision_id,
+                         hall = excluded.hall, title = excluded.title, closed_at = excluded.closed_at""", row)
+
+
+def _load_points(con):
+    """Пункти для сторінки: `sub` — теперішня назва підрозділу (для показу), `subId` — його ідентифікатор на сторінці
+    («b12» чи свій): за ним пункт і записується (_point_place)."""
+    return [_clean({"id": r["ext_id"], "name": r["name"], "sub": r["sub"], "subId": r["sub_ext"] or f"b{r['sub_id']}",
+                    "hall": r["hall"], "title": r["title"], "closed": r["closed_at"]})
+            for r in con.execute("""SELECT p.*, s.name AS sub, s.ext_id AS sub_ext, s.id AS sub_id FROM food_point p
+                                      JOIN subdivision s ON s.id = p.subdivision_id ORDER BY p.name""")]
+
+
+# Більше мільйона д/д за день не годує жоден пункт; межа ще й не дає числу переповнити базу
+# (запис у ціле колонки й суму днів акта).
+RATIONS_MAX = 1_000_000
+
+
+def _ration_day(day):
+    """День дободач: справжня дата «рррр-мм-дд» з роком у межах обліку; інакше відмова словами —
+    введене не зникає мовчки."""
+    day = str(day)
+    try:
+        ok = bool(_ISO_DATE.match(day)) and DATE_YEARS[0] <= datetime.date.fromisoformat(day).year <= DATE_YEARS[1]
+    except ValueError:
+        ok = False
+    if not ok:
+        raise SaveError(f"Дободачі: «{day}» — не дата або рік з опискою.")
+    return day
+
+
+def _whole_number(v):
+    """Ціле з того, що прийшло: ціле, ціле дійсне (608.0) чи текст із цілим; усе інше, зокрема «так/ні», — None."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float):
+        return int(v) if v.is_integer() else None
+    if isinstance(v, str) and re.fullmatch(r"[+-]?\d+", v.strip()):
+        try:
+            return int(v.strip())
+        except ValueError:                  # рядок з тисячами цифр Python у число не перетворює
+            return None
+    return None
+
+
+def _save_rations(con, recs):
+    """Д/д пунктів за день ({"<id пункту>|<дата>": число}): перелік повний. Ключ без «|» чи з пунктом,
+    якого немає, пропускається; дата не за календарем, число не ціле чи понад RATIONS_MAX — відмова
+    словами (тихо відкинуте число стерло б збережений день). День, що вже лежить у базі, проходить
+    як є: давня описка не зупиняє запис решти."""
+    if recs is None:
+        return
+    if not isinstance(recs, dict):
+        raise SaveError("Дободачі мають прийти словником.")
+    points = dict(con.execute("SELECT ext_id, id FROM food_point"))
+    have = {(r[0], r[1]): r[2] for r in con.execute("SELECT point_id, on_date, rations FROM ration_day")}
+    want = {}
+    for key, n in recs.items():
+        ext, bar, day = str(key).partition("|")
+        pid = points.get(ext)
+        if not bar or pid is None:
+            continue
+        if (pid, day) not in have:                 # день, що вже лежить у базі, запису не спиняє — як у _check_dates
+            day = _ration_day(day)
+        whole = _whole_number(n)
+        if whole is None:
+            raise SaveError(f"Дободачі {day}: потрібне ціле число.")
+        if whole < 0:
+            raise SaveError(f"Дободачі {day}: число не може бути від'ємним.")
+        if whole > RATIONS_MAX:
+            raise SaveError(f"Дободачі {day}: число завелике.")
+        want[(pid, day)] = whole
+    for k in have.keys() - want.keys():
+        con.execute("DELETE FROM ration_day WHERE point_id = ? AND on_date = ?", k)
+    for k, n in want.items():
+        if have.get(k) != n:
+            con.execute("""INSERT INTO ration_day(point_id, on_date, rations) VALUES(?, ?, ?)
+                           ON CONFLICT(point_id, on_date) DO UPDATE SET rations = excluded.rations""", (*k, n))
+
+
+def _load_rations(con):
+    return {f"{r[0]}|{r[1]}": r[2] for r in con.execute(
+        "SELECT p.ext_id, d.on_date, d.rations FROM ration_day d JOIN food_point p ON p.id = d.point_id")}
+
+
+def _save_ration_dates(con, recs):
+    """Витяг і джерело дня ({"<дата>": {"order", "src"}}): перелік повний. Дата не за календарем — відмова
+    словами, крім дня, що вже лежить у базі."""
+    if recs is None:
+        return
+    if not isinstance(recs, dict):
+        raise SaveError("Дні дободач мають прийти словником.")
+    stored = {r[0] for r in con.execute("SELECT on_date FROM ration_date")}
+    want = {}
+    for day, rec in recs.items():
+        day = str(day) if str(day) in stored else _ration_day(day)       # збережений день проходить як є
+        if not isinstance(rec, dict):
+            continue
+        order = str(rec.get("order") or "").strip() or None
+        src = str(rec.get("src") or "").strip() or None
+        if order or src:
+            want[str(day)] = (order, src)
+    con.execute("DELETE FROM ration_date WHERE on_date NOT IN (SELECT value FROM json_each(?))", (json.dumps(list(want)),))
+    for day, (order, src) in want.items():
+        con.execute("""INSERT INTO ration_date(on_date, order_no, source) VALUES(?, ?, ?)
+                       ON CONFLICT(on_date) DO UPDATE SET order_no = excluded.order_no, source = excluded.source""",
+                    (day, order, src))
+
+
+def _load_ration_dates(con):
+    return {r["on_date"]: _clean({"order": r["order_no"], "src": r["source"]})
+            for r in con.execute("SELECT * FROM ration_date ORDER BY on_date")}
+
+
+# ----------------------------------------------- акти списання за нормами (лише читання)
+
+def _load_acts(con):
+    """Акти ({"<id документа>": {...}}): складає й править їх сервер (api/op-act), сторінка лише читає."""
+    # «Дні змінилися» — лише коли є і д/д акта, і дні в базі, а сума днів інша: акт з книги без днів чи
+    # акт не за нормою (д/д 0) не позначаються, а нестачу днів показує вікно акта.
+    acts = {}
+    for r in con.execute("""SELECT a.*, p.ext_id AS point,
+                                   (SELECT COALESCE(SUM(x.rations), 0) FROM ration_day x
+                                     WHERE x.point_id = a.point_id AND x.on_date BETWEEN a.period_from AND a.period_to) AS now
+                              FROM act a LEFT JOIN food_point p ON p.id = a.point_id"""):
+        acts[str(r["document_id"])] = {
+            "kind": r["kind"], "series": r["series"], "point": r["point"] or "", "from": r["period_from"],
+            "to": r["period_to"], "rations": r["rations"], "offNorm": bool(r["off_norm"]),
+            "daysChanged": bool(r["rations"]) and bool(r["now"]) and r["now"] != r["rations"],
+            "note": r["note"] or "", "papers": {}, "signers": [], "norms": {}}
+    for r in con.execute("SELECT * FROM act_paper"):
+        if str(r["document_id"]) in acts:
+            acts[str(r["document_id"])]["papers"][r["role"]] = {"no": r["number"] or "", "date": r["doc_date"] or ""}
+    for r in con.execute("SELECT * FROM act_signer ORDER BY document_id, role, sort"):
+        if str(r["document_id"]) in acts:
+            acts[str(r["document_id"])]["signers"].append({"role": r["role"], "sort": r["sort"], "pos": r["position"] or "",
+                                                           "rank": r["rank"] or "", "name": r["name"] or ""})
+    for r in con.execute("SELECT i.document_id, n.code, i.norm FROM act_item i JOIN nomen n ON n.id = i.nomen_id"):
+        if str(r["document_id"]) in acts:
+            acts[str(r["document_id"])]["norms"][r["code"]] = r["norm"]
+    for a in acts.values():
+        a["sig"] = _act_sig(a)
+    return acts
+
+
+def _act_sig(act):
+    """Відбиток того в акті, чого номер, дата й період не показують: серія, пункт, підписанти, папери, примітка. Вікно акта
+    повертає його у `was.sig`: вікно, відкрите до правки в іншому вікні, тих правок не перепише (op_acts._same_act)."""
+    body = [act.get("series"), act.get("point"), act.get("note") or "", act.get("papers") or {},
+            sorted([s.get("role"), s.get("sort"), s.get("pos"), s.get("rank"), s.get("name")] for s in act.get("signers") or [])]
+    text = json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _check_act_docs(con, docs):
+    """Документ акта за нормами правлять лише у вікні акта: кількість у ньому — за нормою, а сторінка її не рахує."""
+    if docs is None:
+        return
+    acts = {r[0] for r in con.execute("SELECT document_id FROM act")}
+    sent = {}
+    for r in (docs or {}).get("writeoffs") or []:
+        doc = _doc_key(r[10]) if len(r) > 10 else None
+        if doc in acts:
+            sent.setdefault(doc, []).append(r)
+    if not sent:
+        return
+    have = {}
+    for r in _load_docs(con).get("writeoffs", []):
+        doc = _doc_key(r[10]) if len(r) > 10 else None
+        if doc in sent:
+            have.setdefault(doc, []).append(r)
+
+    def sig(rows):
+        return sorted((str(x[0]), str(x[2]).strip(), str(x[3]), str(x[4] or ""), str(x[5]), _milli(x[6])) for x in rows)
+
+    for doc, rows in sent.items():
+        if sig(rows) != sig(have.get(doc, [])):
+            raise SaveError(f"Акт №{str(rows[0][2]).strip()} від {rows[0][0]} змінюють у вікні акта: "
+                            "«Посуд і миючі» → «Акти списання».")
 
 
 def _save_doc_meta(con, recs):
@@ -2408,9 +2688,9 @@ def _load_papers(con):
 
 # «mtz» — відомість МТЗ: джерело, КПКВ і КЕКВ надходжень, відмітки про подання.
 SETTINGS = ["ui", "unit", "baseSeen", "baseSig", "mtz", "fesPlaces"]
-# Налаштування, які веде сам сервер (теки ручного шляху, дата вивантаження книги ОП, відбитки книги
-# «Закупівлі», яку програма сама записала чи прийняла): у стан вікна вони не йдуть, і запис вікна їх не стирає.
-SERVER_SETTINGS = ("folders", "op_book_export", "pur_book_sha")
+# Налаштування, які веде сам сервер (теки ручного шляху, дата вивантаження книги ОП, відбитки книг
+# «Закупівлі» й «Облік ОП», які програма сама записала чи прийняла): у стан вікна вони не йдуть, і запис вікна їх не стирає.
+SERVER_SETTINGS = ("folders", "op_book_export", "pur_book_sha", "op_book_sha")
 # Розділи старих версій, які запис приймає й відкидає: номери актів до рапортів
 # і виправлення рапортів із бази тепер лежать у самих документах.
 RETIRED = {"dzActs", "reportFix"}
@@ -2472,7 +2752,10 @@ ONE_TIME = {"invIssue"}
 DIRECTORIES = {"people", "mvo", "cmdrs", "officials", "locations", "subs", "norms", "items"}
 # Книга ОП і 2/Прод: статус ФЕС і поля документів, клітинки й записки 2/прод — свої таблиці;
 # прив'язки кодів, власні рядки 2/Прод і види контрагентів — правки довідників.
-OP_SECTIONS = {"docFes", "docMeta", "form2Cells", "form2Notes", "form2Map", "form2Own", "parties", "fesMap"}
+# Акти списання за нормами: пункти харчування, дободачі й дні дободач — свої таблиці; акти (`acts`)
+# сторінка лише читає — складає й править їх сервер.
+OP_SECTIONS = {"docFes", "docMeta", "form2Cells", "form2Notes", "form2Map", "form2Own", "parties", "fesMap",
+               "points", "rations", "rationDates", "acts"}
 # Закупівлі: рядки коштів, закупівлі з версіями й документи до них — свої таблиці (purchases_db.py).
 PUR_SECTIONS = {"budget", "purchases", "purDocs"}
 KNOWN = (set(SIMPLE) | set(SETTINGS) | DIRECTORIES | RETIRED | OP_SECTIONS | PUR_SECTIONS
@@ -2517,6 +2800,7 @@ _REFUSALS = [
     ("NOT NULL constraint failed: commander.valid_from", "у призначенні командира підрозділу не вказано дату"),
     ("NOT NULL constraint failed: official.valid_from", "у призначенні посадовця не вказано дату"),
     ("instance.nomen_id, instance.serial_no", "у цієї позиції вже є одиниця з таким заводським номером"),
+    ("food_point.name", "два пункти харчування з однаковою назвою — назви пунктів не повторюються"),
     ("FOREIGN KEY constraint failed", "запис потрібен іншим записам обліку (документам, описам, призначенням), "
                                       "тож прибрати його не можна"),
 ]
@@ -2709,7 +2993,8 @@ SECTION_WORDS = {"docs": "документи", "people": "люди", "mvo": "М�
                  "units": "одиниці", "subs": "підрозділи", "destroyed": "знищене майно", "recon": "звірки",
                  "reconBase": "звірки", "inventories": "інвентаризації", "papers": "документи служби",
                  "subst": "заміни", "scans": "файли", "mtz": "відомість МТЗ", "budget": "кошти",
-                 "purchases": "закупівлі", "purDocs": "документи закупівель"}
+                 "purchases": "закупівлі", "purDocs": "документи закупівель", "points": "пункти харчування",
+                 "rations": "дободачі", "rationDates": "дні дободач"}
 # Поля, де рядок «рррр-мм-дд» може бути номером чи назвою з паперу, а не датою.
 NOT_A_DATE = {"no", "offNo", "report", "act", "name", "tname", "note", "pnote", "text", "basis", "title",
               "file", "path", "id", "key"}
@@ -2799,6 +3084,8 @@ def _save_state(con, state, replace_papers=False, ui_key="ui"):
         _save_parties(con, state.get("parties"))
         # Документ не змішує книги: техзасоби й посуд з миючими — різні документи.
         _check_books(con, state.get("docs"))
+        # Документ акта за нормами правлять лише у вікні акта: кількість у ньому — за нормою.
+        _check_act_docs(con, state.get("docs"))
         # Документи переписуються не всі підряд, а лише ті, що змінилися: інакше
         # кожне збереження тягло б за собою весь облік — і в журнал аудиту, і в
         # розмір файла.
@@ -2828,6 +3115,10 @@ def _save_state(con, state, replace_papers=False, ui_key="ui"):
         _save_form2_cells(con, state.get("form2Cells"))
         _save_form2_notes(con, state.get("form2Notes"))
         _save_fes_map(con, state.get("fesMap"))
+        # Пункти харчування — до дободач: підрозділи вже записані, а д/д лягають на пункт цього ж запису.
+        _save_points(con, state.get("points"))
+        _save_rations(con, state.get("rations"))
+        _save_ration_dates(con, state.get("rationDates"))
         _save_inv_issue(con, state.get("invIssue"))
         _save_inv_moves(con, state.get("invMoves"))
         # Рапорти — після документів: номер акта знаходить уже проведений акт.
@@ -2881,6 +3172,10 @@ def load_state(con, ui_key="ui"):
     state["form2Cells"] = _load_form2_cells(con)
     state["form2Notes"] = _load_form2_notes(con)
     state["fesMap"] = _load_fes_map(con)
+    state["points"] = _load_points(con)
+    state["rations"] = _load_rations(con)
+    state["rationDates"] = _load_ration_dates(con)
+    state["acts"] = _load_acts(con)
     import purchases_db                                     # noqa: PLC0415
     state.update(purchases_db.load(con))
     state.update(_load_settings(con, ui_key))
@@ -2897,7 +3192,7 @@ def is_empty(con):
         return False
     for table in ("app_destroyed", "app_subst", "app_recon", "app_inventory",
                   "app_file", "app_log", "app_setting", "app_paper",
-                  "fund_line", "purchase", "pur_doc"):
+                  "fund_line", "purchase", "pur_doc", "food_point", "ration_day", "ration_date"):
         if con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]:
             return False
     return True

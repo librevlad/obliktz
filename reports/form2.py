@@ -252,12 +252,14 @@ def _commander(con, cut):
 
 def save_package(con, spec, root):
     """Бланк А2788 з графами з бази, розшифровки 12/13/14/16/17 переліком і «Перевірки»."""
+    from desktop.excel_export import clean_workbook               # noqa: PLC0415
     from reports.form21 import _signers, _unit_code               # noqa: PLC0415
     year = int(spec["year"])
     rep = collect(con, year, spec.get("asOf") or None)
     unit = _unit_code(con)
     cut = (datetime.date.fromisoformat(rep["as_of"]) + datetime.timedelta(days=1)).isoformat()
-    wb = load_workbook(TEMPLATE)
+    # Автор бланка, хто його зберігав і коли друкував, — властивості файла штабу, а не звіту частини.
+    wb = clean_workbook(load_workbook(TEMPLATE))
     ws = wb[SHEET]
     pos, rank, name = _commander(con, cut)
     subst = {"{Р+1}": str(year + 1), "{Р}": str(year), "{ЧАСТИНА}": unit or "А____",

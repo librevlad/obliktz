@@ -24,7 +24,9 @@ if hasattr(sys.stdout, "reconfigure"):
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path[:0] = [ROOT, HERE]
+sys.path.insert(0, os.path.join(ROOT, "desktop"))
 
+import op_norms                                         # noqa: E402  (норми наказу №390 — для сторінки: D.opNorms)
 from build.version import APP_VERSION, APP_VERSION_DATE   # noqa: E402
 from db.connect import current_version, open_db, close_db   # noqa: E402
 
@@ -53,7 +55,7 @@ def items_of(con):
     for r in con.execute("""
             SELECT n.id, n.code, n.name, g.code AS grp, u.code AS uom,
                    n.is_fixed_asset, n.source, n.fes_code, n.note, n.old_code, n.archived_at,
-                   n.per_ration, COALESCE(p.price_kop, n.app_price_kop) AS price_kop
+                   n.per_ration, n.norm_line, COALESCE(p.price_kop, n.app_price_kop) AS price_kop
               FROM nomen n
               JOIN nomen_group g ON g.id = n.group_id
               JOIN uom u ON u.id = n.uom_id
@@ -73,8 +75,9 @@ def items_of(con):
             # Примітка картки, коди з «Облік ТЗ 3.0», згорнуті в позицію, і дата,
             # з якої позиція в архіві (її не пропонують у нових документах).
             r["note"] or "", r["old_code"] or "", r["archived_at"] or "",
-            # «Дободач» книги ОП: скільки добових видач покриває одиниця (порожньо — не задано).
-            r["per_ration"],
+            # Норма на одну добову видачу позиції книги ОП, у кількості одиниці позиції (порожньо — не задано), і рядок
+            # норми наказу 390, вибраний у картці (ключ op_norms.PER_RATION; порожньо — не вибрано).
+            r["per_ration"], r["norm_line"] or "",
         ])
     return out
 
@@ -533,7 +536,7 @@ def payload(con) -> dict:
     "groups": groups,
     "itemCols": ["code", "name", "group", "unit", "price", "cat",
                  "serial", "chassis", "year", "nonrev", "own", "fes", "note", "old", "archived",
-                 "perRation"],
+                 "perRation", "normLine"],
     "items": items,
     "subCols": ["name", "parent", "kind", "depth", "sort", "used", "active", "note", "id", "refs"],
     "subs": subs,
@@ -566,6 +569,9 @@ def payload(con) -> dict:
     "form2Map": form2_map,
     "form2Submitted": form2_sub,
     "parties": parties_of(con),
+    # Норми наказу №390 — одне джерело (desktop/op_norms.py): вибір норми на д/д у картці позиції ОП,
+    # заявка на 30 днів, кроки груп.
+    "opNorms": op_norms.page_data(),
     "respCols": ["sub", "name", "position"],
     "responsible": responsible,
     "personCols": ["id", "surname", "name", "patr", "note", "hist"],

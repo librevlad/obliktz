@@ -32,8 +32,8 @@ import decimal
 import hashlib
 import json
 import os
+import random
 import re
-import secrets
 import sqlite3
 import zlib
 
@@ -1240,16 +1240,26 @@ def _group(rows, *cols):
     return out
 
 
+def _id_digits(seed):
+    """Нескінченний ряд по 16 шістнадцяткових цифр, однаковий для того самого `seed` (відбитка вмісту книги)."""
+    draw = random.Random(seed)
+    while True:
+        yield format(draw.getrandbits(64), "016x")
+
+
 def from_model(m, have, rcpt_keys, old_files=None, people=None):
     """Рядки книги → розділи сторінки й файли; записи, знайдені за ключем у `have`, зберігають id (а з ними — файли), решта
-    отримує новий: «u» і 16 шістнадцяткових цифр, яких немає ніде серед наявних записів і серед щойно виданих. Прихід, якого
-    нема в обліку (`rcpt_keys`), — BookError з аркушем і рядком: так він не губиться мовчки."""
+    отримує новий: «u» і 16 шістнадцяткових цифр, яких немає ніде серед наявних записів і серед щойно виданих. Цифри йдуть від
+    відбитка вмісту книги: та сама книга над тією самою базою дає ті самі id — перегляд і прийом бачать одне й те саме, і котрий
+    із двійників документа стане «#2», не змінюється від спроби до спроби. Прихід, якого нема в обліку (`rcpt_keys`), —
+    BookError з аркушем і рядком: так він не губиться мовчки."""
     used = set()
     _collect_ids(have, used)
+    digits = _id_digits(fingerprint(m))
 
     def new():
         while True:
-            i = "u" + secrets.token_hex(8)
+            i = "u" + next(digits)
             if i not in used:
                 used.add(i)
                 return i

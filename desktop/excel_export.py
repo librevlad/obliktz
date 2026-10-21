@@ -28,7 +28,8 @@ from datetime import datetime
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, Side
-from openpyxl.utils import get_column_letter
+from openpyxl.utils import column_index_from_string, get_column_letter
+from openpyxl.worksheet.pagebreak import Break
 
 THIN = Side(style="thin", color="000000")
 BOX = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
@@ -273,6 +274,8 @@ SHEET = "Накладна-вимога"
 FIRST_LINE = 23          # перший рядок таблиці
 LINE_SLOTS = 3           # скільки рядків у бланку заготовлено
 TOTAL_ROW = 26           # рядок «Всього» в бланку
+NUMBERS_ROW = 22         # рядок номерів граф: ним таблиця продовжується на новій сторінці
+TAIL_LINES = 3           # останні позиції, що лишаються на одній сторінці з «Всього» й підписами
 
 
 def template_path(name: str = TEMPLATE) -> str:
@@ -283,11 +286,15 @@ def template_path(name: str = TEMPLATE) -> str:
 
 
 def _shift_down(ws, from_row: int, by: int) -> None:
-    """Зсуває все від `from_row` униз на `by` рядків разом з об'єднаннями й
-    висотами. openpyxl.insert_rows цього не робить: об'єднання лишаються на
-    місці й налазять на нові рядки, тому зсув зроблено вручну."""
+    """Зсуває все від `from_row` униз на `by` рядків разом з об'єднаннями,
+    висотами й ручними розривами сторінок. openpyxl.insert_rows цього не робить:
+    об'єднання лишаються на місці й налазять на нові рядки, тому зсув зроблено вручну."""
     if by <= 0:
         return
+    # Розрив належить рядку, з якого починається сторінка (id — рядок над розривом): рядок їде — і розрив із ним.
+    for b in ws.row_breaks.brk:
+        if b.id + 1 >= from_row:
+            b.id += by
     moved = [m for m in list(ws.merged_cells.ranges) if m.min_row >= from_row]
     for m in moved:
         ws.unmerge_cells(str(m))
@@ -307,10 +314,18 @@ def _shift_up(ws, from_row: int, by: int) -> None:
     """Прибирає `by` рядків над `from_row`: усе від `from_row` піднімається.
 
     Об'єднання в прибраних рядках зникають разом із ними, нижчі — зсуваються;
-    висоти рядків ідуть слідом, як і в `_shift_down`."""
+    висоти рядків і ручні розриви сторінок ідуть слідом, як і в `_shift_down`."""
     if by <= 0:
         return
     gone = from_row - by
+    kept = {}
+    for b in ws.row_breaks.brk:
+        if b.id + 1 >= from_row:
+            b.id -= by
+        elif b.id + 1 > gone:
+            continue                           # сторінка починалася з прибраного рядка
+        kept.setdefault(b.id, b)
+    ws.row_breaks.brk = sorted(kept.values(), key=lambda b: b.id)
     moved = []
     for m in list(ws.merged_cells.ranges):
         if m.max_row >= gone:
@@ -339,6 +354,70 @@ def _copy_style(src, dst) -> None:
     dst.fill = copy(src.fill)
 
 
+def _row_pt(ws, r) -> float:
+    """Висота рядка в пунктах аркуша: прихований — 0, не заданий — як задано аркушу за замовчуванням."""
+    d = ws.row_dimensions.get(r)
+    if d is not None and d.hidden:
+        return 0.0
+    return (d.height if d is not None else None) or ws.sheet_format.defaultRowHeight or 15.0
+
+
+def _col_width(ws, c) -> float:
+    for d in ws.column_dimensions.values():
+        lo = d.min or column_index_from_string(d.index)
+        if lo <= c <= (d.max or lo) and d.width:
+            return d.width
+    return ws.sheet_format.defaultColWidth or 8.43
+
+
+def _page_room(ws, ncols: int) -> float:
+    """Скільки пунктів висоти рядків уміщує сторінка — за правилом Pager з inventory_export:
+    масштаб «одна сторінка завширшки» з ширин граф, запас 3 %."""
+    from inventory_export import Pager                              # noqa: PLC0415
+    return Pager(ws, [_col_width(ws, c) for c in range(1, ncols + 1)]).room
+
+
+def _runs(rows):
+    """[23, 24, 25, 27, 28] -> [(23, 25), (27, 28)]: суцільні відрізки рядків."""
+    out = []
+    for r in rows:
+        if out and r == out[-1][1] + 1:
+            out[-1][1] = r
+        else:
+            out.append([r, r])
+    return [tuple(x) for x in out]
+
+
+def _invoice_pages(ws, slots: int):
+    """Де рвати сторінки накладної на `slots` рядків таблиці — до того, як її розсунуто (рядки бланка).
+
+    Excel рве сторінку там, де скінчилося місце, а ручний розрив бланка стоїть після підписів: на 5–7 позиціях
+    підпис «здав» лишався на одній сторінці, а графи під ним — на другій, на 20 — «Всього» відривалося від
+    таблиці. Тому сторінки розкладає програма, як Pager в inventory_export: шапка таблиці — з першою позицією,
+    останні TAIL_LINES позицій, «Всього» й підписи — на одній сторінці, продовження таблиці починається рядком
+    номерів граф, відмітка ФЕС — з нової сторінки, як у бланку.
+
+    Повертає (позиції з 0, перед якими нова сторінка; рядок бланка, з якого сторінка відмітки ФЕС, або None)."""
+    starts = sorted(b.id + 1 for b in ws.row_breaks.brk)
+    fes = next((s for s in starts if s > TOTAL_ROW), None)
+    signs = max(r for r in range(TOTAL_ROW, fes or ws.max_row + 1)
+                if any(ws.cell(row=r, column=c).value is not None for c in range(1, 11)))
+    room = _page_room(ws, 10)
+    line = _row_pt(ws, FIRST_LINE)
+    tail = min(TAIL_LINES, slots)
+    y = sum(_row_pt(ws, r) for r in range(max([1] + [s for s in starts if s < FIRST_LINE]), FIRST_LINE))
+    breaks = []
+    for i in range(slots - tail + 1):
+        need = line if i < slots - tail else tail * line + sum(_row_pt(ws, r) for r in range(TOTAL_ROW, signs + 1))
+        if i and y + need > room:
+            breaks.append(i)
+            y = _row_pt(ws, NUMBERS_ROW)
+        y += need
+    if fes and y + sum(_row_pt(ws, r) for r in range(signs + 1, fes)) > room:
+        fes = signs + 1                        # порожні рядки під підписами — уже на сторінку відмітки
+    return breaks, fes
+
+
 def _person(p) -> str:
     """{pos, rank, name} -> «посада, звання Ім'я ПРІЗВИЩЕ», як у бланку служби."""
     if not p or not p.get("name"):
@@ -348,15 +427,7 @@ def _person(p) -> str:
 
 
 def fill_invoice(spec: dict):
-    """Заповнює бланк накладної. Повертає книгу openpyxl.
-
-    spec: no, date (YYYY-MM-DD), operation, basis, sender, receiver, lines
-    (name, code, uom, cat, price, qty, note), qty_words, sum_words;
-    place — місце складання на дату накладної; підписанти {pos, rank, name}:
-    sender_person, receiver_person (МВО), chief (начальник служби), accountant
-    (хто відобразив в обліку), fes (начальник ФЕС). Кого немає — рядок лишається
-    для підпису від руки.
-    """
+    """Заповнює бланк накладної. Повертає книгу openpyxl (spec — як у fill_invoice_sheet)."""
     from openpyxl import load_workbook
     wb = load_workbook(template_path())
     ws = wb[SHEET]
@@ -366,18 +437,53 @@ def fill_invoice(spec: dict):
     for name in list(wb.sheetnames):
         if name != SHEET:
             del wb[name]
-
     clean_workbook(wb)
+    fill_invoice_sheet(ws, spec)
+    return wb
 
+
+def fill_invoice_sheet(ws, spec: dict) -> int:
+    """Заповнює аркуш бланка накладної (будова — як у nakladna-vymoga.xlsx) — і в книзі акта списання.
+
+    spec: no, date (YYYY-MM-DD), operation, basis, sender, receiver, lines
+    (name, code, uom, cat, price, qty, note), qty_words, sum_words;
+    place — місце складання на дату накладної; підписанти {pos, rank, name}:
+    sender_person, receiver_person (МВО), chief (начальник служби), accountant
+    (хто відобразив в обліку), fes (начальник ФЕС). Кого немає — рядок лишається
+    для підпису від руки. round_lines — сума рядка до копійки (ROUND), як рахує
+    програма: накладна акта списання бере суму прописом із таких сум рядків.
+    blank_mixed_total — накладна акта списання: рядки різних одиниць (штуки й
+    кілограми) підсумку кількості не мають; звичайна накладна його має, як у 1.12.0.
+
+    Повертає, на скільки рядків таблиця розсунула бланк: рядки підписів — нижче на стільки.
+    """
     lines = spec.get("lines") or []
-    extra = max(0, len(lines) - LINE_SLOTS)
+    slots = max(len(lines), LINE_SLOTS)
+    breaks, fes = _invoice_pages(ws, slots)
+    # Позиції на аркуші: перед тією, з якої починається нова сторінка, — рядок номерів граф.
+    rows, heads = [], []
+    for i in range(slots):
+        if i in breaks:
+            heads.append(FIRST_LINE + i + len(heads))
+        rows.append(FIRST_LINE + i + len(heads))
+    last = rows[-1]
+    extra = last + 1 - TOTAL_ROW
     if extra:
         _shift_down(ws, TOTAL_ROW, extra)
-        for r in range(FIRST_LINE + LINE_SLOTS, FIRST_LINE + LINE_SLOTS + extra):
-            ws.row_dimensions[r].height = ws.row_dimensions[FIRST_LINE].height
-            for c in range(1, 11):
-                _copy_style(ws.cell(row=FIRST_LINE, column=c), ws.cell(row=r, column=c))
-    last = FIRST_LINE + max(len(lines), LINE_SLOTS) - 1
+    # Рядки таблиці — як перший (у бланку третій мав формат кількості «0.00»), рядки номерів граф — як у шапці,
+    # але з лінією згори: у бланку її дає нижня межа шапки, а на новій сторінці шапки над ними немає.
+    for r in range(FIRST_LINE + 1, last + 1):
+        src = NUMBERS_ROW if r in heads else FIRST_LINE
+        ws.row_dimensions[r].height = ws.row_dimensions[src].height
+        for c in range(1, 11):
+            cell = ws.cell(row=r, column=c)
+            _copy_style(ws.cell(row=src, column=c), cell)
+            if src == NUMBERS_ROW:
+                cell.value = ws.cell(row=src, column=c).value
+                b = cell.border
+                cell.border = Border(left=b.left, right=b.right, top=b.bottom, bottom=b.bottom)
+    ws.row_breaks.brk = [b for b in ws.row_breaks.brk if b.id + 1 < FIRST_LINE] + [
+        Break(id=r - 1) for r in heads + ([fes + extra] if fes else [])]
     total = TOTAL_ROW + extra
     # У бланку служби рядки 24 і 25 приховані — накладна на дві чи три позиції
     # друкувалася без другої й третьої, хоч у підсумку вони враховані.
@@ -425,8 +531,8 @@ def fill_invoice(spec: dict):
     def put(r, c, v):
         ws.cell(row=r, column=c).value = v
 
-    for i in range(max(len(lines), LINE_SLOTS)):
-        r = FIRST_LINE + i
+    rounded = bool(spec.get("round_lines"))
+    for i, r in enumerate(rows):
         ln = lines[i] if i < len(lines) else None
         put(r, 1, i + 1 if ln else None)
         put(r, 2, ln.get("name") if ln else None)
@@ -436,14 +542,22 @@ def fill_invoice(spec: dict):
         put(r, 6, (ln.get("price") or None) if ln else None)
         put(r, 7, ln.get("qty") if ln else None)
         put(r, 8, f"=G{r}" if ln else None)
-        put(r, 9, f"=F{r}*H{r}" if ln else None)
+        put(r, 9, (f"=ROUND(F{r}*H{r},2)" if rounded else f"=F{r}*H{r}") if ln else None)
         put(r, 10, (ln.get("note") or None) if ln else None)
         ws.cell(row=r, column=6).number_format = FMT_MONEY
         ws.cell(row=r, column=9).number_format = FMT_MONEY
+        if ln:
+            fmt = qty_format(ln.get("qty"))
+            ws.cell(row=r, column=7).number_format = ws.cell(row=r, column=8).number_format = fmt
 
-    put(total, 7, f"=SUM(G{FIRST_LINE}:G{last})")
-    put(total, 8, f"=G{total}")
-    put(total, 9, f"=SUM(I{FIRST_LINE}:I{last})")
+    # Підсумок — лише позицій: рядок номерів граф посеред таблиці (7 і 9 у графах) не додається. У накладній акта
+    # списання штуки й кілограми не додаються: рядки різних одиниць підсумку кількості не мають (як в акті), сума — є.
+    mixed = bool(spec.get("blank_mixed_total")) and len({str(ln.get("uom") or "").strip() for ln in lines}) > 1
+    put(total, 7, None if mixed else "=SUM(" + ",".join(f"G{a}:G{b}" for a, b in _runs(rows)) + ")")
+    put(total, 8, None if mixed else f"=G{total}")
+    put(total, 9, "=SUM(" + ",".join(f"I{a}:I{b}" for a, b in _runs(rows)) + ")")
+    qty = sum(ln.get("qty") for ln in lines if isinstance(ln.get("qty"), (int, float)))
+    ws.cell(row=total, column=7).number_format = ws.cell(row=total, column=8).number_format = qty_format(qty)
     ws.cell(row=total, column=9).number_format = FMT_MONEY
 
     # «Всього передано» й «на суму» — текстом замість формул надбудови.
@@ -464,10 +578,13 @@ def fill_invoice(spec: dict):
         if buh.get("name") else "_" * 34 + "    ______________   " + "_" * 29)
     fes = spec.get("fes") or {}
     if fes.get("pos"):
-        # У бланку посада начфіна стоїть двома рядками; ділимо по тире, як там.
-        head, sep, tail = fes["pos"].partition("–")
-        if not sep:
-            head, sep, tail = fes["pos"].partition("-")
+        # У бланку посада начфіна стоїть двома рядками; ділимо по тире, як там: спершу тире з пробілами
+        # («служби – головний», «служби - головний»), і лише тоді голе — дефіс усередині «фінансово-економічної» не тире.
+        for mark in (" – ", " - ", "–", "-"):
+            head, sep, tail = fes["pos"].partition(mark)
+            if sep:
+                sep = sep.strip()
+                break
         put(57 + extra, 1, (head.strip() + " " + sep).strip() if sep else fes["pos"])
         put(58 + extra, 1, tail.strip() or None)
     put(59 + extra, 2, " " * 72 + "______________" + " " * 25 + (fes.get("name") or "_" * 22))
@@ -476,7 +593,7 @@ def fill_invoice(spec: dict):
     ws.page_setup.fitToWidth = 1
     ws.page_setup.fitToHeight = 0
     ws.sheet_properties.pageSetUpPr.fitToPage = True
-    return wb
+    return extra
 
 
 def save_invoice(spec: dict, folder: str) -> str:
