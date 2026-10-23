@@ -14,6 +14,9 @@
   («командир», «НШ», «комісія · голова» …), рядок 3 — «посада», «звання», «ПІБ»; далі рядок на дату
   (дата в другій колонці). На кожну роль — три колонки.
 
+- «Сухпай»: дні й особи на сухпаї по підрозділах, рапорт і акт дня — для актів сухпаю (`read_sukhpai`, `report_days`)
+  і «1прод» (`suhpay_days`).
+
 Те саме приходить вставкою: Ctrl+A, Ctrl+C на аркуші Excel дає текст із табуляціями, аркуш упізнається
 за шапкою; шматок без шапки — «дата | число» (рівно два стовпці) або стовпець чисел пункту з дня `start`
 (не далі `end`). Стовпець іде за будовою аркуша «Пункти харчування»: після неділі — рядок «за період», після 13-го,
@@ -56,7 +59,8 @@ _SUBTOTAL = re.compile(r"^(за період|разом|всього|усьог�
 # Аркуш упізнано, а даних немає: що сказати (ключ — розділ результату).
 _NOTHING = {"points": "Аркуш «Пункти харчування» впізнано, але жодного дня не прочитано.",
             "orders": "Аркуш «Добовка» впізнано, але жодного номера витягу не прочитано.",
-            "signers": "Аркуш «Підписанти» впізнано, але жодного рядка не прочитано."}
+            "signers": "Аркуш «Підписанти» впізнано, але жодного рядка не прочитано.",
+            "sukhpai": "Аркуш «Сухпай» впізнано, але жодного дня з особами не прочитано."}
 _NO_YEAR = " Якщо в датах немає року, вставте у вікні акта: рік візьметься з періоду."
 _UNKNOWN = ("Не впізнано: вставте аркуш «Пункти харчування», «Підписанти» чи «Добовка» або стовпці «дата | число» "
             "чи стовпець чисел.")
@@ -129,7 +133,7 @@ def _text(v):
 
 
 def _empty():
-    return {"kind": "unknown", "points": {}, "orders": {}, "signers": {}, "values": {}, "problems": []}
+    return {"kind": "unknown", "points": {}, "orders": {}, "signers": {}, "values": {}, "sukhpai": {}, "problems": []}
 
 
 def _say(out, text):
@@ -498,6 +502,11 @@ def parse_paste(text, start=None, end=None):
             if not out[what]:
                 out["problems"].append(_NOTHING[what] + ("" if year else _NO_YEAR))
             return out
+    if _sukhpai(rows, out, year):                            # аркуш «Сухпай» — для актів сухпаю
+        out["kind"] = "sukhpai"
+        if not out["sukhpai"]:                               # дні аркуша — дати з роком, а вікно акта сухпаю періоду не шле:
+            out["problems"].append(_NOTHING["sukhpai"])      # поради «рік візьметься з періоду» тут немає
+        return out
     if _pairs(lines, out, year):
         return out
     # Стовпець чисел поспіль: порожній рядок усередині — день без числа, рядок підсумку — не день.
@@ -544,3 +553,106 @@ def newest(folder):
             return -1.0
 
     return max(files, key=saved) if files else None
+
+
+# ----------------------------------------------------------------------------- аркуш «Сухпай»
+# Рядок груп (батальйони: «Упр», «1 БАТ» …) над першою колонкою групи, рядок підрозділів («період», «дата», «№ витягу»…,
+# далі підрозділ над першою колонкою своєї трійки), рядок полів — «осіб», «рапорт», «акт» (у «усього» — лише «осіб»);
+# далі рядок на день (дата в колонці «дата»), між тижнями — «за період …» без дати. Підрозділ — «група підрозділ»
+# («2 БАТ 4 рота»): той самий підрозділ («РВП», «ВМТЗ») є в кількох батальйонах. «Усього» — сума інших, не читається.
+
+def _sukhpai(rows, out, year=None):
+    """Рядки аркуша «Сухпай» → out["sukhpai"] = {підрозділ: {"block", "sub", "days": {дата: [осіб, рапорт, акт]}}}
+    (день — лише з особами, рапортом чи актом); True, якщо шапку знайдено. Шапка — за мітками, а не за місцем: рядок
+    полів з «осіб» під рядком підрозділів з «дата» (графи «рапорт» може й не бути: старі копії Добовки її не мали); поля
+    підрозділу — «осіб», «рапорт», «акт» у його графах (до наступного підрозділу чи групи), у будь-якому порядку; нова
+    група починає підрозділи наново, група без підрозділу — сама собі підрозділ."""
+    at = next((i for i, r in enumerate(rows) if i >= 2 and "осіб" in [_low(c) for c in r]
+               and "дата" in [_low(c) for c in rows[i - 1]]), None)
+    if at is None:
+        return False
+    groups, subs, fields = rows[at - 2], rows[at - 1], rows[at]
+    date_col = next(i for i, v in enumerate(subs) if _low(v) == "дата")
+    first = next(i for i, v in enumerate(fields) if _low(v) == "осіб")
+    cols, group, sub = {}, "", ""
+    for c in range(first, len(fields)):
+        if c < len(groups) and _text(groups[c]):
+            group, sub = _text(groups[c]), ""                # нова група — підрозділи наново
+        if c < len(subs) and _text(subs[c]):
+            sub = _text(subs[c])
+        field = _low(fields[c])
+        if field not in ("осіб", "рапорт", "акт") or not group or _low(sub) == "усього":
+            continue
+        unit = cols.setdefault(f"{group} {sub}" if sub else group, {"block": group, "sub": sub or group})
+        unit.setdefault(field, c)
+    found = {}
+    for r in rows[at + 1:]:
+        day = _day(r[date_col], year) if date_col < len(r) else None
+        if not day:
+            continue
+        for label, c in cols.items():
+            if "осіб" not in c:
+                continue
+            n = _num(r[c["осіб"]]) if c["осіб"] < len(r) else None
+            rep = _text(r[c["рапорт"]]) if "рапорт" in c and c["рапорт"] < len(r) else ""
+            act = _text(r[c["акт"]]) if "акт" in c and c["акт"] < len(r) else ""
+            if n or rep or act:
+                unit = found.setdefault(label, {"block": c["block"], "sub": c["sub"], "days": {}})
+                unit["days"][day] = [n or 0, rep, act]
+    out["sukhpai"].update((label, found[label]) for label in cols if label in found)     # порядок колонок аркуша
+    return True
+
+
+def read_sukhpai(data):
+    """Аркуш «Сухпай» книги Добовки (байти .xlsx) → {"sukhpai": {…}, "problems": […]}."""
+    import openpyxl                                              # noqa: PLC0415
+    out = {"sukhpai": {}, "problems": []}
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    except Exception as e:                                       # noqa: BLE001 — будь-який зіпсований файл
+        print(f"Добовка: файл не прочитано — {type(e).__name__}: {e}")
+        out["problems"].append("Файл не є книгою Excel (.xlsx).")
+        return out
+    try:
+        if "Сухпай" not in wb.sheetnames:
+            out["problems"].append("Немає аркуша «Сухпай».")
+            return out
+        rows = [list(r) for r in wb["Сухпай"].iter_rows(values_only=True)]
+    finally:
+        wb.close()
+    if not _sukhpai(rows, out):
+        out["problems"].append("Аркуш «Сухпай»: шапку не впізнано.")
+    elif not out["sukhpai"]:
+        out["problems"].append(_NOTHING["sukhpai"])
+    return out
+
+
+def _acts_in(cell):
+    """Клітинка «акт» → номери актів: «СП2026-116,СП2026-104» → [СП2026-116, СП2026-104]."""
+    return [x for x in (" ".join(p.split()) for p in re.split(r"[,;\n]+", str(cell or ""))) if x]
+
+
+def report_days(sukhpai, report):
+    """Дні рапорту на аркуші «Сухпай»: номер рапорту — окремим числом у клітинці «рапорт» («Вх.№41207 від 23.09.2026»;
+    41207 — не 4120 і не 41207/1). → {"label", "block", "sub", "days": [[дата, осіб]] (дні з особами), "acts": номери
+    актів, уже вписаних у ці дні, "reportDate": дата рапорту з клітинки (чи ""), "text": клітинка, "others": підрозділи,
+    де той самий рапорт ще є} або None. Рапорт у кількох підрозділах — перший за порядком колонок аркуша."""
+    no = " ".join(str(report or "").split()).lstrip("№").strip()
+    if not no:
+        return None
+    pat = re.compile(r"(?<![\d/])" + re.escape(no) + r"(?![\d/])")
+    hits = []
+    for label, unit in sukhpai.items():
+        days = sorted((d, v) for d, v in unit["days"].items() if v[1] and pat.search(v[1]))
+        if days:
+            hits.append((label, unit, days))
+    if not hits:
+        return None
+    label, unit, days = hits[0]
+    acts = []
+    for _, v in days:
+        acts += [a for a in _acts_in(v[2]) if a not in acts]
+    m = re.search(r"від\s*(\d{1,2}[./]\d{1,2}[./]\d{2,4})", days[0][1][1])
+    return {"label": label, "block": unit["block"], "sub": unit["sub"], "days": [[d, v[0]] for d, v in days if v[0]],
+            "acts": acts, "reportDate": (_day(m.group(1)) or "") if m else "", "text": days[0][1][1],
+            "others": [x[0] for x in hits[1:]]}

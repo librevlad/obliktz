@@ -28,6 +28,7 @@ from openpyxl.worksheet.table import Table, TableFormula, TableStyleInfo
 
 import op_norms
 import stable_hash
+from state_db import FES_STATUSES as STATUSES   # стани ФЕС — сам перелік програми, не його копія: новий стан приймає й книга
 
 BOOK = "ОП"
 # Відбитки книги, яку програма сама записала чи прийняла, — байтів і вмісту (як у книги «Закупівлі»): така книга на диску —
@@ -42,7 +43,6 @@ GROUP_OF_CAT = {v: k for k, v in CAT_OF_GROUP.items()}
 # Назви груп — ті самі, що в довіднику бази (nomen_group.name, міграція 026): слова відмови «рядок норми не з групи позиції» при
 # прийомі книги збігаються зі словами сервера (state_db._save_items).
 GROUP_NAME = {g: t[:1].upper() + t[1:] for g, t in TYPE_OF_GROUP.items()}
-STATUSES = ["немає витяга", "на підписі", "їде на ФЕС", "проведено", "переробка"]
 ARCHIVE = "архів"
 UNSURE = "уточнити"
 
@@ -69,6 +69,9 @@ SIGNER_COLS = ["док_дата", "док_номер", "підрозділ", "р
 RATION_HEAD = ["дата", "витяг", "джерело"]
 POINT_COLS = ["пункт", "підрозділ", "їдальня", "назва_у_звірці", "закрито"]
 KIND_WORDS = {"op390": "за нормами 390"}
+# Книга ОП несе акти лише своїх видів: акт сухпаю — у книзі «Облік СП», і прийом книги ОП його не чіпає.
+OP_KINDS = tuple(KIND_WORDS)
+_OP_KINDS_SQL = "(" + ", ".join("'%s'" % k for k in OP_KINDS) + ")"
 PAPER_CELLS = {"накладна": ("накладна_номер", "накладна_дата"), "рапорт": (None, "рапорт_дата"),
                "звірка": ("звірка_номер", "звірка_дата"), "розрахунок": (None, "розрахунок_дата")}
 
@@ -225,7 +228,8 @@ def _acts_model(con):
     acts, signers = [], []
     for r in con.execute("""SELECT a.*, d.number, d.doc_date, s.name AS sub, p.name AS point FROM act a
                               JOIN document d ON d.id = a.document_id JOIN subdivision s ON s.id = d.from_subdivision_id
-                              LEFT JOIN food_point p ON p.id = a.point_id ORDER BY d.doc_date, d.number, d.id"""):
+                              LEFT JOIN food_point p ON p.id = a.point_id WHERE a.kind IN """ + _OP_KINDS_SQL + """
+                             ORDER BY d.doc_date, d.number, d.id"""):
         head = {"date": r["doc_date"], "no": " ".join(str(r["number"]).split()), "sub": r["sub"]}
         acts.append({**head, "series": r["series"], "kind": r["kind"], "point": r["point"] or "", "from": r["period_from"],
                      "to": r["period_to"], "rations": r["rations"], "papers": papers.get(r["document_id"], {}),
@@ -390,7 +394,7 @@ def _validations(ws, journal, last):
         return DataValidation(type="list", formula1=formula, allow_blank=True)
     pos = lst("Номенклатура!$F$2:$F$2000")
     place = lst("Довідка!$A$2:$A$200")
-    status = lst("Довідка!$C$2:$C$6")
+    status = lst(f"Довідка!$C$2:$C${len(STATUSES) + 1}")
     for dv in (pos, place, status):
         ws.add_data_validation(dv)
     end = max(last, 1) + 500
@@ -559,36 +563,40 @@ def _unescape(s):
     return s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"').replace("&apos;", "'").replace("&amp;", "&")
 
 
-def export_book(con, path, as_of=None):
+def export_book(con, path, as_of=None, own=True):
     """Книга з бази — цілою або ніяк: пишеться поруч під одним і тим самим тимчасовим ім'ям («Облік ОП.xlsx.part» —
     той, що лишився після обриву, наступний запис перезаписує) і стає на місце одним кроком. Збій посеред запису лишає
     попередню книгу як була; книга, відкрита в Excel, заміні не піддається — PermissionError, як і раніше.
     Готова книга запам'ятовується своєю (`remember_sha`): відбиток байтів і вмісту (вона ж, прочитана назад); не
     читається назад — лише байтів, а у відповіді `readBack` — що не так (до 50 рядків), як у книги «Закупівлі»: книга
-    на місці, але «Прийняти книгу…» її не прийме, поки ці рядки не виправлено."""
+    на місці, але «Прийняти книгу…» її не прийме, поки ці рядки не виправлено. `own=False` — книга для рушія в
+    тимчасовій теці (описи 572), як у книг СП і РП: назад не читається, пам'ять про свої книги не змінюється —
+    вивантаження в теці книги не втрачає свого відбитка."""
     m = model_from_db(con)
     path = os.fspath(path)
     part = path + ".part"
-    problems = None
+    sha = mark = problems = None
     try:
         write_book(m, part, as_of)
-        sha = stable_hash.stable_sha(part)
-        with open(part, "rb") as f:
-            data = f.read()
-        try:
-            mark = fingerprint(read_book(data))
-        except BookError as e:                    # через дані самої бази назад не читається: впізнаємо лише за байтами
-            mark, problems = None, e.problems[:50]
-        except Exception:                         # noqa: BLE001 — несподіване при читанні назад: книга однаково стає
-            traceback.print_exc()                 # людині — речення, назва винятку й текст помилки — лише в консоль
-            mark, problems = None, ["Книгу назад не прочитано."]
+        if own:
+            sha = stable_hash.stable_sha(part)
+            with open(part, "rb") as f:
+                data = f.read()
+            try:
+                mark = fingerprint(read_book(data))
+            except BookError as e:                # через дані самої бази назад не читається: впізнаємо лише за байтами
+                problems = e.problems[:50]
+            except Exception:                     # noqa: BLE001 — несподіване при читанні назад: книга однаково стає
+                traceback.print_exc()             # людині — речення, назва винятку й текст помилки — лише в консоль
+                problems = ["Книгу назад не прочитано."]
         os.replace(part, path)
     except BaseException:
         with contextlib.suppress(OSError):
             os.remove(part)
         raise
-    with contextlib.suppress(sqlite3.Error):      # не запам'ятали — наступного разу книгу звірять із базою
-        remember_sha(con, sha, mark)
+    if own:
+        with contextlib.suppress(sqlite3.Error):  # не запам'ятали — наступного разу книгу звірять із базою
+            remember_sha(con, sha, mark)
     out = {"path": path, "items": len(m["items"]), "docs": len(m["docs"]),
            "lines": sum(len(d["lines"]) for d in m["docs"])}
     if problems:
@@ -1196,9 +1204,55 @@ def _ration_records(r):
     return out
 
 
+def _dormant_foreign(con):
+    """{код: книга} сплячих позицій книг СП і РП: архівних і без жодного рядка документів у базі. Такий рядок коду не
+    тримає — його віддають позиції старої книги ОП (`claim_dormant`). Позиції ТЗ не віддаються ніколи: каталог ТЗ несе
+    номери ФЕС і прив'язки до форм."""
+    return dict(con.execute("""SELECT n.code, g.book FROM nomen n JOIN nomen_group g ON g.id = n.group_id
+                                WHERE g.book IN ('СП', 'РП') AND n.archived_at IS NOT NULL
+                                  AND NOT EXISTS (SELECT 1 FROM document_line l WHERE l.nomen_id = n.id)"""))
+
+
+def _refuse_foreign_codes(con, model):
+    """Код один на всю номенклатуру: позицію іншої книги (ТЗ, СП, РП) книга ОП не забирає, а документи тієї позиції не
+    переписує. Відмова — переліком «Номенклатура: код N належить книзі «X»», до будь-якого запису; так само в книг СП і РП
+    (`book_xlsx._refuse_foreign_codes`). Виняток один — перенесення старої книги: спляча позиція, що віддала свій код
+    (`model["claimed"]`, див. `claim_dormant`); віддача перевіряється тут щоразу, тож позиція, яка встигла отримати
+    рядки, вже не віддається."""
+    owner = dict(con.execute("SELECT n.code, g.book FROM nomen n JOIN nomen_group g ON g.id = n.group_id "
+                             "WHERE g.book <> ?", (BOOK,)))
+    claimed = model.get("claimed")
+    if claimed:
+        asleep = _dormant_foreign(con)
+        owner = {c: b for c, b in owner.items() if not (c in claimed and c in asleep)}
+    codes = dict.fromkeys(str(i["code"]) for i in model["items"])
+    problems = [f"Номенклатура: код {c} належить книзі «{owner[c]}»" for c in codes if c in owner]
+    if problems:
+        raise BookError(problems)
+
+
+def claim_dormant(con, model):
+    """Перенесення старої книги ОП: спляча позиція іншої книги (архівна, без рядків документів у базі), код якої має позиція
+    старої книги, віддає код книзі ОП. Прийом перегрупує її рядок у групу ОП і перепише найменування, ціну й решту полів,
+    як для власних позицій, а ознаку 1/прод книги СП скине. Кожна така позиція — рядок звіту, і ці рядки стоять першими:
+    звіт старої книги довгий, а передачу людина має побачити. Діюча позиція іншої книги й позиція з рядками лишаються за
+    своєю книгою — відмова, як завжди (`_refuse_foreign_codes`). Звичайний прийом книги цього кроку не проходить: чужий код
+    у ній завжди відмова. Модель повертається з `claimed` ({код: книга, що віддала}); немає чого віддавати — та сама,
+    вхідна не змінюється. Викликати до `diff` і `apply`, під тим самим замком запису."""
+    asleep = _dormant_foreign(con)
+    claimed = {c: asleep[c] for c in dict.fromkeys(str(i["code"]) for i in model["items"]) if c in asleep}
+    if not claimed:
+        return model
+    notes = [f"Номенклатура: архівну позицію {book} з кодом {code} (без рядків) передано книзі «{BOOK}»"
+             for code, book in claimed.items()]
+    return dict(model, claimed=claimed, report=notes + list(model.get("report", [])))
+
+
 def diff(con, model):
     """Що зміниться в базі, коли прийняти книгу: документи, позиції, нові місця й контрагенти, акти, дободачі й пункти
-    харчування. Аркуша нових розділів у книзі немає (None) — ці дані не порівнюються: прийом їх не змінює."""
+    харчування. Аркуша нових розділів у книзі немає (None) — ці дані не порівнюються: прийом їх не змінює. Код позиції
+    іншої книги — відмова (`BookError`): перегляд її не показує як нову, а прийом не забирає."""
+    _refuse_foreign_codes(con, model)
     have = model_from_db(con)
     model = _resolved(con, model)
     if not model.get("normCol", True):           # книга без «норма_дд» норм рядків не змінює
@@ -1302,13 +1356,15 @@ def apply(con, model):
 
 
 def _ensure_subs(con, model):
-    """Місця з аркуша «Підрозділи» (у чистій програмі — усе дерево) і назви з документів."""
+    """Місця з аркуша «Підрозділи» (у чистій програмі — усе дерево) і назви з документів. Колишня назва перейменованого
+    підрозділу (псевдонім) — той самий підрозділ, а не новий: книга, вивантажена до перейменування, несе стару назву."""
     kinds = dict(con.execute("SELECT code, id FROM subdivision_kind"))
     have = dict(con.execute("SELECT name, id FROM subdivision"))
-    aliases = {r[0] for r in con.execute("SELECT name FROM subdivision_alias")}
+    alias_of = dict(con.execute("SELECT name, subdivision_id FROM subdivision_alias"))
+    aliases = set(alias_of)
     sort = con.execute("SELECT COALESCE(MAX(sort), 0) FROM subdivision").fetchone()[0] or 0
     for s in model["subs"]:
-        if s["name"] in have:
+        if s["name"] in have or s["name"] in alias_of:
             continue
         if s["kind"] not in kinds:
             kinds[s["kind"]] = con.execute("INSERT INTO subdivision_kind(code, name) VALUES(?, ?)",
@@ -1316,7 +1372,8 @@ def _ensure_subs(con, model):
         sort += 1
         have[s["name"]] = con.execute(
             "INSERT INTO subdivision(name, kind_id, parent_id, sort, is_active) VALUES(?, ?, ?, ?, ?)",
-            (s["name"], kinds[s["kind"]], have.get(s["parent"]), sort, 0 if s["closed"] else 1)).lastrowid
+            (s["name"], kinds[s["kind"]], have.get(s["parent"]) or alias_of.get(s["parent"]), sort,
+             0 if s["closed"] else 1)).lastrowid
         for a in s["aliases"]:
             if a not in aliases and a not in have:
                 con.execute("INSERT INTO subdivision_alias(subdivision_id, name, source) VALUES(?, ?, 'книга ОП')",
@@ -1335,12 +1392,13 @@ def _ensure_subs(con, model):
         unknown |= {n for n in names if n and n not in have and n not in aliases}
     if unknown:
         # У старій книзі аркуша «Підрозділи» немає: місце заводять у програмі чи зіставляють у вікні перенесення.
-        how = ("додайте його в аркуш «Підрозділи» книги чи заведіть у програмі («Підрозділи» → «+ Підрозділ»)"
-               if model["subs"] else "заведіть такий підрозділ («Підрозділи» → «+ Підрозділ») або зіставте його з наявним")
+        how = ("додайте його в аркуш «Підрозділи» книги чи заведіть у програмі («Довідники» → «Підрозділи» → «+ Підрозділ»)"
+               if model["subs"] else "заведіть такий підрозділ («Довідники» → «Підрозділи» → «+ Підрозділ») або зіставте його з наявним")
         raise BookError([f"невідоме місце «{n}»: {how}" for n in sorted(unknown)])
 
 
 def _ensure_items(con, model):
+    _refuse_foreign_codes(con, model)               # ще раз під замком запису: після перегляду код міг зайняти хтось інший
     groups = dict(con.execute("SELECT code, id FROM nomen_group"))
     uoms = dict(con.execute("SELECT code, id FROM uom"))
     for it in model["items"]:
@@ -1358,6 +1416,8 @@ def _ensure_items(con, model):
         else:
             con.execute("UPDATE nomen SET name = ?, group_id = ?, uom_id = ?, per_ration = ?, note = ?, archived_at = ?, "
                         "app_price_kop = ? WHERE id = ?", (*vals, row["id"]))
+            if str(it["code"]) in model.get("claimed", ()):      # рядок прийшов із книги СП чи РП: її ознака 1/прод не лишається
+                con.execute("UPDATE nomen SET prod1_kind = NULL WHERE id = ?", (row["id"],))
         if model.get("lineCol", True):                           # книга без «рядок норми» рядків норми не змінює
             con.execute("UPDATE nomen SET norm_line = ? WHERE code = ?", (it.get("line"), it["code"]))
 
@@ -1401,7 +1461,8 @@ def _held_acts(con):
     перепише документи: документ, рядки якого в книзі змінено, записується наново, і дані акта йшли б разом зі старим."""
     held = {}
     for r in con.execute("""SELECT a.*, d.doc_date, d.number, s.name AS sub FROM act a JOIN document d ON d.id = a.document_id
-                              JOIN subdivision s ON s.id = d.from_subdivision_id"""):
+                              JOIN subdivision s ON s.id = d.from_subdivision_id
+                             WHERE a.kind IN """ + _OP_KINDS_SQL):
         doc = r["document_id"]
         held[(r["doc_date"], " ".join(str(r["number"]).split()), r["sub"])] = {
             "doc": doc, "act": {k: r[k] for k in ("kind", "series", "point_id", "period_from", "period_to", "rations",
@@ -1509,7 +1570,7 @@ def _apply_acts(con, model, held):
                                    {"papers": a["papers"], "note": a["note"], "signers": []}, off_norm=off)
             except state_db.SaveError as e:
                 problems.append(f"{a['row']}: {e}")
-        for (doc,) in con.execute("SELECT document_id FROM act").fetchall():
+        for (doc,) in con.execute("SELECT document_id FROM act WHERE kind IN " + _OP_KINDS_SQL).fetchall():
             if doc not in acts:
                 con.execute("DELETE FROM act WHERE document_id = ?", (doc,))
     else:

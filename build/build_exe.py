@@ -40,8 +40,9 @@ def command(version_file):
            "--workpath", WORK,
            "--specpath", WORK]
     # data.js у збірку не йде: програма будує його з бази при запиті.
-    for asset in ("index.html", "style.css", "app.js"):
+    for asset in ("index.html", "style.css"):
         cmd += ["--add-data", os.path.join(APP, asset) + ";."]
+    cmd += ["--add-data", os.path.join(APP, "js") + ";js"]        # модулі сторінки
     # Схема бази, бланк накладної служби й модулі вивантаження в Excel: модулі
     # імпортуються всередині обробника запиту, тому PyInstaller про них треба
     # сказати явно.
@@ -55,10 +56,17 @@ def command(version_file):
             # Книга «Облік ОП», заявка на посуд і миючі, звірка з ФЕС; норми наказу №390 — одні для заявки й сторінки.
             "--hidden-import", "op_book", "--hidden-import", "op_request",
             "--hidden-import", "op_fes", "--hidden-import", "fes_read",
+            # Книги «Облік СП» і «Облік РП» (з актами сухпаю книги СП), «1прод» і забезпеченість сухпаю, календар ПС.
+            "--hidden-import", "book_xlsx", "--hidden-import", "sp_book_acts", "--hidden-import", "suhpay_days",
+            "--hidden-import", "zabezpechenist", "--hidden-import", "prod.ps_calendar",
+            # Описи № 572 запасів з книг обліку (рушій iprod tools/inv/opysy_knyhy, бланк — opysy_forma).
+            "--hidden-import", "opysy_api", "--hidden-import", "prod.opysy_forma", "--hidden-import", "prod.opysy_knyhy",
             "--hidden-import", "op_norms",
             "--hidden-import", "dobovka",
             "--hidden-import", "op_acts",
             "--hidden-import", "op_act_export",
+            # Акти сухпаю на ядрі актів: рушій і пакет паперів.
+            "--hidden-import", "sp_acts", "--hidden-import", "sp_act_export",
             # Закупівлі: папери пакета з коду, запис закупівель у базу, книга закупівель; відбиток файлів, який
             # рахують і лаунчер, і папери (контейнер .xls без міток часу).
             "--hidden-import", "purchase_papers", "--hidden-import", "purchases_db",
@@ -66,6 +74,7 @@ def command(version_file):
             # Акт ЯТС складає python-docx: йому потрібні його шаблони документа.
             "--collect-data", "docx",
             "--hidden-import", "reports.form21", "--hidden-import", "reports.form2",
+            "--hidden-import", "reports.form11",
             "--collect-submodules", "reports.journals"]
     cmd.append(os.path.join(ROOT, "desktop", "launcher.py"))
     return cmd

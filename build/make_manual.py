@@ -4,7 +4,8 @@
 
 Джерело — docs/інструкція-користувача.md. Підтримується те, що в ній
 вживається: заголовки #…####, абзаци, переліки «- » і «1. », таблиці на «|»,
-цитати «> », жирний **…** і код `…` усередині рядка.
+цитати «> », жирний **…** і код `…` усередині рядка, блоки коду між рядками «```»
+(рядок за рядком шрифтом Consolas, без мітки мови).
 
     python build/make_manual.py [вихідний .docx]
 """
@@ -74,6 +75,18 @@ def build_manual(source=SOURCE, out=None):
         doc.styles[name].font.color.rgb = RGBColor(0x2B, 0x3A, 0x42)
 
     para, table, i = [], [], 0
+    fenced, last_code = False, None
+
+    def code_line(text):
+        """Рядок блока коду — окремий абзац Consolas без проміжків: блок виглядає, як у Markdown, а відступи лишаються."""
+        nonlocal last_code
+        p = doc.add_paragraph()
+        p.paragraph_format.space_after = Pt(0)
+        p.paragraph_format.left_indent = Cm(0.5)
+        run = p.add_run(text)
+        run.font.name = "Consolas"
+        run.font.size = Pt(9)
+        last_code = p
 
     def flush_para():
         if para:
@@ -89,6 +102,16 @@ def build_manual(source=SOURCE, out=None):
     while i < len(lines):
         line = lines[i]
         i += 1
+        if line.strip().startswith("```"):                  # межа блока коду; мітку мови («```json») у документ не беруть
+            flush_para()
+            flush_table()
+            if fenced and last_code is not None:
+                last_code.paragraph_format.space_after = Pt(8)
+            fenced = not fenced
+            continue
+        if fenced:
+            code_line(line)
+            continue
         if line.strip().startswith("|"):
             flush_para()
             table.append(line)

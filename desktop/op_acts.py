@@ -8,6 +8,8 @@
 до кроку групи, не більше залишку місця пункту на кінець періоду й на дату акта; кількість пулу (рядок
 норми наказу 390, op_norms.pool_key) ділиться між кодами за порядком надходження — спершу код із найстаршою партією.
 Номер акта — один на рік серед документів вибуття; виправляють лише наявний акт (його документ).
+Вид акта (`Kind`) — що він рахує й пише поверх спільного складання (документ, дані акта, статус ФЕС — однією
+транзакцією): вид «op390» — цей модуль (`OP390`), акти сухпаю — `sp_acts`.
 """
 import datetime as dt
 import re
@@ -181,10 +183,12 @@ def _first_batch(con, sub_id, nomen_id, day, exclude):
     return row[0] or "9999-12-31"
 
 
-def next_number(con, series, year, exclude=0):
+def next_number(con, series, year, exclude=0, fmt=None):
     """Наступний вільний номер серії за рік: найбільший номер документа вибуття цього року + 1
-    (документ `exclude` не рахується)."""
-    series = _series(series)
+    (документ `exclude` не рахується). `fmt` — формат номера іншого виду («СП{year}-{n:03d}»); без нього — ОП чи МЗ."""
+    if fmt is None:
+        series = _series(series)
+        fmt = SERIES[series]["fmt"]
     pat = re.compile(rf"^{re.escape(series)}{int(year)}-(\d+)$")
     top = 0
     for (no,) in con.execute("""SELECT d.number FROM document d JOIN doc_kind k ON k.id = d.kind_id
@@ -193,7 +197,7 @@ def next_number(con, series, year, exclude=0):
         m = pat.match(str(no).strip())
         if m:
             top = max(top, int(m.group(1)))
-    return SERIES[series]["fmt"].format(year=int(year), n=top + 1)
+    return fmt.format(year=int(year), n=top + 1)
 
 
 def defaults(con, series, point_ext, today):
@@ -312,6 +316,25 @@ def _name(r):
     return r["full_name"] or ""
 
 
+def _official_on(con, role, day):
+    """Посадовець «Люди й МВО» з роллю `role` на дату `day` (рядок person) чи None."""
+    return con.execute("""SELECT p.* FROM official o JOIN person p ON p.id = o.person_id
+                           WHERE o.role = ? AND o.valid_from <= ? AND (o.valid_to IS NULL OR o.valid_to > ?)
+                           ORDER BY o.valid_from DESC LIMIT 1""", (role, day, day)).fetchone()
+
+
+def _mvo_on(con, sub_id, day):
+    """МВО місця `sub_id` на дату `day` (рядок person) чи None."""
+    return con.execute("""SELECT p.* FROM responsible x JOIN person p ON p.id = x.person_id
+                           WHERE x.subdivision_id = ? AND x.valid_from <= ? AND (x.valid_to IS NULL OR x.valid_to > ?)
+                           ORDER BY x.valid_from DESC LIMIT 1""", (sub_id, day, day)).fetchone()
+
+
+def _signer(role, r):
+    """Підписант акта з рядка person: посада, звання, «Ім'я ПРІЗВИЩЕ»."""
+    return {"role": role, "sort": 0, "pos": r["position"] or "", "rank": r["rank"] or "", "name": _name(r)}
+
+
 def default_signers(con, point_ext, day):
     """З попереднього акта пункту, де підписантів записано; якщо такого немає — посадовці програми й МВО місця на дату."""
     p = point(con, point_ext)
@@ -326,16 +349,12 @@ def default_signers(con, point_ext, day):
                 for r in con.execute("SELECT * FROM act_signer WHERE document_id = ? ORDER BY role, sort", (prev[0],))]
     out = []
     for role, official in _OFFICIALS:
-        r = con.execute("""SELECT p.* FROM official o JOIN person p ON p.id = o.person_id
-                            WHERE o.role = ? AND o.valid_from <= ? AND (o.valid_to IS NULL OR o.valid_to > ?)
-                            ORDER BY o.valid_from DESC LIMIT 1""", (official, day, day)).fetchone()
+        r = _official_on(con, official, day)
         if r:
-            out.append({"role": role, "sort": 0, "pos": r["position"] or "", "rank": r["rank"] or "", "name": _name(r)})
-    r = con.execute("""SELECT p.* FROM responsible x JOIN person p ON p.id = x.person_id
-                        WHERE x.subdivision_id = ? AND x.valid_from <= ? AND (x.valid_to IS NULL OR x.valid_to > ?)
-                        ORDER BY x.valid_from DESC LIMIT 1""", (p["sub_id"], day, day)).fetchone()
+            out.append(_signer(role, r))
+    r = _mvo_on(con, p["sub_id"], day)
     if r:
-        out.append({"role": "МВО", "sort": 0, "pos": r["position"] or "", "rank": r["rank"] or "", "name": _name(r)})
+        out.append(_signer("МВО", r))
     return out
 
 
@@ -366,31 +385,37 @@ def _clean_signers(recs):
     return out
 
 
-def _check_papers(papers):
-    """Папери пакета ({роль: {no, date}}) — до запису: дата кожного — справжня."""
+def _check_papers(papers, roles=PAPER_ROLES):
+    """Папери пакета ({роль: {no, date}}) — до запису: дата кожного паперу виду (`roles`) — справжня."""
     if papers is None:
         return
     if not isinstance(papers, dict):
         raise SaveError("Папери акта не впізнано. Оновіть сторінку.")
     for role, rec in papers.items():
-        if role in PAPER_ROLES and rec is not None and not isinstance(rec, dict):
+        if role in roles and rec is not None and not isinstance(rec, dict):
             raise SaveError(f"Папір «{role}» не впізнано. Оновіть сторінку.")
-        if role in PAPER_ROLES and isinstance(rec, dict) and rec.get("date"):
+        if role in roles and isinstance(rec, dict) and rec.get("date"):
             _iso(rec["date"], f"Дата паперу «{role}»")
 
 
 def _write_act(con, doc, prop, spec, off_norm=False):
-    con.execute("""INSERT INTO act(document_id, kind, series, point_id, period_from, period_to, rations, off_norm, note)
-                   VALUES(?, ?, ?, (SELECT id FROM food_point WHERE ext_id = ?), ?, ?, ?, ?, ?)
+    """Дані акта поруч із документом. Вид (`kind`), папери виду (`paperRoles`) і одержувач (`party`) — з пропозиції;
+    без них — вид «op390» з його паперами й без одержувача."""
+    roles = prop.get("paperRoles") or PAPER_ROLES
+    con.execute("""INSERT INTO act(document_id, kind, series, point_id, period_from, period_to, rations, off_norm, note,
+                                   party)
+                   VALUES(?, ?, ?, (SELECT id FROM food_point WHERE ext_id = ?), ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(document_id) DO UPDATE SET kind = excluded.kind, series = excluded.series,
                      point_id = excluded.point_id, period_from = excluded.period_from, period_to = excluded.period_to,
-                     rations = excluded.rations, off_norm = excluded.off_norm, note = excluded.note""",
-                (doc, KIND, prop["series"], prop["point"], prop["from"], prop["to"], prop["rations"], int(off_norm),
-                 " ".join(str(spec.get("note") or "").split()) or None))
+                     rations = excluded.rations, off_norm = excluded.off_norm, note = excluded.note,
+                     party = excluded.party""",
+                (doc, prop.get("kind") or KIND, prop["series"], prop["point"], prop["from"], prop["to"], prop["rations"],
+                 int(off_norm), " ".join(str(spec.get("note") or "").split()) or None,
+                 " ".join(str(prop.get("party") or "").split()) or None))
     for t in ("act_paper", "act_signer", "act_item"):
         con.execute(f"DELETE FROM {t} WHERE document_id = ?", (doc,))
     for role, rec in (spec.get("papers") or {}).items():
-        if role in PAPER_ROLES and isinstance(rec, dict) and (rec.get("no") or rec.get("date")):
+        if role in roles and isinstance(rec, dict) and (rec.get("no") or rec.get("date")):
             on = _iso(rec["date"], f"Дата паперу «{role}»") if rec.get("date") else None
             con.execute("INSERT INTO act_paper(document_id, role, number, doc_date) VALUES(?, ?, ?, ?)",
                         (doc, role, " ".join(str(rec.get("no") or "").split()) or None, on))
@@ -398,8 +423,10 @@ def _write_act(con, doc, prop, spec, off_norm=False):
         con.execute("INSERT INTO act_signer(document_id, role, sort, position, rank, name) VALUES(?, ?, ?, ?, ?, ?)",
                     (doc, *row))
     for l in prop["lines"]:
-        con.execute("""INSERT OR REPLACE INTO act_item(document_id, nomen_id, norm)
-                       VALUES(?, (SELECT id FROM nomen WHERE code = ?), ?)""", (doc, l["code"], l["norm"]))
+        con.execute("""INSERT OR REPLACE INTO act_item(document_id, nomen_id, norm, role, people_days, heater)
+                       VALUES(?, (SELECT id FROM nomen WHERE code = ?), ?, ?, ?, ?)""",
+                    (doc, l["code"], l["norm"], l.get("role"), l.get("pdays"),
+                     None if l.get("heater") is None else int(bool(l["heater"]))))
 
 
 def _log(con, what, key, text, who):
@@ -413,24 +440,60 @@ def _overlap_ok(spec):
     return {" ".join(str(x).split()) for x in got if isinstance(x, (str, int))} if isinstance(got, list) else set()
 
 
-def save(con, spec, who=None):
+class Kind:
+    """Вид акта поверх спільного складання: що він рахує (`compute`), яка примітка в рядках документа, який статус ФЕС
+    має новий акт і як його міняє виправлення (`restatus`), що вид пише поруч у тій самій транзакції (`extra`), як акт
+    названо в журналі змін і де лежать файли його пакета (`folder`, `package` — для чистки пакета старого номера). Вид
+    «op390» — цей модуль; акти сухпаю — `sp_acts.SP`."""
+    code = KIND
+    paper_roles = PAPER_ROLES
+    folder = "opActs"
+
+    def package(self, number):
+        return package_names(number)
+
+    def compute(self, con, spec):
+        return compute(con, spec)
+
+    def note(self, prop, line):
+        return ""
+
+    def status(self, spec, prop):
+        return "на підписі"
+
+    def restatus(self, con, doc, spec, prop):
+        """Виправлення акта: статус ФЕС, який вид міняє сам (вид «op390» — жодного: статус веде людина)."""
+
+    def extra(self, con, doc, prop, spec, number):
+        """Вид «op390» поруч нічого не пише."""
+
+    def words(self, number, prop):
+        return (f"Акт №{number}: {prop['pointName']}, {_dmy(prop['from'])} — {_dmy(prop['to'])}, {prop['rations']} д/д, "
+                f"{len(prop['lines'])} поз.")
+
+
+OP390 = Kind()
+
+
+def save(con, spec, who=None, kind=None):
     """Складає новий акт чи виправляє наявний (`docId`): документ вибуття, дані акта, статус ФЕС — разом.
     `docId` — лише документ наявного акта: акт, видалений в іншому вікні, не складається наново;
     `was` ({number, date, from, to, sig}) — яким акт був у вікні: інший чи виправлений деінде акт не переписується;
     `overlapOk` — номери актів, перетин із якими вікно показало: перетин з іншим (акт склали, поки вікно було
     відкрите) — відмова, перевіряється в транзакції; `locked: true` — людина погодилась на закритий період
     (позначка в журналі змін, як для решти документів)."""
+    kind = kind or OP390                                     # вид акта (`Kind`); без нього — «op390»
     number = " ".join(str(spec.get("number") or "").split())
     if not number or "|" in number:
         raise SaveError("Вкажіть номер акта.")
     _clean_signers(spec.get("signers"))                      # підписанти й папери — до запису, не після документа
-    _check_papers(spec.get("papers"))
+    _check_papers(spec.get("papers"), kind.paper_roles)
     doc_id = _doc_id(spec.get("docId"))
     if doc_id and not _act_exists(con, doc_id):
         raise SaveError(GONE)
     if doc_id and not _same_act(con, doc_id, spec.get("was")):
         raise SaveError(CHANGED)
-    prop = compute(con, spec)
+    prop = kind.compute(con, spec)
     if not prop["lines"]:
         raise SaveError("Немає чого списувати: " + ("; ".join(w.rstrip(".") for w in prop["warnings"])
                                                      or "немає залишку позицій із нормою") + ".")
@@ -445,7 +508,7 @@ def save(con, spec, who=None):
             raise SaveError(f"Документ №{number} уже є в {day[:4]} році.")
         seen = _overlap_ok(spec)                             # перетин, якого пропозиція у вікні не показала, — відмова
         fresh = [o for o in _overlaps(con, prop["series"], point(con, prop["point"])["id"], prop["from"], prop["to"], doc_id)
-                 if o[0] not in seen]
+                 if o[0] not in seen] if prop["point"] else []
         if fresh:
             raise SaveError("Період перетинається з " + ", ".join(f"актом №{no} ({_dmy(a)} — {_dmy(b)})" for no, a, b in fresh)
                             + ". Перевірте період і збережіть ще раз.")
@@ -456,7 +519,7 @@ def save(con, spec, who=None):
         docs = state_db._load_docs(con)
         rows = [r for r in docs.get("writeoffs", [])
                 if not (doc_id and len(r) > 10 and state_db._doc_key(r[10]) == doc_id)]
-        rows += [[day, PAPER, number, holder, "", l["code"], l["qty_milli"] / 1000, "", 0, "",
+        rows += [[day, PAPER, number, holder, "", l["code"], l["qty_milli"] / 1000, kind.note(prop, l), 0, "",
                   doc_id or None, "program"] for l in prop["lines"]]
         docs["writeoffs"] = rows
         state_db._save_docs(con, docs)
@@ -471,28 +534,33 @@ def save(con, spec, who=None):
             if len(fresh) != 1:
                 raise SaveError("Документ акта не записано. Оновіть сторінку й спробуйте ще раз.")
             doc = fresh[0]
-        _write_act(con, doc, prop, spec)
+        _write_act(con, doc, dict(prop, kind=kind.code, paperRoles=kind.paper_roles), spec)
+        kind.extra(con, doc, prop, spec, number)
         if not doc_id:
-            con.execute("""INSERT INTO document_fes(document_id, status, changed_on) VALUES(?, 'на підписі', ?)
-                           ON CONFLICT(document_id) DO NOTHING""", (doc, day))
+            con.execute("""INSERT INTO document_fes(document_id, status, changed_on) VALUES(?, ?, ?)
+                           ON CONFLICT(document_id) DO NOTHING""", (doc, kind.status(spec, prop), day))
+        else:
+            kind.restatus(con, doc, spec, prop)
         new = {k: v for k, v in state_db.negative_days(con).items() if k not in before}
         if new:
             raise SaveError(state_db._negative_words(con, new))
         if head:                                             # файли документа (пакет, скани) — за документом
             was_no = " ".join(str(head[1] or "").split())
             old = _key(head[0], was_no, head[2] or "")
-            names = package_names(was_no)
+            names = kind.package(was_no)
             # Пакет старого номера лишається в теці, але не в файлах акта; номер з тим самим іменем файла («/» → «-», інший
-            # регістр) — той самий пакет: його записи переходять до нового ключа разом з усім.
-            if [n.casefold() for n in names] != [n.casefold() for n in package_names(number)]:
-                con.execute("DELETE FROM app_file WHERE target = ? AND folder = 'opActs' AND file_name IN (?, ?)",
-                            (old, *names))
+            # регістр) — той самий пакет: його записи переходять до нового ключа разом з усім. Ім'я запису — без різниці
+            # регістру (як у _register): номер, раніше змінений лише регістром, лишив запис під іменем першого файла.
+            if [n.casefold() for n in names] != [n.casefold() for n in kind.package(number)]:
+                gone = {n.casefold() for n in names}
+                con.executemany("DELETE FROM app_file WHERE pos = ?", [(pos,) for pos, name in con.execute(
+                    "SELECT pos, file_name FROM app_file WHERE target = ? AND folder = ?", (old, kind.folder)).fetchall()
+                    if name.casefold() in gone])
             if old != _key(day, number, holder):
                 con.execute("UPDATE app_file SET target = ?, doc_date = ?, doc_no = ? WHERE target = ?",
                             (_key(day, number, holder), day, number, old))
         _log(con, "акт виправлено" if doc_id else "акт складено", _key(day, number, holder),
-             f"Акт №{number}: {prop['pointName']}, {_dmy(prop['from'])} — {_dmy(prop['to'])}, {prop['rations']} д/д, "
-             f"{len(prop['lines'])} поз." + (LOCKED_MARK if spec.get("locked") is True else ""), who)
+             kind.words(number, prop) + (LOCKED_MARK if spec.get("locked") is True else ""), who)
         con.execute("COMMIT")
     except Exception:
         con.execute("ROLLBACK")
@@ -555,6 +623,9 @@ def act_of(con, doc_id):
         l["pool"] = key
     p = con.execute("SELECT p.*, s.name AS sub FROM food_point p JOIN subdivision s ON s.id = p.subdivision_id "
                     "WHERE p.ext_id = ?", (act["point"],)).fetchone()
+    # Дні акта: знімок днів рапорту (акт сухпаю) чи дободачі пункту за період (акт ОП/МЗ).
+    days = [[d, n, ""] for d, n in act["days"]] if act["days"] else \
+        rations(con, p["id"], act["from"], act["to"])["days"] if p else []
     return {**act, "docId": doc_id, "number": d["number"], "date": d["doc_date"], "sub": d["sub"], "sub_kind": d["kind"] or "",
             "pointName": p["name"] if p else "", "hall": (p["hall"] or "") if p else "", "title": (p["title"] or "") if p else "",
-            "days": rations(con, p["id"], act["from"], act["to"])["days"] if p else [], "lines": lines}
+            "days": days, "lines": lines}

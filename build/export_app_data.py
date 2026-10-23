@@ -55,7 +55,7 @@ def items_of(con):
     for r in con.execute("""
             SELECT n.id, n.code, n.name, g.code AS grp, u.code AS uom,
                    n.is_fixed_asset, n.source, n.fes_code, n.note, n.old_code, n.archived_at,
-                   n.per_ration, n.norm_line, COALESCE(p.price_kop, n.app_price_kop) AS price_kop
+                   n.per_ration, n.norm_line, n.prod1_kind, COALESCE(p.price_kop, n.app_price_kop) AS price_kop
               FROM nomen n
               JOIN nomen_group g ON g.id = n.group_id
               JOIN uom u ON u.id = n.uom_id
@@ -78,6 +78,8 @@ def items_of(con):
             # Норма на одну добову видачу позиції книги ОП, у кількості одиниці позиції (порожньо — не задано), і рядок
             # норми наказу 390, вибраний у картці (ключ op_norms.PER_RATION; порожньо — не вибрано).
             r["per_ration"], r["norm_line"] or "",
+            # Вид рядка 1/прод позиції сухпаю (ПНСП, ДПНП, іноземні добові…).
+            r["prod1_kind"] or "",
         ])
     return out
 
@@ -503,12 +505,21 @@ def payload(con) -> dict:
     form2_rows, form2_map, form2_sub = form2_of(con)
     period = con.execute(
         "SELECT MIN(doc_date), MAX(doc_date) FROM document").fetchone()
-    # Коли книгу «Облік ОП» вивантажували востаннє — для нагадування на Зведенні.
-    op_export = con.execute("SELECT value FROM app_setting WHERE key = 'op_book_export'").fetchone()
-    try:
-        op_export = json.loads(op_export[0]) if op_export else ""
-    except ValueError:
-        op_export = ""
+    # Коли востаннє вивантажували книги ОП, СП і РП — для нагадування на Зведенні.
+    # Дату ОП раніше тримав ключ op_book_export: він лишається запасним, якщо book_export порожній.
+    def _setting(key, default):
+        row = con.execute("SELECT value FROM app_setting WHERE key = ?", (key,)).fetchone()
+        try:
+            return json.loads(row[0]) if row else default
+        except ValueError:
+            return default
+
+    op_export = _setting("op_book_export", "")
+    op_export = op_export if isinstance(op_export, str) else ""
+    book_export = _setting("book_export", {})
+    book_export = book_export if isinstance(book_export, dict) else {}
+    book_export = {b: str(book_export.get(b) or "") for b in ("ОП", "СП", "РП")}
+    book_export["ОП"] = book_export["ОП"] or op_export
 
     legal = conf.get("unit_legal_name", "") or ""
     unit_code = (re.search(r"частина\s+(\S+)", legal, re.I) or [None, ""])[1] if legal else ""
@@ -516,7 +527,7 @@ def payload(con) -> dict:
     "meta": {
         "unit": unit_code,
         "service": "продовольча служба",
-        # Версія програми й схема бази — для рядка внизу панелі ⚙.
+        # Версія програми й схема бази — для екрана «Налаштування».
         "version": APP_VERSION,
         "versionDate": APP_VERSION_DATE,
         "schema": current_version(con),
@@ -531,12 +542,13 @@ def payload(con) -> dict:
         "edrpou": conf.get("unit_edrpou", ""),
         "serviceFull": conf.get("service_full", ""),
         "validDays": int(conf.get("invoice_valid_days") or 1),
-        "opBookExport": op_export if isinstance(op_export, str) else "",
+        "opBookExport": op_export,
+        "bookExport": book_export,
     },
     "groups": groups,
     "itemCols": ["code", "name", "group", "unit", "price", "cat",
                  "serial", "chassis", "year", "nonrev", "own", "fes", "note", "old", "archived",
-                 "perRation", "normLine"],
+                 "perRation", "normLine", "kind1"],
     "items": items,
     "subCols": ["name", "parent", "kind", "depth", "sort", "used", "active", "note", "id", "refs"],
     "subs": subs,

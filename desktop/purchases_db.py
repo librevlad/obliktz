@@ -24,6 +24,8 @@ PRICE_RULES = ("середня", "КП", "вручну")
 OFFER_KINDS = ("посилання", "КП")
 DOC_KINDS = ("договір", "ВН", "рахунок", "довіреність", "оплата", "акт введення", "інше")
 DOC_STATES = ("", "чернетка", "підготовлено", "затверджено")
+# Статуси ФЕС документів закупівель — п'ять, які знає таблиця pur_doc: «роздрукувати» належить документам чотирьох книг.
+PUR_FES_STATUSES = tuple(s for s in FES_STATUSES if s != "роздрукувати")
 # Прихід в обліку — акт приймання (і перенесення залишків): лише на такі документи вказує зв'язок приходу.
 ACT_KINDS = ("act_in", "opening")
 _IS_ACT = f"k.code IN ({', '.join('?' * len(ACT_KINDS))})"
@@ -286,7 +288,7 @@ def _save_doc(con, d, pos, purs, people, keys, acts, cache, line_ref, names, use
     if d.get("state", "") not in DOC_STATES:
         raise SaveError(f"{what}: невідомий стан {d.get('state')!r}")
     fes = d.get("fes") or {}
-    if fes.get("status", "") not in ("",) + FES_STATUSES:
+    if fes.get("status", "") not in ("",) + PUR_FES_STATUSES:
         raise SaveError(f"{what}: невідомий статус ФЕС {fes.get('status')!r}")
     purchase = _t(d.get("purchase"))
     kop = _kop(d.get("kop"), what)

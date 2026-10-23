@@ -93,11 +93,11 @@ class PackageConflict(Exception):
         self.changed = list(changed)
 
 
-def _own_shas(con, name):
+def _own_shas(con, name, folder=None):                  # folder — тека пакета виду: «opActs», в акта сухпаю «spActs»
     """Відбитки, якими програма записувала файл пакета з таким іменем (записи про файли актів, тека «opActs»); ім'я — без
     різниці регістру, як його бачить Windows (номер перенумерували лише регістром — файл той самий)."""
     return {sha for file_name, sha in con.execute("SELECT file_name, sha256 FROM app_file WHERE folder = ? AND sha256 IS NOT NULL",
-                                                  (SCAN_FOLDER,)) if file_name.casefold() == name.casefold()}
+                                                  (folder or SCAN_FOLDER,)) if file_name.casefold() == name.casefold()}
 
 
 def conflicts(con, root, series, year, number):
@@ -362,7 +362,10 @@ def _calc(ws, a, req, sig):
     ws[f"A{14 + extra}"] = f"{chief['rank']} ______________________ {chief['name']}".strip()
 
 
-def _act(ws, a, req, sig):
+def _act(ws, a, req, sig, att=None, conclusion=None, ground="Списання", sum_mixed=False):
+    """Аркуш «Акт» (Додаток 10). Додатки (`att`, до чотирьох), висновок комісії й підстава (`ground`) — від виду акта;
+    без них — як в акта ОП/МЗ за нормами 390. `sum_mixed` — «всього» кількостей і рядків різних одиниць (акт сухпаю, як у
+    паперах служби); в акта ОП/МЗ штуки й кілограми не додаються."""
     issue = _issue(a)
     ws["AL5"] = req["actForm"] or None
     cmd = _who(sig, "командир")
@@ -371,7 +374,7 @@ def _act(ws, a, req, sig):
     _fit_text(ws, "AG10")
     ws["AG12"] = "___.___.20___"
     ws["AB29"], ws["Q34"], ws["X34"] = a["number"], a["number"], _dmy(a["date"])
-    ws["AD34"], ws["AM34"], ws["AW34"] = "Списання", _dmy(a["date"]), req["code"] or None
+    ws["AD34"], ws["AM34"], ws["AW34"] = ground, _dmy(a["date"]), req["code"] or None
     n = len(a["lines"])
     hidden = sorted(r for r, d in ws.row_dimensions.items() if d.hidden and r >= ACT_TOTAL)
     extra = _grow(ws, ACT_FIRST, ACT_SLOTS, ACT_TOTAL, n, 53)
@@ -422,21 +425,23 @@ def _act(ws, a, req, sig):
         ws[f"AR{t}"].number_format, ws[f"AU{t}"].number_format = _qfmt([s for s in saved if s > 0]), "#,##0.00"
     else:
         ws[f"AR{t}"] = ws[f"AU{t}"] = "---"
-    if len({l["uom"] for l in a["lines"]}) > 1:                       # штуки й кілограми не додаються
+    if len({l["uom"] for l in a["lines"]}) > 1 and not sum_mixed:     # штуки й кілограми не додаються
         ws[f"Z{t}"] = ws[f"AG{t}"] = None
         if any(s > 0 for s in saved):
             ws[f"AR{t}"] = None
     zv = a["papers"].get("звірка") or {}
     period = f"за період з {_dmy(a['from'])} по {_dmy(a['to'])} року"
-    att = ([f"НАКЛАДНА (вимога) №{issue[0]} від {_dmy(issue[1])} року;"] if issue else []) + [
-        f"РАПОРТ-ДОНЕСЕННЯ {period};", f"АКТ ЗВІРКИ №{zv.get('no') or a['number']} від {_dmy(zv.get('date') or a['date'])} {period};",
-        f"РОЗРАХУНОК {period}."]
+    if att is None:
+        att = ([f"НАКЛАДНА (вимога) №{issue[0]} від {_dmy(issue[1])} року;"] if issue else []) + [
+            f"РАПОРТ-ДОНЕСЕННЯ {period};", f"АКТ ЗВІРКИ №{zv.get('no') or a['number']} від {_dmy(zv.get('date') or a['date'])} {period};",
+            f"РОЗРАХУНОК {period}."]
     for i in range(4):
         ws[f"A{71 + extra + i}"] = f"{i + 1}. {att[i]}" if i < len(att) else None
-    basis = (f"накладної (вимоги) №{issue[0]} від {_dmy(issue[1])}, " if issue else "")
-    ws[f"A{76 + extra}"] = (f"Висновок комісії: на підставі {basis}акта звірки №{zv.get('no') or a['number']} {period} та "
-                            f"розрахунку за нормами наказу МОУ №390 — {_words(a)[0]} списати з "
-                            f"обліку {_unit(req)}.")
+    if conclusion is None:
+        basis = (f"накладної (вимоги) №{issue[0]} від {_dmy(issue[1])}, " if issue else "")
+        conclusion = (f"Висновок комісії: на підставі {basis}акта звірки №{zv.get('no') or a['number']} {period} та "
+                      f"розрахунку за нормами наказу МОУ №390 — {_words(a)[0]} списати з обліку {_unit(req)}.")
+    ws[f"A{76 + extra}"] = conclusion
     # Члени комісії — ті, хто є, підряд з першого рядка («Члени комісії:» бланка — на ньому): немає першого — другий
     # стає на його місце, а не лишає порожній рядок посередині; порожні рядки для руки — лише в кінці.
     members = [sig[k] for k in sorted(k for k in sig if k[0] == "член комісії")][:len(MEMBER_ROWS)]
@@ -549,9 +554,9 @@ SCAN_FOLDER = "opActs"
 XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 
-def _register(con, a, root, files):
-    """Файли пакета — у файли документа акта (як скани): ключ документа на сторінці, тека «opActs», шлях від неї,
-    відбиток. Повторне складання пакета заміняє записи тих самих файлів."""
+def _register(con, a, root, files, folder=SCAN_FOLDER):
+    """Файли пакета — у файли документа акта (як скани): ключ документа на сторінці, тека пакета (`folder`: «opActs»,
+    у акта сухпаю — «spActs»), шлях від неї, відбиток. Повторне складання пакета заміняє записи тих самих файлів."""
     key = f"wr|{a['date']}|{a['number']}|{a['sub']}|"
     con.execute("BEGIN IMMEDIATE")
     try:
@@ -567,7 +572,7 @@ def _register(con, a, root, files):
             con.execute("""INSERT INTO app_file(pos, id, target, doc_date, doc_no, file_name, rel_path, mime, size_bytes,
                            folder, sha256) VALUES(?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (n, key, a["date"], a["number"], os.path.basename(f),
-                         os.path.relpath(f, root).replace(os.sep, "/"), XLSX, len(data), SCAN_FOLDER,
+                         os.path.relpath(f, root).replace(os.sep, "/"), XLSX, len(data), folder,
                          stable_hash.stable_sha_bytes(data)))
         con.execute("COMMIT")
     except Exception:

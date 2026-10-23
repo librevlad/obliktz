@@ -2,7 +2,7 @@
 """Звіт-заявка 2/прод — з бази програми, за бланком А2788.
 
 Графи 8 і 5 — зі зданого звіту минулого року (так велить методичка: гр.8 = гр.18 минулого
-звіту), рух року — з документів обох книг обліку по рядках, до яких прив'язано коди (з
+звіту), рух року — з документів книг ТЗ і ОП по рядках, до яких прив'язано коди (з
 множником одиниць), помилки минулих звітів — записками в гр.14 (+) і гр.17 (−). Гр.18 мусить
 дорівнювати обліку на кінець року; різницю програма пропонує закрити запискою.
 
@@ -128,6 +128,7 @@ def collect(con, year, as_of=None):
                    d.note, e.form2_col, l.nomen_id, n.code, SUM(l.qty_milli) AS q
               FROM document d JOIN doc_kind k ON k.id = d.kind_id
               JOIN document_line l ON l.document_id = d.id JOIN nomen n ON n.id = l.nomen_id
+              JOIN nomen_group g ON g.id = n.group_id AND g.book IN ('ТЗ', 'ОП')
               LEFT JOIN counterparty c ON c.id = d.counterparty_id
               LEFT JOIN counterparty_kind ck ON ck.id = c.kind_id
               LEFT JOIN document_extra e ON e.document_id = d.id

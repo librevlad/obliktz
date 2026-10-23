@@ -3,7 +3,7 @@
 
 Піднімає локальний сервер на вільному порту (тільки 127.0.0.1, назовні нічого
 не слухає) і відкриває вікно WebView2 без адресного рядка й вкладок. Коли на
-основному ПК увімкнено роботу в мережі (⚙ → «Робота в мережі»), сервер слухає й
+основному ПК увімкнено роботу в мережі («Налаштування» → «Робота в мережі»), сервер слухає й
 мережу на сталому порту, а інші ПК відкривають програму в браузері — з кодом доступу
 (див. network.py). Стан
 користувача — норми, проведені документи, записи знищення — лягає в ту саму
@@ -14,6 +14,7 @@
 """
 import sys, os, re, io, json, socket, sqlite3, threading, subprocess, tempfile, shutil, time
 import contextlib
+import datetime
 import gc
 import ntpath
 import traceback
@@ -22,7 +23,8 @@ from urllib.parse import quote, unquote, parse_qs
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 APP_NAME = "Облік ТЗ ПС"
-ASSETS = ("index.html", "style.css", "app.js")
+# Сторінка: index.html, стилі й модулі app/js, які підключає index.html (порядок — його).
+ASSETS = ("index.html", "style.css")
 MIME = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8",
         ".js": "text/javascript; charset=utf-8", ".json": "application/json; charset=utf-8",
         ".pdf": "application/pdf", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
@@ -141,7 +143,7 @@ from db.connect import (apply_migrations, checked_version, current_version,   # 
                         APP_SCHEMA_VERSION, SchemaTooNewError, SchemaTooOldError)
 from build import export_app_data                     # noqa: E402
 from build import verify_db                           # noqa: E402
-from reports import form2, form21, journals           # noqa: E402
+from reports import form2, form11, form21, journals   # noqa: E402
 
 ROOT = base_dir()
 DATA = data_dir()
@@ -155,7 +157,7 @@ LAST_WRITE = {"who": "", "at": ""}
 # копію діалогом Windows, відкрити файл чи теку програмою цього ПК (і теку акта), змінити
 # налаштування мережі, шукати файли в теках служби за вмістом.
 HOST_ONLY = {"/api/restore", "/api/restore-file", "/api/copy", "/api/reveal", "/api/open", "/api/network",
-             "/api/folders", "/api/files-find", "/api/op-act/reveal"}
+             "/api/folders", "/api/files-find", "/api/op-act/reveal", "/api/sp-act/reveal"}
 
 
 def net_cfg() -> dict:
@@ -171,6 +173,11 @@ def host_name() -> str:
 ASSET_CACHE = {}
 for name in ASSETS:
     with open(os.path.join(ROOT, name), "rb") as f:
+        ASSET_CACHE[name] = f.read()
+PAGE_MODULES = tuple(re.findall(r'<script src="(js/[\w.-]+\.js)"></script>',
+                                ASSET_CACHE["index.html"].decode("utf-8")))
+for name in PAGE_MODULES:
+    with open(os.path.join(ROOT, *name.split("/")), "rb") as f:
         ASSET_CACHE[name] = f.read()
 
 
@@ -508,6 +515,10 @@ def backup_before_upgrade(con) -> str:
         raise StateBroken(f"перед оновленням бази не вдалося зберегти її копію: {e}") from e
 
 
+# Книга обліку за адресою маршруту (/api/book/<op|sp|rp>/…) і тека книг СП і РП у FOLDERS.
+BOOK_URL = {"op": "ОП", "sp": "СП", "rp": "РП"}
+BOOK_FOLDER = {"СП": "spBook", "РП": "rpBook"}
+
 # Теки, куди програма кладе файли ручного шляху: (ключ, підпис у «Налаштуваннях», типова тека
 # відносно «Дані обліку»). Перелік спільний: інші розділи (закупівлі) дописують сюди свої теки.
 FOLDERS = [
@@ -518,8 +529,11 @@ FOLDERS = [
     ("purchases", "Закупівлі", "Закупівлі"),
     ("receipts", "Прибутково-видаткові документи", "Прибутково-видаткові документи"),
     ("fesRegisters", "Реєстри на ФЕС", "Реєстри на ФЕС"),
+    ("spActs", "Акти сухпаю", os.path.join("вивантаження", "Акти сухпаю")),
     ("opActs", "Акти списання ОП", os.path.join("вивантаження", "Акти списання")),
     ("dobovka", "Добовка", None),            # лише читання; типового значення немає — «Налаштування» → «Теки»
+    ("spBook", "Книга «Облік СП»", "вивантаження"),
+    ("rpBook", "Книга «Облік РП»", "вивантаження"),
 ]
 # Теки, у які програма лише дивиться: Добовку читають інші програми служби за сталим шляхом, тож ні файла (/api/scan), ні
 # каталогу («Показати в теці» з `make`) там не створюється. Значення — відповідь на спробу.
@@ -974,6 +988,67 @@ def _names_act(req):
         return True
 
 
+def _sukhpai_refusal(file, problems):
+    """Слова читача аркуша «Сухпай» (dobovka) одним реченням разом із тим, звідки аркуш: «Файл «…» не є книгою Excel
+    (.xlsx).», «Файл «…»: немає аркуша «Сухпай».», «Файл «…», аркуш «Сухпай» впізнано, але …», «Вставлений аркуш «Сухпай»
+    впізнано, але …». Слово, з якого починаються і «де», і слова читача, не повторюється; далі — з малої літери."""
+    text = " ".join(p if p.endswith(".") else p + "." for p in problems)
+    low = text[:1].lower() + text[1:]
+    if file:
+        head = f"Файл «{file}»"
+        if text.startswith("Файл "):
+            return f"{head} {text[len('Файл '):]}"
+        return f"{head}, {low}" if text.startswith("Аркуш ") else f"{head}: {low}"
+    if text.startswith("Аркуш «Сухпай» "):
+        return f"Вставлений аркуш «Сухпай» {text[len('Аркуш «Сухпай» '):]}"
+    return f"Вставлений аркуш: {low}"
+
+
+def dobovka_people(day):
+    """Особи на харчуванні з Добовки на день `day`: «разом» пунктів харчування того дня чи найближчого
+    раніше заповненого (аркуш «Пункти харчування», найновіша «Добовка*.xlsx» теки «Добовка»).
+    -> (осіб або None, джерело). Джерело: None — Добовки немає (теку не задано чи в ній немає файла);
+    {"file", "day"} — файл прочитано (day None — до цього дня в ньому нічого не внесено);
+    {"file", "error"} — файл не прочитано, error — причина словами для людини (подробиці — у консоль)."""
+    import dobovka                                           # noqa: PLC0415
+    path = dobovka.newest(folders().get("dobovka", ""))
+    if not path:
+        return None, None
+    name = os.path.basename(path)
+    try:
+        with open(path, "rb") as f:
+            got = dobovka.read_file(f.read())
+    except OSError as e:                                     # тримає інша програма, немає доступу: слова — людині, причина — у консоль
+        print(f"Добовка: {path} не прочитано — {e}")
+        return None, {"file": name, "error": f"файл «{name}» тримає інша програма чи немає доступу"}
+    except Exception:                                        # noqa: BLE001 — зіпсований файл: слова — людині, подробиці — у консоль
+        traceback.print_exc()
+        return None, {"file": name, "error": f"файл «{name}» не вдалося прочитати"}
+    points = got["points"]
+    if not points and got["kind"] != "book" and got["problems"]:
+        print(f"Добовка: {path} не прочитано — {got['problems'][0]}")
+        why = got["problems"][0].rstrip(". ")
+        return None, {"file": name, "error": why[:1].lower() + why[1:]}
+    days = sorted({d for per in points.values() for d in per if d <= day})
+    if not days:
+        return None, {"file": name, "day": None}
+    total = sum(per.get(days[-1]) or 0 for per in points.values())
+    return (round(total) or None), {"file": name, "day": days[-1]}
+
+
+def broken_app_data(why: str) -> bytes:
+    """data.js, коли база не читається: дані порожньої бази (лише схема) і причина в meta.broken. Модулі
+    сторінки вантажаться як завжди, а замість програми — екран з копіями (dataBroken), без помилок у консолі."""
+    from db.connect import close_db, open_db                 # noqa: PLC0415
+    con = open_db(":memory:")
+    try:
+        data = export_app_data.payload(con)
+    finally:
+        close_db(con)
+    data.setdefault("meta", {})["broken"] = why
+    return export_app_data.as_js(data).encode("utf-8")
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -1085,7 +1160,7 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(200, json.dumps(out, ensure_ascii=False).encode("utf-8"), MIME[".json"])
 
     def _set_network(self):
-        """Налаштування мережі з ⚙ основного ПК. Діють після перезапуску програми."""
+        """Налаштування мережі з екрана «Налаштування» основного ПК. Діють після перезапуску програми."""
         n = int(self.headers.get("Content-Length", 0) or 0)
         req = json.loads(self.rfile.read(n).decode("utf-8") or "{}") if n else {}
         cfg = dict(net_cfg())
@@ -1144,8 +1219,26 @@ class Handler(BaseHTTPRequestHandler):
         if path == "api/file":
             query = parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
             return self._send_export((query.get("p") or [""])[0])
+        if path == "api/sp/supply":
+            # Забезпеченість сухпаєм на дату: добо-дачі по місцях проти «днів × осіб» (екран «Забезпеченість»).
+            import zabezpechenist                                # noqa: PLC0415
+            query = parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+            day = (query.get("day") or [time.strftime("%Y-%m-%d")])[0][:10]
+            try:
+                datetime.date.fromisoformat(day)
+                people = int((query.get("people") or ["0"])[0] or 0) or None
+                days = int((query.get("days") or [str(zabezpechenist.DAYS)])[0] or zabezpechenist.DAYS)
+            except ValueError:
+                return self._send(400, "дата — РРРР-ММ-ДД, осіб і діб — цілі числа".encode("utf-8"))
+            source = None
+            if people is None:
+                people, source = dobovka_people(day)
+            with STATE_LOCK:
+                rep_ = zabezpechenist.compute(db(), day, people, days)
+            rep_["peopleFrom"] = source
+            return self._send(200, json.dumps(rep_, ensure_ascii=False).encode("utf-8"), MIME[".json"])
         if path == "api/form2":
-            # Звіт 2/прод за рік — з бази обох книг обліку (екран «2/Прод»).
+            # Звіт 2/прод за рік — з бази книг ТЗ і ОП (екран «2/Прод»).
             query = parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
             try:
                 year = int((query.get("year") or [""])[0])
@@ -1154,6 +1247,18 @@ class Handler(BaseHTTPRequestHandler):
             with STATE_LOCK:
                 rep = form2.collect(db(), year, (query.get("asOf") or [""])[0] or None)
             return self._send(200, json.dumps(rep, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+        if path == "api/form11":
+            # Звіт 11/прод за квартал — з книги СП (екран «11/прод»).
+            query = parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+            try:
+                year, q = int((query.get("year") or [""])[0]), int((query.get("q") or [""])[0])
+            except ValueError:
+                return self._send(400, "рік і квартал звіту — числа".encode("utf-8"))
+            if q not in (1, 2, 3, 4):
+                return self._send(400, "квартал — від 1 до 4".encode("utf-8"))
+            with STATE_LOCK:
+                rep = form11.collect(db(), year, q)
+            return self._send(200, json.dumps(rep, ensure_ascii=False).encode("utf-8"), MIME[".json"])
         if path == "api/folders":
             return self._send(200, json.dumps(folders_listing(), ensure_ascii=False).encode("utf-8"), MIME[".json"])
         if path == "api/backups":
@@ -1161,7 +1266,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, body, MIME[".json"])
         if path == "api/verify":
             # Звірка бази за правилами обліку — та сама, що й build/verify_db.py,
-            # але для людини без Python: кнопка в ⚙.
+            # але для людини без Python: кнопка в «Налаштуваннях».
             try:
                 with STATE_LOCK:
                     checks = verify_db.check_all(db())
@@ -1187,7 +1292,7 @@ class Handler(BaseHTTPRequestHandler):
                 with STATE_LOCK:
                     body = app_data()
             except StateBroken as e:
-                return self._send(500, str(e).encode("utf-8"))
+                body = broken_app_data(str(e))     # сторінка покаже «База обліку не читається» з копіями
             return self._send(200, body, MIME[".js"])
         if path in ASSET_CACHE:
             ext = os.path.splitext(path)[1]
@@ -1431,8 +1536,46 @@ class Handler(BaseHTTPRequestHandler):
         body = {"ok": True, "year": got["year"], "rows": rows, "unknown": got["unknown"]}
         return self._send(200, json.dumps(body, ensure_ascii=False).encode("utf-8"), MIME[".json"])
 
+    def _opysy(self, route):
+        """«Звіти › Описи 572» — `/api/opysy/state|run|open` (`opysy_api`): чернетки описів запасів з книг обліку.
+        «Стоп» рушія — {ok: false, stop, log}; конфіг чи книга, що не читається, — {ok: false, why}. Шлях до конфігу
+        вписують і теку відкривають лише на основному ПК (з іншого — 403): шлях до файлів основного ПК обирає лише його
+        вікно; запам'ятований конфіг працює й звідти, а файл описів з іншого ПК віддається завантаженням (`download`)."""
+        import dobovka                                           # noqa: PLC0415
+        import opysy_api                                         # noqa: PLC0415
+        req = self._json_body()
+        if req is None:
+            return None
+        name = route.rsplit("/", 1)[-1]
+        if self.remote and (name == "open" or str(req.get("config") or "").strip()):
+            return self._send(403, opysy_api.HOST_ONLY.encode("utf-8"))
+        try:
+            if name == "state":
+                with STATE_LOCK:
+                    out = opysy_api.state(db(), req)
+            elif name == "run":
+                out = opysy_api.run(db, STATE_LOCK, req, dobovka.newest(folders().get("dobovka", "")) or None)
+                if self.remote and out.get("out"):                   # з іншого ПК файл описів віддається завантаженням
+                    try:
+                        out["download"] = remote_any(out["out"])["download"]
+                    except OSError as e:                             # файл записано, а копії для завантаження не вийшло
+                        out["why"] = f"Описи складено, а для завантаження не підготовлено: {e}"
+            elif name == "open":
+                with STATE_LOCK:
+                    where = opysy_api.folder(db(), req)
+                out = {"opened": open_file(where), "folder": where}
+            else:
+                return self._send(404, b"not found")
+        except ValueError as e:
+            return self._send(400, str(e).encode("utf-8"))
+        except Exception as e:                                   # noqa: BLE001 — зіпсований файл книги чи описів
+            out = {"why": "%s: %s" % (type(e).__name__, e)}
+        out["ok"] = "stop" not in out and "why" not in out or name == "state"
+        return self._send(200, json.dumps(out, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+
     def _op_fes(self):
-        """Звірка книги ОП зі звітом ФЕС «Залишки ТМЦ»: результат — на сторінку й книгою в теку звірок."""
+        """Звірка книги ОП чи СП (`book`) зі звітом ФЕС «Залишки ТМЦ»: результат — на сторінку й книгою в теку
+        звірок."""
         import fes_read                                          # noqa: PLC0415
         import op_fes                                            # noqa: PLC0415
         n = int(self.headers.get("Content-Length", 0) or 0)
@@ -1441,6 +1584,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(413, "файл порожній або завеликий".encode("utf-8"))
         data = self.rfile.read(n)
         query = parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+        book = (query.get("book") or ["ОП"])[0]
+        if book not in op_fes.FES_BOOKS:
+            return self._send(400, "Звірка з ФЕС — для книг ОП і СП".encode("utf-8"))
         try:
             report = fes_read.read_report(data)
         except ValueError as e:
@@ -1454,7 +1600,7 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 places = {}
             got = op_fes.compare(con, report, (query.get("asOf") or [""])[0] or None,
-                                 places if isinstance(places, dict) else {})
+                                 places if isinstance(places, dict) else {}, book)
         got["path"] = op_fes.write_result(got, folders()["fes"])
         got["ok"] = True
         got["places"] = [p["name"] for p in report["places"]]
@@ -1515,7 +1661,8 @@ class Handler(BaseHTTPRequestHandler):
     def _op_preview(self):
         """Перегляд змін книги проти бази; файл лежить до «Прийняти» під своїм sha, а поруч (<sha>.json) — відмінності,
         які людина побачила: «Прийняти» звіряє з ними те, що прийом зробив би тепер (`_op_apply`). Sha — від вмісту
-        файла й показаних відмінностей разом, як у книги закупівель."""
+        файла й показаних відмінностей разом, як у книги закупівель. Для старої книги спляча позиція іншої книги (архівна,
+        без рядків) віддає код позиції старої книги (`claim_dormant`), і кожна така — перший рядок звіту."""
         import hashlib                                           # noqa: PLC0415
         import op_book                                           # noqa: PLC0415
         n = int(self.headers.get("Content-Length", 0) or 0)
@@ -1526,11 +1673,14 @@ class Handler(BaseHTTPRequestHandler):
         legacy = "legacy=1" in self.path
         try:
             model = op_book.read_book(data, legacy=legacy)
+            with STATE_LOCK:
+                con = db()
+                if legacy:                                   # спляча позиція іншої книги віддає код позиції старої книги
+                    model = op_book.claim_dormant(con, model)
+                plan = op_book.diff(con, model)              # код позиції іншої книги — відмова, як і в читанні
         except op_book.BookError as e:
             body = {"error": "книга не приймається", "problems": e.problems[:200]}
             return self._send(422, json.dumps(body, ensure_ascii=False).encode("utf-8"), MIME[".json"])
-        with STATE_LOCK:
-            plan = op_book.diff(db(), model)
         seen = _plan_text(plan)
         sha = hashlib.sha256(data + b"\0" + seen.encode("utf-8")).hexdigest()
         folder = self._op_upload_dir()
@@ -1576,6 +1726,8 @@ class Handler(BaseHTTPRequestHandler):
             model = op_book.read_book(data, legacy=legacy)
             with STATE_LOCK:
                 con = db()
+                if legacy:                                   # як у перегляді: інакше «Прийняти» звіряло б не ту книгу
+                    model = op_book.claim_dormant(con, model)
                 now = op_book.diff(con, model)               # той самий перегляд: чим база стала тепер
                 if _plan_text(now) != seen:
                     stale = now
@@ -1807,6 +1959,198 @@ class Handler(BaseHTTPRequestHandler):
                 os.remove(done)
         body = {"ok": True, "diff": plan, "backup": os.path.basename(backup)}
         return self._send(200, json.dumps(body, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+
+    def _book_export(self, book):
+        """Книга «Облік СП» («Облік РП») — у теку з налаштувань. Книгу, яку програма сама записала чи прийняла
+        (її відбиток байтів або вмісту запам'ятано: book_xlsx.own_book — вміст пізнає її й після «Зберегти» в
+        Excel), перезаписує без звірки, хоч би облік у програмі за цей час змінився. Іншу — лише коли в ній немає
+        внесеного руками, чого немає в базі: нових і змінених документів, нових позицій, нових і змінених актів сухпаю
+        (інакше 409: спершу «Прийняти книгу…»). Книга ОП — `_op_export`."""
+        import book_xlsx                                         # noqa: PLC0415
+        layout = book_xlsx.LAYOUTS[book]
+        path = os.path.join(folders()[BOOK_FOLDER[book]], layout.file_name)
+        with STATE_LOCK:
+            con = db()
+            if os.path.exists(path):
+                try:
+                    own, have = book_xlsx.own_book(con, path, layout)     # своя — за байтами, а після Excel — за вмістом
+                    extra = []
+                    if not own:
+                        plan = book_xlsx.diff(con, have, layout)
+                        acts = plan.get("acts") or {}                     # акти сухпаю — лише в книзі СП
+                        extra = (plan["docs"]["new"] + plan["docs"]["changed"] + plan["items"]["new"]
+                                 + acts.get("new", []) + acts.get("changed", []))
+                except book_xlsx.BookError as e:
+                    extra = e.problems
+                except OSError as e:
+                    extra = [f"файл зайнятий: {e}"]
+                if extra:
+                    body = {"error": "у книзі є внесене руками, чого немає в програмі: спершу «Прийняти книгу…»",
+                            "rows": extra[:50]}
+                    return self._send(409, json.dumps(body, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                got = book_xlsx.export_book(con, path, layout, own=True)     # записана книга далі своя
+            except PermissionError:
+                body = {"error": f"книга «{layout.file_name}» відкрита в Excel: закрийте її й вивантажте знову"}
+                return self._send(409, json.dumps(body, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+            row = con.execute("SELECT value FROM app_setting WHERE key = 'book_export'").fetchone()
+            try:
+                dates = json.loads(row[0]) if row else {}
+            except ValueError:
+                dates = {}
+            dates = dates if isinstance(dates, dict) else {}
+            dates[book] = time.strftime("%Y-%m-%d")
+            con.execute("INSERT INTO app_setting(key, value) VALUES('book_export', ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (json.dumps(dates, ensure_ascii=False),))
+            bump_state_version()
+        got["ok"] = True
+        if self.remote:
+            got.update(remote_any(path))
+        return self._send(200, json.dumps(got, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+
+    def _book_upload_dir(self, book):
+        d = os.path.join(DATA, "вивантаження", f".прийом книги {book}")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _book_preview(self, book):
+        """Перегляд змін книги проти бази; файл лежить до «Прийняти» під своїм sha, а поруч (<sha>.json) — відмінності,
+        які людина побачила: «Прийняти» звіряє з ними те, що прийом зробив би тепер (`_book_apply`). Sha — від вмісту
+        файла й показаних відмінностей разом, як у книги ОП. Для старої книги — місця, які вона називає, і пропозиція,
+        з чим їх зіставити; архівна позиція старої книги без рядків із кодом іншої книги не переноситься
+        (`drop_foreign_archived`), а спляча позиція іншої книги віддає код діючій позиції старої (`claim_dormant`):
+        кожна така — перший рядок звіту."""
+        import hashlib                                           # noqa: PLC0415
+        import book_xlsx                                         # noqa: PLC0415
+        layout = book_xlsx.LAYOUTS[book]
+        n = int(self.headers.get("Content-Length", 0) or 0)
+        if n <= 0 or n > MAX_RESTORE:
+            self._drain()
+            return self._send(413, "файл порожній або завеликий".encode("utf-8"))
+        data = self.rfile.read(n)
+        legacy = "legacy=1" in self.path
+        try:
+            model = book_xlsx.read_book(data, layout, legacy=legacy)
+            with STATE_LOCK:
+                con = db()
+                if legacy:                                           # без архівної позиції без рядків, код якої чужий
+                    model = book_xlsx.drop_foreign_archived(con, model, layout)
+                    model = book_xlsx.claim_dormant(con, model, layout)    # спляча позиція іншої книги віддає код цій
+                plan = book_xlsx.diff(con, model, layout)             # код позиції іншої книги — відмова, як і в читанні
+                subs = [r[0] for r in con.execute("SELECT name FROM subdivision WHERE is_active = 1 ORDER BY sort, id")]
+        except book_xlsx.BookError as e:
+            body = {"error": "книга не приймається", "problems": e.problems[:200]}
+            return self._send(422, json.dumps(body, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+        seen = _plan_text(plan)
+        sha = hashlib.sha256(data + b"\0" + seen.encode("utf-8")).hexdigest()
+        folder = self._book_upload_dir(book)
+        for name, content in ((sha + ".json", seen.encode("utf-8")), (sha + ".xlsx", data)):
+            with open(os.path.join(folder, name), "wb") as f:
+                f.write(content)
+        places = book_xlsx.legacy_places(model) if legacy else []
+        # «Зауваження» («Поправки» старої книги): що сказало читання книги, і акти сухпаю не за правилами (`remarks`).
+        body = {"ok": True, "sha": sha, "diff": plan, "places": places,
+                "suggest": book_xlsx.suggest_places(places, subs, layout) if legacy else {},
+                "report": model.get("report", []) + plan.get("remarks", [])}
+        return self._send(200, json.dumps(body, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+
+    def _book_apply(self, book):
+        """Прийняти книгу: копія бази «перед прийомом книги …» (чи «перед перенесенням…»), тоді книга в
+        базі стає такою, як у файлі. Усе або нічого.
+
+        Книга лягає на базу, якою та стала після перегляду: інше вікно могло за цей час змінити облік книги,
+        і прийом мовчки переписав би його. Тож під тим самим замком, що й прийом, відмінності рахуються знову:
+        не ті, що людина бачила (<sha>.json), — 409 з новими відмінностями, і нічого не змінено (ні копії, ні
+        прийому); файли застарілого перегляду прибираються. Прийнята книга (не стара) далі — своя
+        (book_xlsx.remember_sha): вивантаження перезапише її без звірки. Як `_op_apply`."""
+        import book_xlsx                                         # noqa: PLC0415
+        layout = book_xlsx.LAYOUTS[book]
+        try:
+            n = int(self.headers.get("Content-Length", 0) or 0)
+            req = json.loads(self.rfile.read(n).decode("utf-8") or "{}") if n else {}
+        except ValueError:
+            req = {}
+        sha = re.sub(r"[^0-9a-f]", "", str(req.get("sha") or ""))
+        folder = self._book_upload_dir(book)
+        path, seen_path = os.path.join(folder, sha + ".xlsx"), os.path.join(folder, sha + ".json")
+        seen = None
+        if sha and os.path.exists(path):
+            try:
+                with open(seen_path, encoding="utf-8") as f:
+                    seen = _plan_text(json.loads(f.read()))
+            except (OSError, ValueError):            # немає того, що бачили при перегляді, — звіряти нема з чим
+                seen = None
+        if seen is None:
+            return self._send(400, "оберіть книгу ще раз: перегляд застарів".encode("utf-8"))
+        with open(path, "rb") as f:
+            data = f.read()
+        legacy = bool(req.get("legacy"))
+        stale = None
+        try:
+            model = book_xlsx.read_book(data, layout, legacy=legacy)
+            with STATE_LOCK:
+                con = db()
+                if legacy:                                   # як у перегляді: інакше «Прийняти» звіряло б не ту книгу
+                    model = book_xlsx.drop_foreign_archived(con, model, layout)
+                    model = book_xlsx.claim_dormant(con, model, layout)
+                now = book_xlsx.diff(con, model, layout)     # той самий перегляд: чим база стала тепер
+                if _plan_text(now) != seen:
+                    stale = now
+                else:
+                    mark = None if legacy else book_xlsx.fingerprint(model)     # стара книга програмі своєю не стає
+                    if legacy:
+                        model = book_xlsx.normalize_legacy(model, req.get("mapping") or {}, layout)
+                    backup = named_backup(con, f"перед перенесенням книги {book}" if legacy else f"перед прийомом книги {book}")
+                    plan = book_xlsx.apply(con, model, layout)
+                    if mark:
+                        with contextlib.suppress(sqlite3.Error):     # прийняту книгу далі вважаємо своєю: вона вся в базі
+                            book_xlsx.remember_sha(con, layout, stable_hash.stable_sha_bytes(data), mark)
+                    bump_state_version()
+                    LAST_WRITE.update(who=self.who, at=time.strftime("%H:%M"))
+        except book_xlsx.BookError as e:
+            body = {"error": "книгу не прийнято", "problems": e.problems[:200]}
+            return self._send(422, json.dumps(body, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+        for done in (path, seen_path):                       # прийнято чи застаріло — цей перегляд більше не потрібен
+            with contextlib.suppress(OSError):
+                os.remove(done)
+        if stale is not None:
+            body = {"error": f"З часу перегляду облік {book} у програмі змінився. Перегляньте книгу ще раз.", "diff": stale}
+            return self._send(409, json.dumps(body, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+        body = {"ok": True, "diff": plan, "backup": os.path.basename(backup),
+                "report": model.get("report", []) + plan.get("remarks", [])}
+        return self._send(200, json.dumps(body, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+
+    def _sp_q1prod(self):
+        """«1прод» рядків списання сухпаю за днями з Добовки (найновіший файл «Добовка*.xlsx» у теці
+        «Добовка»); квартал, що прийшов з книги чи вписаний людиною, не перераховується. Пошкоджена Добовка — 400 і ті
+        самі слова, що й збій запитів /api/dobovka/*; прогін, що нічого не змінив, версії стану не піднімає."""
+        import suhpay_days                                       # noqa: PLC0415
+        try:
+            n = int(self.headers.get("Content-Length", 0) or 0)
+            req = json.loads(self.rfile.read(n).decode("utf-8") or "{}") if n else {}
+        except ValueError:
+            req = {}
+        days_from = None
+        if req.get("daysFrom"):
+            try:
+                days_from = datetime.date.fromisoformat(str(req["daysFrom"])[:10])
+            except ValueError:
+                return self._send(400, "дата «з якого дня» — РРРР-ММ-ДД".encode("utf-8"))
+        path = suhpay_days.newest_dobovka(folders().get("dobovka", ""))
+        try:
+            with STATE_LOCK:
+                got = suhpay_days.fill_q1prod(db(), path, days_from)
+                if got["changed"]:                           # прогін, що нічого не змінив, не змушує вікна перечитувати стан
+                    bump_state_version()
+                    LAST_WRITE.update(who=self.who, at=time.strftime("%H:%M"))
+        except (OSError, ValueError) as e:
+            return self._send(422, json.dumps({"error": str(e)}, ensure_ascii=False).encode("utf-8"), MIME[".json"])
+        except Exception:                                # noqa: BLE001 — пошкоджена Добовка: відповідь словами, а не обрив зв'язку
+            traceback.print_exc()                        # подробиці — у консоль, як у запитах Добовки
+            return self._send_json(400, {"ok": False, "error": "Добовку не прочитано."})
+        got.update(ok=True, dobovka=os.path.basename(path) if path else "")
+        return self._send(200, json.dumps(got, ensure_ascii=False).encode("utf-8"), MIME[".json"])
 
     def _open_scan(self, reveal=False):
         """Відкрити файл програмою Windows або показати його в теці. Відкривається лише те, що можна
@@ -2069,9 +2413,10 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return got
 
-    def _op_act(self, what):
+    def _op_act(self, what, kind="op"):
         """Акти списання за нормами: пропозиція (`preview`), складання й виправлення (`save`), файли пакета (`files`),
-        видалення (`delete`).
+        видалення (`delete`). `kind` — вид акта: «op» (посуд, серветки, миючі — `op_acts`) чи «sp» (акти сухпаю —
+        `sp_acts`, пакет — `sp_act_export`, тека «Акти сухпаю»); решта — спільне.
 
         Виправлення (`save` з `docId`) і видалення вимагають `was` — яким акт був у вікні, коли його відкрили (номер і дата
         не порожні): без нього 400. Інший акт під тим самим id чи акт, виправлений деінде, — 422 (op_acts).
@@ -2086,6 +2431,9 @@ class Handler(BaseHTTPRequestHandler):
         Видалення — як будь-якого документа: спершу копія бази (backup_state(force=True)); без копії акт не видаляється."""
         import op_act_export                                     # noqa: PLC0415
         import op_acts                                           # noqa: PLC0415
+        import sp_act_export                                     # noqa: PLC0415
+        import sp_acts                                           # noqa: PLC0415
+        mod, export, key = (sp_acts, sp_act_export, "spActs") if kind == "sp" else (op_acts, op_act_export, "opActs")
         req = self._object_body()
         if req is None:
             return                                   # відповідь (400 чи 413) уже надіслано
@@ -2101,6 +2449,9 @@ class Handler(BaseHTTPRequestHandler):
                     con = db()
                 except StateBroken as e:
                     return self._send_json(500, {"ok": False, "error": str(e)})
+                if what == "preview" and kind == "sp":   # акт сухпаю: типові значення — разом з першою пропозицією
+                    out.update(sp_acts.preview(con, req, time.strftime("%Y-%m-%d")))
+                    return self._send_json(200, out)
                 if what == "preview":
                     spec = dict(req)
                     filled = not spec.get("from") or not spec.get("to")
@@ -2134,20 +2485,23 @@ class Handler(BaseHTTPRequestHandler):
                 if what == "save":
                     if not force:                        # файл пакета правили руками — питання, перш ніж щось записати
                         try:
-                            changed = op_act_export.conflicts(con, folders()["opActs"], str(req.get("series") or ""),
-                                                              str(req.get("date") or "")[:4],
-                                                              " ".join(str(req.get("number") or "").split()))
+                            changed = sp_act_export.conflicts(con, folders()["spActs"], {
+                                "number": req.get("number"), "date": str(req.get("date") or ""),
+                                "label": " ".join(str(req.get("label") or "").split())}) if kind == "sp" else \
+                                op_act_export.conflicts(con, folders()["opActs"], str(req.get("series") or ""),
+                                                        str(req.get("date") or "")[:4],
+                                                        " ".join(str(req.get("number") or "").split()))
                         except (KeyError, ValueError, OSError):
                             changed = []                 # серія чи дата не ті — відмовить сам op_acts.save
                         if changed:
                             raise op_act_export.PackageConflict(changed)
-                    doc = op_acts.save(con, req, who=self.who)
+                    doc = mod.save(con, req, who=self.who)
                     saved = True
                     out.update(docId=doc, number=" ".join(str(req.get("number") or "").split()), sig=op_acts.sig_of(con, doc))
                 else:
                     doc = req.get("docId")
                 try:
-                    out.update(op_act_export.write_package(con, doc, folders()["opActs"], force=force))
+                    out.update(export.write_package(con, doc, folders()[key], force=force))
                     saved = True                         # записи про файли пакета теж лягли в базу
                 finally:
                     if saved:
@@ -2180,8 +2534,10 @@ class Handler(BaseHTTPRequestHandler):
                                              "error": f"Файли складено, а для завантаження не підготовлено: {e}"})
         return self._send_json(200, out)
 
-    def _op_act_reveal(self):
-        """«Відкрити теку» акта — на основному ПК; тека має лежати в теці актів із налаштувань."""
+    def _op_act_reveal(self, kind="op"):
+        """«Відкрити теку» акта — на основному ПК; тека має лежати в теці актів свого виду з налаштувань."""
+        import sp_act_export                                     # noqa: PLC0415
+        import sp_acts                                           # noqa: PLC0415
         import op_act_export                                     # noqa: PLC0415
         import op_acts                                           # noqa: PLC0415
         req = self._object_body()
@@ -2189,9 +2545,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             with STATE_LOCK:
-                a = op_acts.act_of(db(), req.get("docId"))
-            root = folders()["opActs"]
-            folder = op_act_export.act_dir(root, a["series"], a["date"][:4], a["number"])
+                a = (sp_acts if kind == "sp" else op_acts).act_of(db(), req.get("docId"))
+            root = folders()["spActs" if kind == "sp" else "opActs"]
+            folder = sp_act_export.act_dir(root, a) if kind == "sp" else \
+                op_act_export.act_dir(root, a["series"], a["date"][:4], a["number"])
             if not os.path.isdir(folder) or not _inside(os.path.realpath(root), os.path.realpath(folder)):
                 return self._send(404, "Теки акта ще немає: «Перескласти файли».".encode("utf-8"))
             return self._send_json(200, {"ok": True, "opened": open_file(folder)})
@@ -2202,6 +2559,48 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:                                # noqa: BLE001 — відповідь словами, а не обрив зв'язку
             traceback.print_exc()                        # подробиці — у консоль
             return self._send(500, "Теку акта не відкрито.".encode("utf-8"))
+
+    def _sp_report(self):
+        """Дні рапорту для акта сухпаю: {report, text?} → аркуш «Сухпай» вставкою (`text`) чи найновішої Добовки теки
+        «Добовка» → дні, особи, підрозділ, акти, уже вписані в ці дні (`dobovka.report_days`). Ні в Добовку, ні в базу
+        нічого не пишеться. Відмова — словами, речення з однією крапкою; несподіваний збій — теж словами (як `_dobovka`)."""
+        import dobovka                                           # noqa: PLC0415
+        req = self._object_body(MAX_SCAN)
+        if req is None:
+            return
+        report = " ".join(str(req.get("report") or "").split())
+        if not report:
+            return self._send_json(400, {"ok": False, "error": "Вкажіть номер рапорту."})
+        out = {"ok": True}
+        try:
+            if str(req.get("text") or "").strip():
+                got = dobovka.parse_paste(req["text"])
+                if got["kind"] != "sukhpai":
+                    return self._send_json(422, {"ok": False, "error": "Вставте аркуш «Сухпай» Добовки: Ctrl+A, Ctrl+C."})
+            else:
+                path = dobovka.newest(folders()["dobovka"])
+                if not path:
+                    return self._send_json(404, {"ok": False, "error": "Теку Добовки не задано або в ній немає «Добовка*.xlsx»: "
+                                                                        "«Налаштування» → «Теки» → «Добовка»; чи вставте аркуш «Сухпай»."})
+                try:
+                    with open(path, "rb") as f:
+                        got = dobovka.read_sukhpai(f.read())
+                except OSError as e:                         # тримає інша програма, немає доступу: слова — людині, шлях — у консоль
+                    print(f"Добовка: {path} не прочитано — {e}")
+                    return self._send_json(422, {"ok": False, "error": f"Файл «{os.path.basename(path)}» не прочитано: "
+                                                                        "його тримає інша програма чи немає доступу."})
+                out["file"] = os.path.basename(path)
+            hit = dobovka.report_days(got["sukhpai"], report)
+        except Exception:                                # noqa: BLE001 — відповідь словами, а не обрив зв'язку
+            traceback.print_exc()                        # подробиці — у консоль
+            return self._send_json(400, {"ok": False, "error": "Добовку не прочитано."})
+        if hit is None:
+            if got["problems"]:
+                return self._send_json(404, {"ok": False, "error": _sukhpai_refusal(out.get("file"), got["problems"])})
+            sheet = f"в аркуші «Сухпай» файла «{out['file']}»" if "file" in out else "у вставленому аркуші «Сухпай»"
+            return self._send_json(404, {"ok": False, "error": f"Рапорту №{report} немає {sheet}."})
+        out.update(hit)
+        return self._send_json(200, out)
 
     def _dobovka(self, what):
         """Добовка — лише читання: вставка (текст із табуляціями) чи книга — найсвіжіша з теки «Добовка» або передана
@@ -2328,15 +2727,24 @@ class Handler(BaseHTTPRequestHandler):
                 bump_state_version()
                 LAST_WRITE.update(who=self.who, at=time.strftime("%H:%M"))
             return self._send(200, json.dumps({"ok": True, "rows": rows}).encode("utf-8"), MIME[".json"])
+        if route.startswith("/api/opysy/"):
+            return self._opysy(route)
         if route == "/api/op-fes":
             return self._op_fes()
-        if route == "/api/op-book/export":
-            self._drain()
-            return self._op_export()
-        if route == "/api/op-book/preview":
-            return self._op_preview()
-        if route == "/api/op-book/apply":
-            return self._op_apply()
+        # Книги обліку: вивантажити, переглянути, прийняти. ОП — свій модуль (з актами списання), СП і РП —
+        # рушій book_xlsx; /api/op-book/* — так кличе сторінка 1.11.0.
+        book_route = re.match(r"^/api/(?:book/(op|sp|rp)|op-book)/(export|preview|apply)$", route)
+        if book_route:
+            book = BOOK_URL[book_route.group(1) or "op"]
+            action = book_route.group(2)
+            if action == "export":
+                self._drain()
+                return self._op_export() if book == "ОП" else self._book_export(book)
+            if action == "preview":
+                return self._op_preview() if book == "ОП" else self._book_preview(book)
+            return self._op_apply() if book == "ОП" else self._book_apply(book)
+        if route == "/api/sp/q1prod":
+            return self._sp_q1prod()
         if route == "/api/pur-book/export":
             self._drain()
             return self._pur_export()
@@ -2360,6 +2768,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._op_act(route.rsplit("/", 1)[-1])
         if route == "/api/op-act/reveal":
             return self._op_act_reveal()
+        if route in ("/api/sp-act/preview", "/api/sp-act/save", "/api/sp-act/files", "/api/sp-act/delete"):
+            return self._op_act(route.rsplit("/", 1)[-1], "sp")
+        if route == "/api/sp-act/reveal":
+            return self._op_act_reveal("sp")
+        if route == "/api/sp-act/report":
+            return self._sp_report()
         if route in ("/api/dobovka/read", "/api/dobovka/paste"):
             return self._dobovka(route.rsplit("/", 1)[-1])
         if route != "/api/excel":
@@ -2397,6 +2811,8 @@ class Handler(BaseHTTPRequestHandler):
                       # Звіт-заявка 2/прод у бланку А2788 і проєкт пояснювальної — у теку звітів.
                       "form2": lambda s, f: form2.save_package(db(), s, folders()["reports"]),
                       "form2note": lambda s, f: form2.save_note(db(), s, folders()["reports"]),
+                      # Звіт про продовольчу тару 11/прод за квартал — у теку звітів «<рік>\<N> квартал\11прод».
+                      "form11": lambda s, f: form11_book(s),
                       # Заявка на посуд, миючі й серветки на 30 днів за нормами наказу №390 — у Word.
                       "op_request": lambda s, f: op_request.save_request(db(), s, folders()["requests"]),
                       }.get(spec.get("kind"), excel_export.save)
@@ -2520,6 +2936,12 @@ def remote_export(folder, path):
                     z.write(full, os.path.relpath(full, folder))
     name = os.path.relpath(target, folder).replace(os.sep, "/")
     return {"path": target, "download": "api/file?p=" + quote(name)}
+
+
+def form11_book(spec):
+    """Книга 11/прод кварталу в теці звітів; читання бази — під замком, як усі читання."""
+    with STATE_LOCK:
+        return form11.save_book(db(), spec, folders()["reports"])
 
 
 def open_file(path):

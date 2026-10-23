@@ -176,7 +176,7 @@ def _every_unit_has_an_inventory_number(con) -> Check:
 def _numbers_sit_where_the_property_is(con) -> Check:
     """Бирки там, де майно: у підрозділі номерів позиції не більше, ніж там її
     одиниць. Накладна кількістю номерів не називає — після неї номери лишаються
-    у відправника, доки їх не перенесуть у програмі («Інвентарні номери», ⇄)."""
+    у відправника, доки їх не перенесуть у програмі («Техзасоби» → «Інвентарні номери», ⇄)."""
     bad = con.execute("""
         WITH num AS (SELECT i.nomen_id, a.subdivision_id AS sub, COUNT(*) AS n FROM instance i
                        JOIN instance_assignment a ON a.instance_id = i.id

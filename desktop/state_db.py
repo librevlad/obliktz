@@ -28,11 +28,14 @@ JOURNALS = {"incoming": "act_in", "movement": "invoice", "writeoffs": "writeoff"
 KIND_OF = {"act_in": "incoming", "opening": "incoming", "invoice": "movement", "writeoff": "writeoffs"}
 JOURNAL_ORDER = {"incoming": 0, "movement": 1, "writeoffs": 2}
 MILLI = 1000
-# Дві книги обліку: ТЗ (техзасоби, обладнання, багаторазовий посуд) і ОП (посуд одноразового
-# використання, миючі засоби, серветки). Позиція належить книзі своєї групи.
-BOOKS = ("ТЗ", "ОП")
-# Де документ у ФЕС — перелік книги ОП; той самий у документів закупівель.
-FES_STATUSES = ("немає витяга", "на підписі", "їде на ФЕС", "проведено", "переробка")
+# Чотири книги обліку: ТЗ (техзасоби, обладнання, багаторазовий посуд), ОП (посуд одноразового
+# використання, миючі засоби, серветки), СП (сухпай) і РП (реторт-пакети). Позиція належить книзі своєї групи.
+BOOKS = ("ТЗ", "ОП", "СП", "РП")
+# Слово книги у відмовах: «техзасоби й сухпай в одному документі».
+BOOK_WORDS = {"ТЗ": "техзасоби", "ОП": "посуд", "СП": "сухпай", "РП": "реторт-пакети"}
+# Де документ у ФЕС — перелік документів усіх чотирьох книг. Закупівлі мають свій, без «роздрукувати»
+# (purchases_db.PUR_FES_STATUSES): таблиця їхніх документів знає лише п'ять станів.
+FES_STATUSES = ("немає витяга", "роздрукувати", "на підписі", "їде на ФЕС", "проведено", "переробка")
 # Вид контрагента вирішує графу 2/прод приходу (військова частина — 14, постачальник — 12).
 PARTY_KINDS = ("військова частина", "постачальник", "фонд", "інше")
 
@@ -719,7 +722,7 @@ def _save_docs(con, docs, seed_drop_limit=None):
     if limit is not False and len(seed_gone) > limit:
         raise SaveError(f"запис вилучає {len(seed_gone)} документів з паперових журналів разом — так буває лише "
                         "при відновленні з чужої чи неповної копії; облік не змінено. Потрібну копію "
-                        "відновлюйте через ⚙ → «Автоматичні копії…»")
+                        "відновлюйте через «Налаштування» → «Автоматичні копії…»")
     for doc_id in sorted(stale, key=lambda i: (have[i]["from_sub"] is None, have[i]["date"])):
         _drop_doc(con, doc_id)
 
@@ -1236,6 +1239,9 @@ def _save_items(con, rows):
                 cols["per_ration"] = float(rec["perRation"]) if rec["perRation"] not in (None, "") else None
             except (TypeError, ValueError):
                 cols["per_ration"] = None
+        # Вид рядка 1/прод позиції сухпаю (колонка «тип» книги СП: ПНСП, ДПНП, іноземні добові…).
+        if "kind1" in rec:
+            cols["prod1_kind"] = str(rec.get("kind1") or "").strip() or None
         # Рядок норми наказу 390, вибраний у картці (ключ op_norms.PER_RATION; порожньо — не вибрано): за ним акт ділить
         # межу між кодами, а однакові числа різних рядків (тарілка мілка й виделка — по 3 шт) — різні межі.
         if "normLine" in rec:
@@ -1280,17 +1286,23 @@ def _save_items(con, rows):
             con.execute("RELEASE drop_item")
 
 
+def book_codes(con, book):
+    """Коди позицій книги обліку (групи з цією книгою)."""
+    return {r[0] for r in con.execute(
+        "SELECT n.code FROM nomen n JOIN nomen_group g ON g.id = n.group_id WHERE g.book = ?", (book,))}
+
+
 def op_codes(con):
     """Коди позицій книги ОП (групи з книгою «ОП»)."""
-    return {r[0] for r in con.execute(
-        "SELECT n.code FROM nomen n JOIN nomen_group g ON g.id = n.group_id WHERE g.book = 'ОП'")}
+    return book_codes(con, "ОП")
 
 
 def _check_books(con, docs):
-    """Рядки одного документа — однієї книги: техзасоби й посуд з миючими не змішуються."""
+    """Рядки одного документа — однієї книги: техзасоби, посуд з миючими, сухпай і реторт-пакети не
+    змішуються."""
     if not docs:
         return
-    op = op_codes(con)
+    book_of = dict(con.execute("SELECT n.code, g.book FROM nomen n JOIN nomen_group g ON g.id = n.group_id"))
     seen = {}
     for journal, rows in docs.items():
         if journal not in JOURNALS:
@@ -1299,10 +1311,11 @@ def _check_books(con, docs):
             if not isinstance(r, list) or len(r) < 6:
                 continue
             key = (journal, r[10]) if len(r) > 10 and r[10] else (journal, r[0], str(r[2]), r[3], r[4])
-            book = "ОП" if str(r[5]) in op else "ТЗ"
-            if seen.setdefault(key, book) != book:
-                raise SaveError(f"Документ №{r[2]} від {r[0]}: техзасоби й посуд в одному документі. "
-                                "Розділіть його на два.")
+            book = book_of.get(str(r[5]), "ТЗ")
+            first = seen.setdefault(key, book)
+            if first != book:
+                raise SaveError(f"Документ №{r[2]} від {r[0]}: {BOOK_WORDS[first]} й {BOOK_WORDS[book]} в одному "
+                                "документі. Розділіть його на два.")
 
 
 def _doc_key(key):
@@ -1559,7 +1572,8 @@ def _load_acts(con):
             "kind": r["kind"], "series": r["series"], "point": r["point"] or "", "from": r["period_from"],
             "to": r["period_to"], "rations": r["rations"], "offNorm": bool(r["off_norm"]),
             "daysChanged": bool(r["rations"]) and bool(r["now"]) and r["now"] != r["rations"],
-            "note": r["note"] or "", "papers": {}, "signers": [], "norms": {}}
+            "note": r["note"] or "", "party": r["party"] or "", "papers": {}, "signers": [], "norms": {}, "roles": {},
+            "pdays": {}, "heated": [], "days": []}
     for r in con.execute("SELECT * FROM act_paper"):
         if str(r["document_id"]) in acts:
             acts[str(r["document_id"])]["papers"][r["role"]] = {"no": r["number"] or "", "date": r["doc_date"] or ""}
@@ -1567,9 +1581,20 @@ def _load_acts(con):
         if str(r["document_id"]) in acts:
             acts[str(r["document_id"])]["signers"].append({"role": r["role"], "sort": r["sort"], "pos": r["position"] or "",
                                                            "rank": r["rank"] or "", "name": r["name"] or ""})
-    for r in con.execute("SELECT i.document_id, n.code, i.norm FROM act_item i JOIN nomen n ON n.id = i.nomen_id"):
+    for r in con.execute("""SELECT i.document_id, n.code, i.norm, i.role, i.people_days, i.heater
+                              FROM act_item i JOIN nomen n ON n.id = i.nomen_id ORDER BY i.rowid"""):
+        a = acts.get(str(r["document_id"]))
+        if a is not None:
+            a["norms"][r["code"]] = r["norm"]
+            if r["role"]:                         # рядок акта сухпаю: пайок (людино-дні, підігрівач), підігрівач, вода, інше
+                a["roles"][r["code"]] = r["role"]
+                if r["people_days"] is not None:
+                    a["pdays"][r["code"]] = r["people_days"]
+                if r["heater"]:
+                    a["heated"].append(r["code"])
+    for r in con.execute("SELECT * FROM act_day ORDER BY document_id, on_date"):    # дні рапорту акта сухпаю
         if str(r["document_id"]) in acts:
-            acts[str(r["document_id"])]["norms"][r["code"]] = r["norm"]
+            acts[str(r["document_id"])]["days"].append([r["on_date"], r["persons"]])
     for a in acts.values():
         a["sig"] = _act_sig(a)
     return acts
@@ -1580,15 +1605,22 @@ def _act_sig(act):
     повертає його у `was.sig`: вікно, відкрите до правки в іншому вікні, тих правок не перепише (op_acts._same_act)."""
     body = [act.get("series"), act.get("point"), act.get("note") or "", act.get("papers") or {},
             sorted([s.get("role"), s.get("sort"), s.get("pos"), s.get("rank"), s.get("name")] for s in act.get("signers") or [])]
+    if act.get("kind") == "sp":
+        body += [act.get("party") or "", act.get("days") or [], act.get("roles") or {}, act.get("pdays") or {},
+                 act.get("heated") or []]
     text = json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+# Де правлять документ акта кожного виду (відмова звичайного запису його рядків називає це місце).
+ACT_SCREENS = {"sp": "«Сухпай» → «Акти списання»"}
 
 
 def _check_act_docs(con, docs):
     """Документ акта за нормами правлять лише у вікні акта: кількість у ньому — за нормою, а сторінка її не рахує."""
     if docs is None:
         return
-    acts = {r[0] for r in con.execute("SELECT document_id FROM act")}
+    acts = dict(con.execute("SELECT document_id, kind FROM act").fetchall())
     sent = {}
     for r in (docs or {}).get("writeoffs") or []:
         doc = _doc_key(r[10]) if len(r) > 10 else None
@@ -1602,13 +1634,15 @@ def _check_act_docs(con, docs):
         if doc in sent:
             have.setdefault(doc, []).append(r)
 
-    def sig(rows):
-        return sorted((str(x[0]), str(x[2]).strip(), str(x[3]), str(x[4] or ""), str(x[5]), _milli(x[6])) for x in rows)
+    def sig(rows, kind):
+        # Примітка рядків акта сухпаю — його підрозділ (за нею одержувач, типові значення й «1прод»): теж лише у вікні.
+        return sorted((str(x[0]), str(x[2]).strip(), str(x[3]), str(x[4] or ""), str(x[5]), _milli(x[6]))
+                      + ((str(x[7] or "") if len(x) > 7 else "",) if kind == "sp" else ()) for x in rows)
 
     for doc, rows in sent.items():
-        if sig(rows) != sig(have.get(doc, [])):
+        if sig(rows, acts[doc]) != sig(have.get(doc, []), acts[doc]):
             raise SaveError(f"Акт №{str(rows[0][2]).strip()} від {rows[0][0]} змінюють у вікні акта: "
-                            "«Посуд і миючі» → «Акти списання».")
+                            f"{ACT_SCREENS.get(acts[doc], '«Посуд і миючі» → «Акти списання»')}.")
 
 
 def _save_doc_meta(con, recs):
@@ -1641,6 +1675,43 @@ def _load_doc_meta(con):
     return {str(r["document_id"]): {"report": r["report"] or "", "order": r["order_ref"] or "",
                                     "scan": r["scan"] or "", "col": r["form2_col"]}
             for r in con.execute("SELECT * FROM document_extra ORDER BY document_id")}
+
+
+def _save_line_extra(con, recs):
+    """«Придатний до» й квартал 1/прод рядків документа ({id: {"код|примітка": {best, q1, fixed}}}):
+    перелік повний — чого в ньому немає, того поля немає. Рядок — за кодом і приміткою, як його
+    зводить книга (партії рядка його не розбивають)."""
+    if recs is None:
+        return
+    keep = set()
+    for key, lines in (recs or {}).items():
+        doc = _doc_key(key)
+        if doc is None or not isinstance(lines, dict) or not _doc_exists(con, doc):
+            continue
+        for line_key, rec in lines.items():
+            code, _, note = str(line_key).partition("|")
+            rec = rec if isinstance(rec, dict) else {}
+            best = str(rec.get("best") or "").strip()[:10] or None
+            q1 = str(rec.get("q1") or "").strip() or None
+            if not code or (best is None and q1 is None):
+                continue
+            keep.add((doc, code, note))
+            con.execute("""INSERT INTO doc_line_extra(document_id, code, note, best_before, q1prod, q1prod_fixed)
+                           VALUES(?, ?, ?, ?, ?, ?)
+                           ON CONFLICT(document_id, code, note) DO UPDATE SET best_before = excluded.best_before,
+                             q1prod = excluded.q1prod, q1prod_fixed = excluded.q1prod_fixed""",
+                        (doc, code, note, best, q1, 1 if rec.get("fixed") else 0))
+    for doc, code, note in con.execute("SELECT document_id, code, note FROM doc_line_extra").fetchall():
+        if (doc, code, note) not in keep:
+            con.execute("DELETE FROM doc_line_extra WHERE document_id = ? AND code = ? AND note = ?", (doc, code, note))
+
+
+def _load_line_extra(con):
+    out = {}
+    for r in con.execute("SELECT * FROM doc_line_extra ORDER BY document_id, code, note"):
+        out.setdefault(str(r["document_id"]), {})[f"{r['code']}|{r['note']}"] = {
+            "best": r["best_before"] or "", "q1": r["q1prod"] or "", "fixed": bool(r["q1prod_fixed"])}
+    return out
 
 
 FORM2 = "2/Прод"
@@ -1765,9 +1836,20 @@ def _save_form2_notes(con, rows):
             continue
 
 
+def fes_mark(value):
+    """Позначка відповідності позиції ФЕС «не з книги»: «-ОП», «-СП», «-ОП СП» -> книги в порядку BOOKS; «» (так
+    писала сторінка 1.11.0) і позначка без жодної книги програми — («ОП»,). Код обліку -> None."""
+    text = str(value or "")
+    if text and not text.startswith("-"):
+        return None
+    books = set(text[1:].split())
+    return tuple(b for b in BOOKS if b in books) or ("ОП",)
+
+
 def _save_fes_map(con, recs):
-    """Відповідність позицій звіту ФЕС кодам книги ОП ({"<код ФЕС>|<ціна коп.>": "<код>"|""}): «» —
-    позиція ФЕС не з книги ОП (звірка її пропускає). Перелік повний."""
+    """Відповідність позицій звіту ФЕС ({"<код ФЕС>|<ціна коп.>": "<код>" | "-<книги>"}): код — позиція належить
+    книзі свого коду (звірка іншої книги її пропускає); «-ОП», «-СП», «-ОП СП» — позиція не з цих книг (їхня звірка
+    її пропускає, звірка іншої книги ще спитає); «» — «-ОП». Перелік повний."""
     if recs is None:
         return
     nomens = dict(con.execute("SELECT code, id FROM nomen"))
@@ -1776,16 +1858,18 @@ def _save_fes_map(con, recs):
         fes_code, _, kop = str(key).partition("|")
         if not fes_code or not kop.lstrip("-").isdigit():
             continue
-        nid = nomens.get(str(code)) if code else None
-        if code and nid is None:
+        books = fes_mark(code)
+        nid = None if books else nomens.get(str(code))
+        if not books and nid is None:
             continue
-        con.execute("INSERT OR REPLACE INTO fes_item_map(fes_code, price_kop, nomen_id) VALUES(?, ?, ?)",
-                    (fes_code, int(kop), nid))
+        con.execute("INSERT OR REPLACE INTO fes_item_map(fes_code, price_kop, nomen_id, not_books) VALUES(?, ?, ?, ?)",
+                    (fes_code, int(kop), nid, " ".join(books) if books else None))
 
 
 def _load_fes_map(con):
-    return {f"{r['fes_code']}|{r['price_kop']}": r["code"] or "" for r in con.execute(
-        "SELECT m.fes_code, m.price_kop, n.code FROM fes_item_map m LEFT JOIN nomen n ON n.id = m.nomen_id")}
+    return {f"{r['fes_code']}|{r['price_kop']}": r["code"] or "-" + " ".join(fes_mark("-" + (r["not_books"] or "")))
+            for r in con.execute("SELECT m.fes_code, m.price_kop, m.not_books, n.code FROM fes_item_map m "
+                                 "LEFT JOIN nomen n ON n.id = m.nomen_id")}
 
 
 def _load_form2_notes(con):
@@ -2688,9 +2772,12 @@ def _load_papers(con):
 
 # «mtz» — відомість МТЗ: джерело, КПКВ і КЕКВ надходжень, відмітки про подання.
 SETTINGS = ["ui", "unit", "baseSeen", "baseSig", "mtz", "fesPlaces"]
-# Налаштування, які веде сам сервер (теки ручного шляху, дата вивантаження книги ОП, відбитки книг
-# «Закупівлі» й «Облік ОП», які програма сама записала чи прийняла): у стан вікна вони не йдуть, і запис вікна їх не стирає.
-SERVER_SETTINGS = ("folders", "op_book_export", "pur_book_sha", "op_book_sha")
+# Налаштування, які веде сам сервер (теки ручного шляху, дати вивантаження книг, відбитки книг
+# «Закупівлі», «Облік ОП», «Облік СП» і «Облік РП», які програма сама записала чи прийняла): у стан вікна вони не йдуть,
+# і запис вікна їх не стирає. «book_export» — дати вивантаження книг ОП, СП і РП ({"ОП": "РРРР-ММ-ДД", …}),
+# «opysyConfig» — шлях до конфігу «Звіти › Описи 572» (`opysy_api`).
+SERVER_SETTINGS = ("folders", "op_book_export", "pur_book_sha", "op_book_sha", "book_export", "sp_book_sha", "rp_book_sha",
+                   "opysyConfig")
 # Розділи старих версій, які запис приймає й відкидає: номери актів до рапортів
 # і виправлення рапортів із бази тепер лежать у самих документах.
 RETIRED = {"dzActs", "reportFix"}
@@ -2750,12 +2837,12 @@ ONE_TIME = {"invIssue"}
 # Довідники більше не частина стану: вони лежать у своїх таблицях, і застосунок
 # бачить їх у витягу з бази. Тут вони лише приймаються на запис.
 DIRECTORIES = {"people", "mvo", "cmdrs", "officials", "locations", "subs", "norms", "items"}
-# Книга ОП і 2/Прод: статус ФЕС і поля документів, клітинки й записки 2/прод — свої таблиці;
-# прив'язки кодів, власні рядки 2/Прод і види контрагентів — правки довідників.
+# Книга ОП і 2/Прод: статус ФЕС і поля документів (`docMeta`, поля рядків — `lineExtra`), клітинки й записки
+# 2/прод — свої таблиці; прив'язки кодів, власні рядки 2/Прод і види контрагентів — правки довідників.
 # Акти списання за нормами: пункти харчування, дободачі й дні дободач — свої таблиці; акти (`acts`)
 # сторінка лише читає — складає й править їх сервер.
 OP_SECTIONS = {"docFes", "docMeta", "form2Cells", "form2Notes", "form2Map", "form2Own", "parties", "fesMap",
-               "points", "rations", "rationDates", "acts"}
+               "points", "rations", "rationDates", "acts", "lineExtra"}
 # Закупівлі: рядки коштів, закупівлі з версіями й документи до них — свої таблиці (purchases_db.py).
 PUR_SECTIONS = {"budget", "purchases", "purDocs"}
 KNOWN = (set(SIMPLE) | set(SETTINGS) | DIRECTORIES | RETIRED | OP_SECTIONS | PUR_SECTIONS
@@ -2994,7 +3081,7 @@ SECTION_WORDS = {"docs": "документи", "people": "люди", "mvo": "М�
                  "reconBase": "звірки", "inventories": "інвентаризації", "papers": "документи служби",
                  "subst": "заміни", "scans": "файли", "mtz": "відомість МТЗ", "budget": "кошти",
                  "purchases": "закупівлі", "purDocs": "документи закупівель", "points": "пункти харчування",
-                 "rations": "дободачі", "rationDates": "дні дободач"}
+                 "rations": "дободачі", "rationDates": "дні дободач", "lineExtra": "поля рядків документів"}
 # Поля, де рядок «рррр-мм-дд» може бути номером чи назвою з паперу, а не датою.
 NOT_A_DATE = {"no", "offNo", "report", "act", "name", "tname", "note", "pnote", "text", "basis", "title",
               "file", "path", "id", "key"}
@@ -3082,7 +3169,7 @@ def _save_state(con, state, replace_papers=False, ui_key="ui"):
                 rec["unit"] = str(units[str(rec["unit"])])
         # Види контрагентів — до документів: новий постачальник приходу заводиться вже зі своїм видом.
         _save_parties(con, state.get("parties"))
-        # Документ не змішує книги: техзасоби й посуд з миючими — різні документи.
+        # Документ не змішує книги: техзасоби, посуд з миючими, сухпай і реторт-пакети — різні документи.
         _check_books(con, state.get("docs"))
         # Документ акта за нормами правлять лише у вікні акта: кількість у ньому — за нормою.
         _check_act_docs(con, state.get("docs"))
@@ -3093,6 +3180,7 @@ def _save_state(con, state, replace_papers=False, ui_key="ui"):
         # Статус ФЕС і поля документів — після документів: новий документ має вже свій id.
         _save_doc_fes(con, state.get("docFes"))
         _save_doc_meta(con, state.get("docMeta"))
+        _save_line_extra(con, state.get("lineExtra"))
         _save_simple(con, "scans", state.get("scans"))
         # Порядок важить: підрозділи потрібні МВО й нормам, люди — призначенням,
         # номенклатура — нормам на код. Другий захід по підрозділах прибирає ті,
@@ -3169,6 +3257,7 @@ def load_state(con, ui_key="ui"):
     state["log"] = _load_log(con)
     state["docFes"] = _load_doc_fes(con)
     state["docMeta"] = _load_doc_meta(con)
+    state["lineExtra"] = _load_line_extra(con)
     state["form2Cells"] = _load_form2_cells(con)
     state["form2Notes"] = _load_form2_notes(con)
     state["fesMap"] = _load_fes_map(con)

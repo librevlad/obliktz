@@ -163,6 +163,8 @@ SELECT n.id AS nomen_id, n.code, n.name, u.code AS uom, n.is_fixed_asset,
        i.made_year, i.inv_no, i.serial_no
 FROM posting p
 JOIN nomen n ON n.id = p.nomen_id
+-- Опис: техзасоби й посуд з миючими (як у 1.11.0); сухпай і реторт-пакети — свої книги.
+JOIN nomen_group g ON g.id = n.group_id AND g.book IN ('ТЗ', 'ОП')
 JOIN uom u ON u.id = n.uom_id
 LEFT JOIN batch b ON b.batch_line_id = p.batch_line_id
 LEFT JOIN instance i ON i.id = p.instance_id

@@ -213,8 +213,6 @@ body {
   cursor: pointer; padding: 5px 6px;
 }
 .side__gear:hover { color: var(--side-fg); background: var(--side-hover); }
-.side__gear + .side__gear { margin-left: 4px; }
-.side__gear.is-on { color: var(--side-fg); background: var(--side-hover); border-color: var(--side-line); }
 
 /* -------------------------------------------------------------- робоча зона */
 .main { flex: 1; min-width: 0; display: flex; flex-direction: column; background: var(--main); }
@@ -234,6 +232,19 @@ body {
 }
 .title { font: 600 16px/1.25 var(--sans); color: var(--ink); margin-top: 2px; }
 .head__stamp { display: none; }
+/* Вкладки розділу меню (хаба). Рядок вкладок переноситься, а не ховає їх. */
+.tabs {
+  display: flex; flex-wrap: wrap; gap: 0 2px; margin: 0 -20px; padding: 4px 14px 0;
+  border-bottom: 1px solid var(--bd-2);
+}
+.tabs__item {
+  background: none; border: 0; border-bottom: 2px solid transparent; cursor: pointer; white-space: nowrap;
+  padding: 8px 7px 6px; font: 500 12.5px/1.2 var(--sans); color: var(--mut);
+}
+.tabs__item:hover { color: var(--ink); }
+.tabs__item.is-on { color: var(--ink); border-bottom-color: var(--accent); }
+.tabs__badge { margin-left: 5px; font: 500 10.5px var(--mono); color: var(--mut-2); }
+@media print { .tabs { display: none !important; } }
 
 .search {
   display: flex; align-items: center; gap: 8px; background: var(--field);
@@ -308,6 +319,11 @@ body {
 .pager__ind {
   font: 500 11.5px var(--mono); color: var(--ink-3);
   padding: 0 10px; white-space: nowrap; font-variant-numeric: tabular-nums;
+}
+/* Перемикач періоду в шапці екрана (квартал «11/прод»): ‹ мітка ›. */
+.psweek { display: flex; align-items: center; gap: 6px; flex: none; }
+.psweek__label {
+  font: 600 12px var(--mono); color: var(--ink-2); white-space: nowrap; font-variant-numeric: tabular-nums;
 }
 
 .card { background: var(--card); border: 1px solid var(--bd); border-radius: 4px; overflow: hidden; }
@@ -1226,7 +1242,8 @@ details.fold > summary .fold__hint { font: 400 11px var(--sans); color: var(--mu
 .modal__box { max-width: 980px; }
 /* Вікно з кількома полями (робота в мережі) — за висотою вмісту, а не на весь екран. */
 .viewer:has(.modal__box--form) { align-items: flex-start; padding-top: 12vh; }
-.modal__box--form { max-width: 760px; }
+/* Не вище екрана: довгий перегляд книги гортається всередині, кнопка «Прийняти» лишається досяжною. */
+.modal__box--form { max-width: 760px; max-height: calc(88vh - 22px); }
 /* Пам’ятка: текст на одну сторінку, дві колонки; на папері — лише вона. */
 .memo { padding: 8px 20px 14px; font: 400 12.5px/1.45 var(--sans); color: var(--ink); }
 .memo__head { display: flex; align-items: center; gap: 12px; padding: 6px 0 4px; border-bottom: 1px solid var(--bd); }
@@ -1268,8 +1285,9 @@ details.fold > summary .fold__hint { font: 400 11px var(--sans); color: var(--mu
   font-size: 12.5px; border-bottom: 1px solid var(--bd); }
 .f2-check:last-child { border-bottom: 0; }
 .f2-check input { min-width: 90px; }
-/* «Справи»: у шапці вісім елементів, а назві екрана досить півтораста пікселів, — при 1366 px шапка лишається в один рядок. */
-.head__row:has([data-act="pur-book-export"]) .head__titles { flex-basis: 150px; }
+/* «Справи»: у шапці сім елементів (з плашкою «станом на» — вісім), а назві екрана досить півтораста пікселів, —
+   при 1366 px шапка лишається в один рядок. */
+.head__row:has([data-act="pur-book"]) .head__titles { flex-basis: 150px; }
 /* Картка закупівлі: одна колонка блоків під ширину 1366. */
 .pur-card { display: flex; flex-direction: column; gap: 12px; }
 /* Проміжок між блоками дає gap; картка файлів ще має власний відступ знизу (style у filesCard) — він зайвий. */
@@ -1315,8 +1333,6 @@ details.fold > summary .fold__hint { font: 400 11px var(--sans); color: var(--mu
   font: 500 12px var(--sans); color: var(--warn); }
 /* Кнопка паперу, що складається («Складається…»): в блоці «Пакет», у шапці (акт введення) і у вікні (реєстр на ФЕС). */
 .pur-step .btn.is-busy, #head .btn.is-busy, #modal .btn.is-busy { opacity: .6; cursor: progress; }
-.pur-miss ul { font: 400 12.5px/1.45 var(--sans); color: var(--ink-2); }
-.pur-miss li { margin: 2px 0; }
 /* Блок «Договори»: стовпці суми, файлів і кнопок мають одну ширину в усіх рядках (відступ за глибиною забирає місце лише в назви),
    довга назва файла обрізається, а кнопки переносяться, а не лізуть за край картки. */
 .pd-name { flex: 1 1 0; min-width: 0; }
@@ -1391,3 +1407,25 @@ details.fold > summary .fold__hint { font: 400 11px var(--sans); color: var(--mu
 .oa-dob > p small { color: var(--mut-2); }
 .oa-dob .field { margin-top: 10px; }
 .oa-dob .set-form__acts { gap: 8px; padding-top: 14px; }
+
+/* -------------------------------------------------------------- описи 572 */
+.ov-acts { gap: 8px; flex-wrap: wrap; }
+.ov-log { display: grid; gap: 2px; padding: 4px 18px 14px; }
+.ov-log__line { font: 400 11.5px/1.45 var(--mono); color: var(--ink-4); }
+
+/* -------------------------------------------------------------- акти сухпаю */
+.sa .sa-find { display: flex; gap: 8px; align-items: center; }
+.sa .sa-find textarea { flex: 1 1 160px; min-width: 120px; height: 30px; min-height: 30px; resize: none; padding: 6px 9px;
+  font: 400 12px var(--sans); color: var(--ink); border: 1px dashed var(--hover-bd); border-radius: 3px; background: var(--card-2); }
+.sa .sa-find textarea:focus { outline: none; border-color: var(--accent); background: var(--card); }
+.sa .sa-days { margin: 4px 0 10px; }
+.sa .sa-days__head { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; font: 400 12px var(--sans); color: var(--ink-3); }
+.sa .sa-days__head b { font: 600 13px var(--sans); color: var(--ink); }
+.sa .sa-days__list { display: flex; flex-wrap: wrap; gap: 6px 10px; }
+.sa .sa-day { display: flex; gap: 4px; align-items: center; }
+.sa .sa-day input[type="number"] { width: 64px; text-align: right; }
+.sa .sa-empty { margin: 4px 0 8px; font: 400 12px var(--sans); color: var(--mut-2); }
+.sa .sa-line { flex: 1 1 100%; }
+.sa .sa-line select { flex: 0 1 360px; min-width: 200px; }
+.sa .sa-check { display: flex; gap: 4px; align-items: center; font: 400 12px var(--sans); color: var(--ink-3); }
+.sa .oa-lines .sa-rule { flex: 2 1 220px; font: 400 11.5px var(--sans); color: var(--ink-3); }

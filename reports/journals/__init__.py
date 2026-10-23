@@ -9,14 +9,15 @@
 
 spec: {"year": 2025, "paper": true, "electronic": true, "pdf": false, "as_of": "2026-10-01",
        "unit": "А0000", "book": "ТЗ"} — рік паперових книг; електронні будуються за рік `as_of`;
-`book` — книга обліку: «ТЗ» чи «ОП» (посуд одноразового використання, миючі засоби, серветки)."""
+`book` — книга обліку: «ТЗ», «ОП» (посуд одноразового використання, миючі засоби, серветки), «СП»
+(сухі пайки) чи «РП» (реторт-пакети, неофіційний облік)."""
 import datetime
 import json
 import os
 
 from .data import Data
 from .electronic import electronic_year
-from .paper import CFG, CFG_OP, export_pdf, paper_year
+from .paper import CFGS, export_pdf, paper_year
 
 FOLDER = "Книги обліку"
 
@@ -30,8 +31,8 @@ def save_journals(con, spec, folder):
     """Книги в теку «вивантаження/Книги обліку/<рік>/»; -> шлях книги № 47 (решта поруч)."""
     root = os.path.join(folder, FOLDER)
     os.makedirs(root, exist_ok=True)
-    book = "ОП" if spec.get("book") == "ОП" else "ТЗ"
-    cfg = CFG_OP if book == "ОП" else CFG
+    book = spec.get("book") if spec.get("book") in CFGS else "ТЗ"
+    cfg = CFGS[book]
     D = Data(con, str(spec.get("unit") or "").strip(), book)
     made = []
     year = int(spec.get("year") or 0)
@@ -55,7 +56,7 @@ def save_journals(con, spec, folder):
             with open(p, encoding="utf-8") as f:
                 refs = json.load(f)
         books = electronic_year(D, as_of.year, as_of, os.path.join(root, "%d (електронні)" % as_of.year), refs,
-                                cfg if book == "ОП" else None)
+                                cfg if book != "ТЗ" else None)
         made += [b[0] for b in books]
     if not made:
         raise ValueError("за цей рік у книгах немає ні руху, ні залишків")
